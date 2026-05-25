@@ -1,4 +1,4 @@
-ModelParams = dict(
+﻿ModelParams = dict(
     extra_mark = 'endonerf',
     camera_extent = 15
 )
@@ -14,7 +14,7 @@ OptimizationParams = dict(
     percent_dense = 0.01,
     opacity_reset_interval = 4000,
     position_lr_max_steps = 20000,
-    prune_interval = 2000
+    pruning_interval = 2000
 )
 
 ModelHiddenParams = dict(

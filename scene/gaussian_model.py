@@ -80,28 +80,83 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.percent_dense,
             self.spatial_lr_scale,
+            {"tracking_type": getattr(self._deformation.deformation_net, "tracking_mode", "original")},
         )
-    
+
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-            self._xyz, 
-            self._deformation_table,
-            self._deformation,
-            # self.grid,
-            self._features_dc, 
-            self._features_rest,
-            self._scaling, 
-            self._rotation, 
-            self._opacity,
-            self.max_radii2D, 
-            xyz_gradient_accum, 
-            denom,
-            opt_dict, 
-            self.spatial_lr_scale) = model_args
+        if isinstance(model_args[2], dict):
+            deformation_state_dict = model_args[2]
+            deformation_table = model_args[3]
+            remaining = list(model_args[4:])
+        else:
+            deformation_table = model_args[2]
+            deformation_state_dict = model_args[3]
+            remaining = list(model_args[4:])
+
+        metadata = {}
+        if remaining and isinstance(remaining[-1], dict) and "tracking_type" in remaining[-1]:
+            metadata = remaining.pop(-1)
+
+        (
+            self.active_sh_degree,
+            self._xyz,
+        ) = model_args[:2]
+
+        if len(remaining) == 11:
+            (
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                saved_percent_dense,
+                self.spatial_lr_scale,
+            ) = remaining
+        elif len(remaining) == 10:
+            (
+                self._features_dc,
+                self._features_rest,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                xyz_gradient_accum,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale,
+            ) = remaining
+            saved_percent_dense = training_args.percent_dense
+        else:
+            raise ValueError(f"Unsupported checkpoint format with {len(remaining)} payload entries")
+
+        saved_tracking_type = metadata.get("tracking_type")
+        current_tracking_type = getattr(self._deformation.deformation_net, "tracking_mode", "original")
+        if saved_tracking_type is not None and saved_tracking_type != current_tracking_type:
+            raise ValueError(
+                f"Checkpoint tracking_type '{saved_tracking_type}' does not match current model tracking_type '{current_tracking_type}'"
+            )
+
+        try:
+            self._deformation.load_state_dict(deformation_state_dict)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Failed to restore deformation weights. Check that the checkpoint was created with the same tracking_type and MoE architecture."
+            ) from exc
+        self._deformation_table = deformation_table
         self.training_setup(training_args)
+        self.percent_dense = saved_percent_dense
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
-        self.optimizer.load_state_dict(opt_dict)
+        try:
+            self.optimizer.load_state_dict(opt_dict)
+        except (ValueError, RuntimeError) as exc:
+            raise ValueError(
+                "Failed to restore optimizer state. The checkpoint likely belongs to a different tracking configuration or parameter-group layout."
+            ) from exc
 
     @property
     def get_scaling(self):
@@ -164,20 +219,27 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
-        
-        l = [
-            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
-            {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation"},
-            {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale, "name": "grid"},
-            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
-            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
-            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+
+        param_groups = [
+            {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz", "schedule": "xyz", "phase_lr_scale": 1.0},
+            {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc", "schedule": "none", "phase_lr_scale": 1.0},
+            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest", "schedule": "none", "phase_lr_scale": 1.0},
+            {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity", "schedule": "none", "phase_lr_scale": 1.0},
+            {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling", "schedule": "none", "phase_lr_scale": 1.0},
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation", "schedule": "none", "phase_lr_scale": 1.0},
         ]
 
-        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        
+        tracking_groups = self._deformation.get_optimizer_param_groups(training_args, self.spatial_lr_scale)
+        if tracking_groups:
+            param_groups.extend(tracking_groups)
+        else:
+            param_groups.extend([
+                {'params': list(self._deformation.get_mlp_parameters()), 'lr': training_args.deformation_lr_init * self.spatial_lr_scale, "name": "deformation", "schedule": "deformation", "phase_lr_scale": 1.0},
+                {'params': list(self._deformation.get_grid_parameters()), 'lr': training_args.grid_lr_init * self.spatial_lr_scale, "name": "grid", "schedule": "grid", "phase_lr_scale": 1.0},
+            ])
+
+        self.optimizer = torch.optim.Adam(param_groups, lr=0.0, eps=1e-15)
+
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
@@ -185,27 +247,33 @@ class GaussianModel:
         self.deformation_scheduler_args = get_expon_lr_func(lr_init=training_args.deformation_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.deformation_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.deformation_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps) 
+                                                    max_steps=training_args.position_lr_max_steps)
         self.grid_scheduler_args = get_expon_lr_func(lr_init=training_args.grid_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.grid_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.deformation_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)    
 
-    def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
+    def update_learning_rate(self, iteration, phase=None):
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] == "xyz":
-                lr = self.xyz_scheduler_args(iteration)
-                param_group['lr'] = lr
-                # return lr
-            if  "grid" in param_group["name"]:
-                lr = self.grid_scheduler_args(iteration)
-                param_group['lr'] = lr
-                # return lr
-            elif param_group["name"] == "deformation":
-                lr = self.deformation_scheduler_args(iteration)
-                param_group['lr'] = lr
-                # return lr
+            schedule = param_group.get("schedule", "none")
+            base_lr = param_group["lr"]
+
+            if schedule == "xyz":
+                base_lr = self.xyz_scheduler_args(iteration)
+            elif schedule == "grid":
+                base_lr = self.grid_scheduler_args(iteration)
+            elif schedule == "deformation":
+                base_lr = self.deformation_scheduler_args(iteration)
+
+            phase_scale = 1.0
+            if phase is not None:
+                group_name = param_group["name"]
+                phase_scale = phase.lr_scale_for_group(group_name)
+                if not phase.is_group_trainable(group_name):
+                    base_lr = 0.0
+
+            param_group["lr"] = base_lr * phase_scale
+            param_group["phase_lr_scale"] = phase_scale
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -228,25 +296,42 @@ class GaussianModel:
 
     def load_model(self, path):
         print("loading model from exists{}".format(path))
-        
-        weight_dict = torch.load(os.path.join(path,"deformation.pth"),map_location="cuda")
-        self._deformation.load_state_dict(weight_dict)
+
+        weight_dict = torch.load(os.path.join(path, "deformation.pth"), map_location="cuda")
+        meta_path = os.path.join(path, "deformation_meta.pth")
+        metadata = torch.load(meta_path, map_location="cpu") if os.path.exists(meta_path) else {}
+        saved_tracking_type = metadata.get("tracking_type") if isinstance(metadata, dict) else None
+        current_tracking_type = getattr(self._deformation.deformation_net, "tracking_mode", "original")
+        if saved_tracking_type is not None and saved_tracking_type != current_tracking_type:
+            raise ValueError(
+                f"Saved deformation tracking_type '{saved_tracking_type}' does not match current model tracking_type '{current_tracking_type}'"
+            )
+        try:
+            self._deformation.load_state_dict(weight_dict)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Failed to load deformation weights. Check that the saved point cloud matches the current tracking_type and MoE architecture."
+            ) from exc
         self._deformation = self._deformation.to("cuda")
-        
-        self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+
+        self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]), device="cuda"), 0)
         if os.path.exists(os.path.join(path, "deformation_table.pth")):
-            self._deformation_table = torch.load(os.path.join(path, "deformation_table.pth"),map_location="cuda")
-            
-        self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
+            self._deformation_table = torch.load(os.path.join(path, "deformation_table.pth"), map_location="cuda")
+
+        self._deformation_accum = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
         if os.path.exists(os.path.join(path, "deformation_accum.pth")):
-            self._deformation_accum = torch.load(os.path.join(path, "deformation_accum.pth"),map_location="cuda")
-        
+            self._deformation_accum = torch.load(os.path.join(path, "deformation_accum.pth"), map_location="cuda")
+
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def save_deformation(self, path):
-        torch.save(self._deformation.state_dict(),os.path.join(path, "deformation.pth"))
-        torch.save(self._deformation_table,os.path.join(path, "deformation_table.pth"))
-        torch.save(self._deformation_accum,os.path.join(path, "deformation_accum.pth"))
+        torch.save(self._deformation.state_dict(), os.path.join(path, "deformation.pth"))
+        torch.save(self._deformation_table, os.path.join(path, "deformation_table.pth"))
+        torch.save(self._deformation_accum, os.path.join(path, "deformation_accum.pth"))
+        torch.save(
+            {"tracking_type": getattr(self._deformation.deformation_net, "tracking_mode", "original")},
+            os.path.join(path, "deformation_meta.pth"),
+        )
 
     def load_ply(self, path):
         plydata = PlyData.read(path)
@@ -506,45 +591,36 @@ class GaussianModel:
         print("-"*50)
     
     def _plane_regulation(self):
-        multi_res_grids = self._deformation.deformation_net.grid.grids
         total = 0
-        # model.grids is 6 x [1, rank * F_dim, reso, reso]
-        for grids in multi_res_grids:
+        for grids in self._deformation.iter_regularized_grids():
             if len(grids) == 3:
                 time_grids = []
             else:
-                time_grids =  [0,1,3]
+                time_grids = [0, 1, 3]
             for grid_id in time_grids:
                 total += compute_plane_smoothness(grids[grid_id])
         return total
 
     def _time_regulation(self):
-        multi_res_grids = self._deformation.deformation_net.grid.grids
         total = 0
-        # model.grids is 6 x [1, rank * F_dim, reso, reso]
-        for grids in multi_res_grids:
+        for grids in self._deformation.iter_regularized_grids():
             if len(grids) == 3:
                 time_grids = []
             else:
-                time_grids =[2, 4, 5]
+                time_grids = [2, 4, 5]
             for grid_id in time_grids:
                 total += compute_plane_smoothness(grids[grid_id])
         return total
     
     def _l1_regulation(self):
-                # model.grids is 6 x [1, rank * F_dim, reso, reso]
-        multi_res_grids = self._deformation.deformation_net.grid.grids
-
         total = 0.0
-        for grids in multi_res_grids:
+        for grids in self._deformation.iter_regularized_grids():
             if len(grids) == 3:
                 continue
-            else:
-                # These are the spatiotemporal grids
-                spatiotemporal_grids = [2, 4, 5]
+            spatiotemporal_grids = [2, 4, 5]
             for grid_id in spatiotemporal_grids:
                 total += torch.abs(1 - grids[grid_id]).mean()
         return total
 
-    def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
+    def compute_regulation(self, time_smoothness_weight, plane_tv_weight, l1_time_planes_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()

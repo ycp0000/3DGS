@@ -10,11 +10,19 @@
 #
 
 from argparse import ArgumentParser, Namespace
+import math
 import sys
 import os
 
-class GroupParams:
-    pass
+from utils.params_utils import normalize_legacy_config_keys
+
+
+
+def _same_arg_value(left, right):
+    if isinstance(left, float) and isinstance(right, float):
+        if math.isnan(left) and math.isnan(right):
+            return True
+    return left == right
 
 class ParamGroup:
     def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
@@ -100,7 +108,7 @@ class ModelHiddenParams(ParamGroup):
 
         self.tracking_type = "original"
 
-        self.K_geo = 3
+        self.K_geo = 4
         self.K_vis = 2
         self.geo_hidden_dim = 64
         self.vis_hidden_dim = 64
@@ -118,9 +126,9 @@ class ModelHiddenParams(ParamGroup):
         self.temperature_vis_init = 2.0
         self.temperature_vis_final = 1.0
 
+        self.max_disp_hexplane_ratio = 0.01
         self.max_disp_smooth_ratio = 0.01
         self.max_disp_local_ratio = 0.03
-        self.max_disp_shared_ratio = 0.01
         self.max_rot_smooth = 0.05
         self.max_rot_local = 0.10
         self.max_rot_shared = 0.05
@@ -140,6 +148,26 @@ class ModelHiddenParams(ParamGroup):
         self.lambda_geo_spatial = 0.01
         self.lambda_vis_sparse = 0.005
         self.lambda_decouple = 0.05
+        self.target_geo_static = 0.30
+        self.target_geo_smooth = float("nan")
+        self.target_geo_hexplane = float("nan")
+        self.target_geo_local = 0.20
+        self.target_geo_residual_smooth = float("nan")
+        self.target_geo_static_stage2 = float("nan")
+        self.target_geo_smooth_stage2 = float("nan")
+        self.target_geo_hexplane_stage2 = float("nan")
+        self.target_vis_stable = 0.85
+        self.target_vis_transient = 0.15
+        self.sat_threshold = 0.8
+        self.lambda_mag_g1_mu = 1e-4
+        self.lambda_mag_g2_mu = 2e-5
+        self.lambda_mag_g3_mu = float("nan")
+        self.lambda_sat_g1_disp = 5e-4
+        self.lambda_sat_g2_disp = 1e-4
+        self.lambda_sat_g3_disp = float("nan")
+        self.lambda_raw_g1_disp = 1e-4
+        self.lambda_raw_g2_disp = 1e-4
+        self.lambda_raw_g3_disp = float("nan")
 
         self.warmup_iters = 1000
         self.enable_shared_only_iter = 1000
@@ -199,6 +227,7 @@ def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
+    args_defaults = parser.parse_args([])
 
     cfgfilepath = None
     try:
@@ -213,11 +242,9 @@ def get_combined_args(parser : ArgumentParser):
             print("Config file not found at {}".format(cfgfilepath))
     args_cfgfile = eval(cfgfile_string)
 
-    merged_dict = vars(args_cfgfile).copy()
-    for k,v in vars(args_cmdline).items():
-        if v != None:
-            merged_dict[k] = v
+    merged_dict = normalize_legacy_config_keys(vars(args_cfgfile).copy())
     for k, v in vars(args_cmdline).items():
-        if k not in merged_dict:
+        default_value = getattr(args_defaults, k)
+        if k not in merged_dict or not _same_arg_value(v, default_value):
             merged_dict[k] = v
     return Namespace(**merged_dict)

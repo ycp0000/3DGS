@@ -9,22 +9,35 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from __future__ import annotations
+
 import os
 import random
 import json
-from utils.system_utils import searchForMaxIteration
-from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
-from scene.dataset import FourDGSdataset
-from arguments import ModelParams
-from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
-from torch.utils.data import Dataset
+from typing import TYPE_CHECKING
+
 import numpy as np
+
+from utils.system_utils import searchForMaxIteration
+
+if TYPE_CHECKING:
+    from arguments import ModelParams
+    from scene.gaussian_model import GaussianModel
+
+
+def __getattr__(name):
+    if name == "GaussianModel":
+        from scene.gaussian_model import GaussianModel as gaussian_model_cls
+
+        return gaussian_model_cls
+    raise AttributeError(f"module 'scene' has no attribute {name!r}")
 class Scene:
 
-    gaussians : GaussianModel
-    
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_coarse=False):
+    gaussians: GaussianModel
+
+    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_coarse=False):
+        from scene.dataset import FourDGSdataset
+        from scene.dataset_readers import sceneLoadTypeCallbacks
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -117,7 +130,7 @@ class Scene:
         
         xyz_max = scene_info.point_cloud.points.max(axis=0)
         xyz_min = scene_info.point_cloud.points.min(axis=0)
-        self.gaussians._deformation.deformation_net.grid.set_aabb(xyz_max,xyz_min)
+        self.gaussians._deformation.set_aabb(xyz_max, xyz_min)
 
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,

@@ -14,13 +14,13 @@ OptimizationParams = dict(
     percent_dense=0.01,
     opacity_reset_interval=3000,
     position_lr_max_steps=9000,
-    prune_interval=1000,
+    pruning_interval=1000,
 )
 
 ModelHiddenParams = dict(
-    tracking_type='disentangled_moe',
+    tracking_type='heterogeneous_moe',
     enable_visibility=False,
-    K_geo=3,
+    K_geo=4,
     K_vis=2,
     geo_hidden_dim=64,
     vis_hidden_dim=64,

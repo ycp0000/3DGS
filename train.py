@@ -85,7 +85,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 network_gui.conn = None
 
         iter_start.record()
-        gaussians.update_learning_rate(iteration)
+        tracking_phase = gaussians._deformation.get_tracking_phase() if stage == "fine" else None
+        gaussians.update_learning_rate(iteration, phase=tracking_phase)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 500 == 0:
             gaussians.oneupSHdegree()
@@ -207,6 +208,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         loss = Ll1 + depth_loss + tv_loss
 
+        geo_expert_names, vis_expert_names = gaussians._deformation.get_expert_names()
         tracking_metrics = {}
         if stage == "fine" and deformation_aux_list:
             merged_aux = {}
@@ -219,7 +221,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 else:
                     merged_aux[key] = torch.cat(values, dim=0)
 
-            stage_ctx = gaussians._deformation.deformation_net._set_stage_context(torch.empty(0))
+            if "d_mu" in deformation_aux_list[0] and len(deformation_aux_list) > 1:
+                d_mu_sequence = [aux["d_mu"] for aux in deformation_aux_list if "d_mu" in aux]
+                if d_mu_sequence and all(entry.shape == d_mu_sequence[0].shape for entry in d_mu_sequence):
+                    merged_aux["d_mu_sequence"] = torch.stack(d_mu_sequence, dim=0)
+                    merged_aux["time_sequence"] = torch.tensor(
+                        [float(viewpoint_cam.time) for viewpoint_cam in viewpoint_cams[: len(d_mu_sequence)]],
+                        device=d_mu_sequence[0].device,
+                        dtype=d_mu_sequence[0].dtype,
+                    )
 
             if stage == "fine" and iteration % 500 == 0 and deformation_aux_list and tb_writer is not None:
                 for k, v in merged_aux.items():
@@ -233,14 +243,21 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             if "d_mu" in merged_aux:
                 merged_d_mu_for_commit = merged_aux["d_mu"].detach()
 
+            active_geo = tracking_phase.active_geo if tracking_phase is not None else len(geo_expert_names)
+            active_vis = tracking_phase.active_vis if tracking_phase is not None else len(vis_expert_names)
+            enable_visibility = tracking_phase.enable_visibility if tracking_phase is not None else False
             tracking_loss_dict = compute_tracking_losses(
                 merged_aux,
                 iteration,
                 hyper,
                 gaussians._deformation.get_previous_d_mu(),
-                stage_ctx["active_geo"],
-                stage_ctx["active_vis"],
-                stage_ctx["enable_visibility"],
+                active_geo,
+                active_vis,
+                enable_visibility,
+                geo_expert_names,
+                vis_expert_names,
+                force_geo_expert=tracking_phase.force_geo_expert if tracking_phase is not None else None,
+                force_vis_expert=tracking_phase.force_vis_expert if tracking_phase is not None else None,
             )
             tracking_loss = torch.zeros((), device=loss.device)
 
@@ -253,11 +270,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 tracking_loss = tracking_loss + tracking_loss_dict[loss_name]
 
             tracking_metrics = dict(tracking_loss_dict)
+            if tracking_phase is not None:
+                tracking_metrics["phase_active_geo"] = torch.tensor(float(tracking_phase.active_geo), device=loss.device)
+                tracking_metrics["phase_active_vis"] = torch.tensor(float(tracking_phase.active_vis), device=loss.device)
+                tracking_metrics["phase_visibility_enabled"] = torch.tensor(float(tracking_phase.enable_visibility), device=loss.device)
             tracking_metrics["L_tracking_total"] = tracking_loss.detach()
 
             loss = loss + tracking_loss
 
-            # ===== print tracking losses for debugging =====
             if iteration % 500 == 0:
                 print(f"\n[TRACKING LOSS DEBUG] iter={iteration}")
                 print_keys = [
@@ -273,24 +293,36 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     "route_margin_geo",
                     "route_margin_vis",
                     "expert_diversity_geo",
-
                     "L_balance_geo",
                     "L_balance_vis",
-                    "L_route_conf_geo",
-                    "L_route_conf_vis",
-                    "L_expert_diversity_geo",
                     "L_entropy",
                     "L_geo_temp",
-                    "L_geo_spatial",
+                    "geo_temp_velocity",
                     "L_vis_sparse",
                     "L_decouple",
                 ]
+
+                for expert_name in geo_expert_names:
+                    print_keys.extend(
+                        [
+                            f"usage_geo_{expert_name}",
+                            f"target_usage_geo_{expert_name}",
+                            f"geo_disp_ratio_{expert_name}",
+                            f"geo_saturation_{expert_name}",
+                        ]
+                    )
+                for vis_name in vis_expert_names:
+                    print_keys.extend(
+                        [
+                            f"usage_vis_{vis_name}",
+                            f"target_usage_vis_{vis_name}",
+                        ]
+                    )
 
                 for k in print_keys:
                     v = tracking_metrics.get(k, None)
                     if torch.is_tensor(v) and v.numel() == 1:
                         print(f"{k}: {float(v.detach().cpu().item()):.8e}")
-            # ===== end tracking loss debug =====
 
         if stage == "fine" and hyper.time_smoothness_weight != 0:
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.plane_tv_weight, hyper.l1_time_planes)
@@ -331,19 +363,20 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     "point":f"{total_point}",
                 }
                 if tracking_metrics:
-                    if "usage_geo_static" in tracking_metrics:
-                        postfix["uG0"] = f"{tracking_metrics['usage_geo_static'].detach().item():.2f}"
-                    if "usage_geo_smooth" in tracking_metrics:
-                        postfix["uG1"] = f"{tracking_metrics['usage_geo_smooth'].detach().item():.2f}"
-                    if "usage_geo_local" in tracking_metrics:
-                        postfix["uG2"] = f"{tracking_metrics['usage_geo_local'].detach().item():.2f}"
-                    if "usage_vis_transient" in tracking_metrics:
-                        postfix["uV1"] = f"{tracking_metrics['usage_vis_transient'].detach().item():.2f}"
+                    if tracking_phase is not None:
+                        postfix["phase"] = tracking_phase.name
+                    for idx, expert_name in enumerate(geo_expert_names):
+                        usage_key = f"usage_geo_{expert_name}"
+                        if usage_key in tracking_metrics:
+                            postfix[f"uG{idx}"] = f"{tracking_metrics[usage_key].detach().item():.2f}"
+                    for idx, vis_name in enumerate(vis_expert_names):
+                        usage_key = f"usage_vis_{vis_name}"
+                        if usage_key in tracking_metrics:
+                            postfix[f"uV{idx}"] = f"{tracking_metrics[usage_key].detach().item():.2f}"
                     if "route_max_prob_geo" in tracking_metrics:
                         postfix["pG"] = f"{tracking_metrics['route_max_prob_geo'].detach().item():.2f}"
                     if "route_max_prob_vis" in tracking_metrics:
                         postfix["pV"] = f"{tracking_metrics['route_max_prob_vis'].detach().item():.2f}"
-
                     if "L_sat_geo" in tracking_metrics:
                         postfix["Lsat"] = f"{tracking_metrics['L_sat_geo'].detach().item():.1e}"
                     if "L_mag_geo" in tracking_metrics:
@@ -393,26 +426,25 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 if stage == "coarse":
                     opacity_threshold = opt.opacity_threshold_coarse
                     densify_threshold = opt.densify_grad_threshold_coarse
-                else:    
-                    opacity_threshold = opt.opacity_threshold_fine_init - iteration*(opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after)/(opt.densify_until_iter)  
-                    densify_threshold = opt.densify_grad_threshold_fine_init - iteration*(opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after)/(opt.densify_until_iter )  
+                else:
+                    opacity_threshold = opt.opacity_threshold_fine_init - iteration * (opt.opacity_threshold_fine_init - opt.opacity_threshold_fine_after) / (opt.densify_until_iter)
+                    densify_threshold = opt.densify_grad_threshold_fine_init - iteration * (opt.densify_grad_threshold_fine_init - opt.densify_grad_threshold_after) / (opt.densify_until_iter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0 :
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
-                    
+
                 if iteration > opt.pruning_from_iter and iteration % opt.pruning_interval == 0:
                     size_threshold = 40 if iteration > opt.opacity_reset_interval else None
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
-                    
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     print("reset opacity")
                     gaussians.reset_opacity()
-                    
-                gaussians.optimizer.step()
 
-
-                gaussians.optimizer.zero_grad(set_to_none = True)
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none = True)
+            if stage == "fine" and merged_d_mu_for_commit is not None:
                 gaussians._deformation.commit_previous_d_mu(merged_d_mu_for_commit)
 
             if (iteration in checkpoint_iterations):

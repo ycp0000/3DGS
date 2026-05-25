@@ -1,8 +1,13 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional, Sequence
+import math
+from typing import Dict, Optional, Sequence
 
 import torch
+
+
+DEFAULT_GEO_EXPERT_NAMES = ("static", "hexplane", "local", "smooth")
+DEFAULT_VIS_EXPERT_NAMES = ("stable", "transient")
 
 
 def _safe_mean(value: torch.Tensor) -> torch.Tensor:
@@ -15,49 +20,204 @@ def _get_float_arg(args, name: str, default: float) -> float:
     value = getattr(args, name, default)
     if value is None:
         return float(default)
-    return float(value)
+    value = float(value)
+    if not math.isfinite(value):
+        return float(default)
+    return value
 
 
-def _get_aux_tensor(
-    aux: Dict[str, torch.Tensor],
-    names: Sequence[str],
-) -> Optional[torch.Tensor]:
-    for name in names:
-        value = aux.get(name)
-        if isinstance(value, torch.Tensor):
-            return value
+def _get_aux_tensor(aux: Dict[str, torch.Tensor], name: str) -> Optional[torch.Tensor]:
+    value = aux.get(name)
+    if isinstance(value, torch.Tensor):
+        return value
     return None
 
 
-def _add_aux_regularization(
+def _resolve_expert_names(
+    names: Sequence[str],
+    count: int,
+    defaults: Sequence[str],
+    prefix: str,
+) -> tuple[str, ...]:
+    if len(names) >= count:
+        return tuple(names[:count])
+
+    resolved = list(names)
+    default_iter = iter(defaults)
+    while len(resolved) < count:
+        fallback = next(default_iter, f"{prefix}_{len(resolved)}")
+        if fallback in resolved:
+            fallback = f"{prefix}_{len(resolved)}"
+        resolved.append(fallback)
+    return tuple(resolved)
+
+
+def _normalize_target(target: torch.Tensor) -> torch.Tensor:
+    target = target.clamp_min(1e-6)
+    return target / target.sum()
+
+
+def _build_geo_target(
+    args,
+    active_geo_names: Sequence[str],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    legacy_static = _get_float_arg(args, "target_geo_static", 0.30)
+    legacy_smooth = _get_float_arg(args, "target_geo_smooth", 0.50)
+    legacy_local = _get_float_arg(args, "target_geo_local", 0.20)
+
+    target_map = {
+        "static": legacy_static,
+        "hexplane": _get_float_arg(args, "target_geo_hexplane", legacy_smooth * 0.7),
+        "local": legacy_local,
+        "smooth": _get_float_arg(args, "target_geo_residual_smooth", legacy_smooth * 0.3),
+    }
+
+    if tuple(active_geo_names) == ("static", "hexplane"):
+        values = [
+            _get_float_arg(args, "target_geo_static_stage2", legacy_static),
+            _get_float_arg(
+                args,
+                "target_geo_hexplane_stage2",
+                _get_float_arg(args, "target_geo_smooth_stage2", legacy_smooth),
+            ),
+        ]
+    else:
+        values = [target_map.get(name, 1.0) for name in active_geo_names]
+
+    target = torch.tensor(values, device=device, dtype=dtype)
+    return _normalize_target(target)
+
+
+def _build_vis_target(
+    args,
+    active_vis_names: Sequence[str],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if tuple(active_vis_names[:2]) == ("stable", "transient"):
+        values = [
+            _get_float_arg(args, "target_vis_stable", 0.85),
+            _get_float_arg(args, "target_vis_transient", 0.15),
+        ][: len(active_vis_names)]
+        target = torch.tensor(values, device=device, dtype=dtype)
+        return _normalize_target(target)
+
+    return torch.full((len(active_vis_names),), 1.0 / max(len(active_vis_names), 1), device=device, dtype=dtype)
+
+
+def _accumulate_weighted_loss(
+    losses: Dict[str, torch.Tensor],
+    total_name: str,
+    metric_name: str,
+    metric_value: torch.Tensor,
+    weight: float,
+) -> None:
+    losses[metric_name] = metric_value.detach()
+    if weight == 0.0:
+        return
+
+    weighted = metric_value * weight
+    losses[total_name] = weighted if total_name not in losses else losses[total_name] + weighted
+
+
+def _add_temporal_regularization(losses: Dict[str, torch.Tensor], aux: Dict[str, torch.Tensor], args) -> None:
+    d_mu_sequence = _get_aux_tensor(aux, "d_mu_sequence")
+    time_sequence = _get_aux_tensor(aux, "time_sequence")
+    if d_mu_sequence is None or time_sequence is None:
+        return
+    if d_mu_sequence.ndim != 3 or d_mu_sequence.shape[0] < 2:
+        return
+
+    time_sequence = time_sequence.reshape(-1)
+    if time_sequence.numel() != d_mu_sequence.shape[0]:
+        return
+
+    order = torch.argsort(time_sequence)
+    d_mu_sorted = d_mu_sequence[order]
+    time_sorted = time_sequence[order]
+    time_delta = time_sorted[1:] - time_sorted[:-1]
+    valid = time_delta.abs() > 1e-6
+
+    losses["temporal_pair_count"] = valid.to(dtype=d_mu_sequence.dtype).sum()
+    if not bool(valid.any()):
+        return
+
+    delta_mu = d_mu_sorted[1:] - d_mu_sorted[:-1]
+    velocity = delta_mu[valid] / time_delta[valid].abs().view(-1, 1, 1).clamp_min(1e-4)
+    velocity_energy = velocity.square().mean()
+    losses["geo_temp_velocity"] = velocity_energy.detach()
+    losses["L_geo_temp"] = velocity_energy * _get_float_arg(args, "lambda_geo_temp", 0.0)
+
+
+def _add_geo_expert_regularization(
     losses: Dict[str, torch.Tensor],
     aux: Dict[str, torch.Tensor],
     args,
-    loss_name: str,
-    specs: Iterable[tuple[Sequence[str], str, float, str]],
+    geo_expert_names: Sequence[str],
 ) -> None:
-    total: Optional[torch.Tensor] = None
+    if "hexplane" not in geo_expert_names and "local" not in geo_expert_names and "smooth" not in geo_expert_names:
+        return
 
-    for key_aliases, lambda_name, default_lambda, metric_name in specs:
-        value = _get_aux_tensor(aux, key_aliases)
-        if value is None:
+    expert_specs = (
+        (
+            "hexplane",
+            _get_float_arg(args, "lambda_mag_g1_mu", 1e-4),
+            _get_float_arg(args, "lambda_sat_g1_disp", 5e-4),
+            _get_float_arg(args, "lambda_raw_g1_disp", 1e-4),
+        ),
+        (
+            "local",
+            _get_float_arg(args, "lambda_mag_g2_mu", 2e-5),
+            _get_float_arg(args, "lambda_sat_g2_disp", 1e-4),
+            _get_float_arg(args, "lambda_raw_g2_disp", 1e-4),
+        ),
+        (
+            "smooth",
+            _get_float_arg(args, "lambda_mag_g3_mu", _get_float_arg(args, "lambda_mag_g2_mu", 2e-5)),
+            _get_float_arg(args, "lambda_sat_g3_disp", _get_float_arg(args, "lambda_sat_g2_disp", 1e-4)),
+            _get_float_arg(args, "lambda_raw_g3_disp", _get_float_arg(args, "lambda_raw_g2_disp", 1e-4)),
+        ),
+    )
+
+    for expert_name, mag_weight, sat_weight, raw_weight in expert_specs:
+        if expert_name not in geo_expert_names:
             continue
 
-        mean_value = _safe_mean(value)
-        weight = _get_float_arg(args, lambda_name, default_lambda)
-        losses[metric_name] = mean_value.detach()
+        disp_norm = _get_aux_tensor(aux, f"geo_weighted_disp_norm_{expert_name}")
+        disp_ratio = _get_aux_tensor(aux, f"geo_weighted_disp_ratio_{expert_name}")
+        saturation = _get_aux_tensor(aux, f"geo_saturation_{expert_name}")
 
-        if weight == 0.0:
-            weighted_term = mean_value * 0.0
-            losses[f"{metric_name}_weighted"] = weighted_term.detach()
-            continue
+        if disp_norm is not None:
+            disp_norm_mean = _safe_mean(disp_norm)
+            _accumulate_weighted_loss(
+                losses,
+                total_name="L_raw_geo",
+                metric_name=f"geo_disp_norm_{expert_name}",
+                metric_value=disp_norm_mean,
+                weight=raw_weight,
+            )
 
-        term = mean_value * weight
-        losses[f"{metric_name}_weighted"] = term.detach()
-        total = term if total is None else total + term
+        if disp_ratio is not None:
+            disp_ratio_mean = _safe_mean(disp_ratio)
+            _accumulate_weighted_loss(
+                losses,
+                total_name="L_mag_geo",
+                metric_name=f"geo_disp_ratio_{expert_name}",
+                metric_value=disp_ratio_mean,
+                weight=mag_weight,
+            )
 
-    if total is not None:
-        losses[loss_name] = total
+        if saturation is not None:
+            saturation_mean = _safe_mean(saturation)
+            _accumulate_weighted_loss(
+                losses,
+                total_name="L_sat_geo",
+                metric_name=f"geo_saturation_{expert_name}",
+                metric_value=saturation_mean,
+                weight=sat_weight,
+            )
 
 
 def compute_tracking_losses(
@@ -68,7 +228,13 @@ def compute_tracking_losses(
     active_geo: int,
     active_vis: int,
     enable_visibility: bool,
+    geo_expert_names: Sequence[str],
+    vis_expert_names: Sequence[str],
+    force_geo_expert: str | None = None,
+    force_vis_expert: str | None = None,
 ) -> Dict[str, torch.Tensor]:
+    del prev_d_mu
+
     pi_geo = aux.get("pi_geo")
     pi_vis = aux.get("pi_vis")
 
@@ -83,67 +249,57 @@ def compute_tracking_losses(
 
     if pi_geo is not None:
         usage_geo = pi_geo.mean(dim=0)
-        losses["usage_geo_static"] = usage_geo[0]
-        if usage_geo.numel() > 1:
-            losses["usage_geo_smooth"] = usage_geo[1]
-        if usage_geo.numel() > 2:
-            losses["usage_geo_local"] = usage_geo[2]
+        resolved_geo_names = _resolve_expert_names(
+            geo_expert_names,
+            usage_geo.numel(),
+            DEFAULT_GEO_EXPERT_NAMES,
+            prefix="geo",
+        )
+        for index, expert_name in enumerate(resolved_geo_names):
+            losses[f"usage_geo_{expert_name}"] = usage_geo[index]
 
-        active_geo = max(1, min(int(active_geo), usage_geo.numel()))
-        active_usage_geo = usage_geo[:active_geo]
+        if force_geo_expert is None:
+            active_geo = max(1, min(int(active_geo), usage_geo.numel()))
+            active_geo_names = resolved_geo_names[:active_geo]
+            active_usage_geo = usage_geo[:active_geo]
+            target_geo = _build_geo_target(args, active_geo_names, usage_geo.device, usage_geo.dtype)
 
-        if active_geo == 3:
-            target_geo = torch.tensor(
-                [
-                    _get_float_arg(args, "target_geo_static", 0.30),
-                    _get_float_arg(args, "target_geo_smooth", 0.50),
-                    _get_float_arg(args, "target_geo_local", 0.20),
-                ],
-                device=usage_geo.device,
-                dtype=usage_geo.dtype,
-            )
-            target_geo = target_geo / target_geo.sum()
-        elif active_geo == 2:
-            target_geo = torch.tensor(
-                [
-                    _get_float_arg(args, "target_geo_static_stage2", 0.40),
-                    _get_float_arg(args, "target_geo_smooth_stage2", 0.60),
-                ],
-                device=usage_geo.device,
-                dtype=usage_geo.dtype,
-            )
-            target_geo = target_geo / target_geo.sum()
+            for expert_name, target_value in zip(active_geo_names, target_geo):
+                losses[f"target_usage_geo_{expert_name}"] = target_value.detach()
+
+            losses["L_balance_geo"] = ((active_usage_geo - target_geo) ** 2).sum() * _get_float_arg(args, "lambda_balance_geo", 0.0)
+
+            route_max_prob_geo = aux.get("route_max_prob_geo")
+            route_margin_geo = aux.get("route_margin_geo")
+            if route_max_prob_geo is not None:
+                route_max_prob_geo = _safe_mean(route_max_prob_geo)
+                losses["route_max_prob_geo"] = route_max_prob_geo.detach()
+                if active_geo > 1:
+                    losses["L_route_conf_geo"] = (1.0 - route_max_prob_geo) * _get_float_arg(args, "lambda_route_conf_geo", 0.0)
+            if route_margin_geo is not None:
+                losses["route_margin_geo"] = _safe_mean(route_margin_geo).detach()
         else:
-            target_geo = torch.ones_like(active_usage_geo) / max(active_geo, 1)
+            losses["L_balance_geo"] = torch.zeros((), device=usage_geo.device, dtype=usage_geo.dtype)
 
-        losses["target_usage_geo_static"] = target_geo[0].detach()
-        if target_geo.numel() > 1:
-            losses["target_usage_geo_smooth"] = target_geo[1].detach()
-        if target_geo.numel() > 2:
-            losses["target_usage_geo_local"] = target_geo[2].detach()
-
-        losses["L_balance_geo"] = ((active_usage_geo - target_geo) ** 2).sum() * _get_float_arg(args, "lambda_balance_geo", 0.0)
-
-        route_max_prob_geo = aux.get("route_max_prob_geo")
-        route_margin_geo = aux.get("route_margin_geo")
-        if route_max_prob_geo is not None:
-            losses["route_max_prob_geo"] = _safe_mean(route_max_prob_geo)
-            if active_geo > 1:
-                losses["L_route_conf_geo"] = (1.0 - _safe_mean(route_max_prob_geo)) * _get_float_arg(args, "lambda_route_conf_geo", 0.0)
-        if route_margin_geo is not None:
-            losses["route_margin_geo"] = _safe_mean(route_margin_geo)
+        _add_geo_expert_regularization(losses, aux, args, resolved_geo_names)
 
     if pi_vis is not None:
         usage_vis = pi_vis.mean(dim=0)
-        losses["usage_vis_stable"] = usage_vis[0]
-        if usage_vis.numel() > 1:
-            losses["usage_vis_transient"] = usage_vis[1]
+        resolved_vis_names = _resolve_expert_names(
+            vis_expert_names,
+            usage_vis.numel(),
+            DEFAULT_VIS_EXPERT_NAMES,
+            prefix="vis",
+        )
+        for index, expert_name in enumerate(resolved_vis_names):
+            losses[f"usage_vis_{expert_name}"] = usage_vis[index]
 
         active_vis = max(1, min(int(active_vis), usage_vis.numel()))
-        if active_vis > 1 and enable_visibility:
-            target_vis = torch.tensor([0.85, 0.15], device=usage_vis.device, dtype=usage_vis.dtype)
-            target_vis = target_vis[:active_vis]
-            target_vis = target_vis / target_vis.sum()
+        active_vis_names = resolved_vis_names[:active_vis]
+        if force_vis_expert is None and active_vis > 1 and enable_visibility:
+            target_vis = _build_vis_target(args, active_vis_names, usage_vis.device, usage_vis.dtype)
+            for expert_name, target_value in zip(active_vis_names, target_vis):
+                losses[f"target_usage_vis_{expert_name}"] = target_value.detach()
             losses["L_balance_vis"] = ((usage_vis[:active_vis] - target_vis) ** 2).sum() * _get_float_arg(args, "lambda_balance_vis", 0.0)
         else:
             losses["L_balance_vis"] = torch.zeros((), device=usage_vis.device, dtype=usage_vis.dtype)
@@ -151,30 +307,29 @@ def compute_tracking_losses(
         route_max_prob_vis = aux.get("route_max_prob_vis")
         route_margin_vis = aux.get("route_margin_vis")
         if route_max_prob_vis is not None:
-            losses["route_max_prob_vis"] = _safe_mean(route_max_prob_vis)
-            if active_vis > 1 and enable_visibility:
-                losses["L_route_conf_vis"] = (1.0 - _safe_mean(route_max_prob_vis)) * _get_float_arg(args, "lambda_route_conf_vis", 0.0)
+            route_max_prob_vis = _safe_mean(route_max_prob_vis)
+            losses["route_max_prob_vis"] = route_max_prob_vis.detach()
+            if force_vis_expert is None and active_vis > 1 and enable_visibility:
+                losses["L_route_conf_vis"] = (1.0 - route_max_prob_vis) * _get_float_arg(args, "lambda_route_conf_vis", 0.0)
         if route_margin_vis is not None:
-            losses["route_margin_vis"] = _safe_mean(route_margin_vis)
+            losses["route_margin_vis"] = _safe_mean(route_margin_vis).detach()
 
-    if entropy_geo is not None and entropy_vis is not None and iteration <= args.entropy_end_iter:
+    if entropy_geo is not None and entropy_vis is not None and iteration <= getattr(args, "entropy_end_iter", 0):
         losses["L_entropy"] = -args.lambda_entropy_geo * entropy_geo - args.lambda_entropy_vis * entropy_vis
 
     if d_mu is not None:
-        losses["mean_norm_d_mu"] = _safe_mean(torch.norm(d_mu, dim=-1))
-        if prev_d_mu is not None and prev_d_mu.shape == d_mu.shape:
-            losses["L_geo_temp"] = ((d_mu - prev_d_mu) ** 2).mean() * _get_float_arg(args, "lambda_geo_temp", 0.0)
-        centered = d_mu - d_mu.mean(dim=0, keepdim=True)
-        losses["L_geo_spatial"] = (centered ** 2).mean() * _get_float_arg(args, "lambda_geo_spatial", 0.0)
+        losses["mean_norm_d_mu"] = _safe_mean(torch.norm(d_mu, dim=-1)).detach()
+        _add_temporal_regularization(losses, aux, args)
 
     if d_rot is not None:
-        losses["mean_norm_d_rot"] = _safe_mean(torch.norm(d_rot, dim=-1))
+        losses["mean_norm_d_rot"] = _safe_mean(torch.norm(d_rot, dim=-1)).detach()
     if d_scale is not None:
-        losses["mean_norm_d_scale"] = _safe_mean(torch.norm(d_scale, dim=-1))
+        losses["mean_norm_d_scale"] = _safe_mean(torch.norm(d_scale, dim=-1)).detach()
 
     if d_opacity_logit is not None:
-        losses["mean_abs_d_opacity"] = _safe_mean(torch.abs(d_opacity_logit))
-        losses["L_vis_sparse"] = _safe_mean(torch.abs(d_opacity_logit)) * _get_float_arg(args, "lambda_vis_sparse", 0.0)
+        mean_abs_opacity = _safe_mean(torch.abs(d_opacity_logit))
+        losses["mean_abs_d_opacity"] = mean_abs_opacity.detach()
+        losses["L_vis_sparse"] = mean_abs_opacity * _get_float_arg(args, "lambda_vis_sparse", 0.0)
 
     if (
         pi_vis is not None
@@ -182,68 +337,40 @@ def compute_tracking_losses(
         and pi_vis.shape[-1] > 1
         and active_vis > 1
         and enable_visibility
-        and iteration >= args.enable_decouple_iter
+        and iteration >= getattr(args, "enable_decouple_iter", 0)
     ):
-        pi_transient = pi_vis[:, 1]
-        d_mu_sq = (d_mu ** 2).sum(dim=-1)
-        losses["mean_pi_vis_transient"] = _safe_mean(pi_transient)
-        losses["L_decouple"] = (pi_transient * d_mu_sq).mean() * _get_float_arg(args, "lambda_decouple", 0.0)
+        resolved_vis_names = _resolve_expert_names(
+            vis_expert_names,
+            pi_vis.shape[-1],
+            DEFAULT_VIS_EXPERT_NAMES,
+            prefix="vis",
+        )
+        if "transient" in resolved_vis_names:
+            transient_index = resolved_vis_names.index("transient")
+            pi_transient = pi_vis[:, transient_index]
+            d_mu_sq = (d_mu ** 2).sum(dim=-1)
+            losses["mean_pi_vis_transient"] = _safe_mean(pi_transient).detach()
+            losses["L_decouple"] = (pi_transient * d_mu_sq).mean() * _get_float_arg(args, "lambda_decouple", 0.0)
     elif pi_vis is not None and pi_vis.shape[-1] > 1:
-        losses["mean_pi_vis_transient"] = _safe_mean(pi_vis[:, 1])
+        resolved_vis_names = _resolve_expert_names(
+            vis_expert_names,
+            pi_vis.shape[-1],
+            DEFAULT_VIS_EXPERT_NAMES,
+            prefix="vis",
+        )
+        if "transient" in resolved_vis_names:
+            transient_index = resolved_vis_names.index("transient")
+            losses["mean_pi_vis_transient"] = _safe_mean(pi_vis[:, transient_index]).detach()
 
     expert_diversity_geo = aux.get("expert_diversity_geo")
     if expert_diversity_geo is not None:
-        losses["expert_diversity_geo"] = _safe_mean(expert_diversity_geo)
-        losses["L_expert_diversity_geo"] = _safe_mean(expert_diversity_geo) * _get_float_arg(args, "lambda_expert_diversity_geo", 0.0)
-
-    _add_aux_regularization(
-        losses=losses,
-        aux=aux,
-        args=args,
-        loss_name="L_sat_geo",
-        specs=[
-            (("loss_geo_e1_sat_disp", "loss_geo_e1_loss_sat_disp"), "lambda_sat_g1_disp", 5e-4, "sat_geo_e1_disp"),
-            (("loss_geo_e1_sat_rot", "loss_geo_e1_loss_sat_rot"), "lambda_sat_g1_rot", 5e-4, "sat_geo_e1_rot"),
-            (("loss_geo_e1_sat_scl", "loss_geo_e1_loss_sat_scl"), "lambda_sat_g1_scl", 0.0, "sat_geo_e1_scl"),
-            (("loss_geo_e2_sat_disp", "loss_geo_e2_loss_sat_disp"), "lambda_sat_g2_disp", 1e-4, "sat_geo_e2_disp"),
-            (("loss_geo_e2_sat_rot", "loss_geo_e2_loss_sat_rot"), "lambda_sat_g2_rot", 1e-4, "sat_geo_e2_rot"),
-            (("loss_geo_e2_sat_scl", "loss_geo_e2_loss_sat_scl"), "lambda_sat_g2_scl", 0.0, "sat_geo_e2_scl"),
-        ],
-    )
-
-    _add_aux_regularization(
-        losses=losses,
-        aux=aux,
-        args=args,
-        loss_name="L_mag_geo",
-        specs=[
-            (("loss_geo_e1_mag_disp", "loss_geo_e1_mag_mu"), "lambda_mag_g1_mu", 1e-4, "mag_geo_e1_mu"),
-            (("loss_geo_e1_mag_rot",), "lambda_mag_g1_rot", 1e-4, "mag_geo_e1_rot"),
-            (("loss_geo_e1_mag_scl",), "lambda_mag_g1_scl", 0.0, "mag_geo_e1_scl"),
-            (("loss_geo_e2_mag_disp", "loss_geo_e2_mag_mu"), "lambda_mag_g2_mu", 2e-5, "mag_geo_e2_mu"),
-            (("loss_geo_e2_mag_rot",), "lambda_mag_g2_rot", 2e-5, "mag_geo_e2_rot"),
-            (("loss_geo_e2_mag_scl",), "lambda_mag_g2_scl", 0.0, "mag_geo_e2_scl"),
-        ],
-    )
-
-    _add_aux_regularization(
-        losses=losses,
-        aux=aux,
-        args=args,
-        loss_name="L_raw_geo",
-        specs=[
-            (("loss_geo_e1_raw_disp",), "lambda_raw_g1_disp", 1e-4, "raw_geo_e1_disp"),
-            (("loss_geo_e1_raw_rot",), "lambda_raw_g1_rot", 1e-4, "raw_geo_e1_rot"),
-            (("loss_geo_e1_raw_scl",), "lambda_raw_g1_scl", 0.0, "raw_geo_e1_scl"),
-            (("loss_geo_e2_raw_disp",), "lambda_raw_g2_disp", 1e-4, "raw_geo_e2_disp"),
-            (("loss_geo_e2_raw_rot",), "lambda_raw_g2_rot", 5e-5, "raw_geo_e2_rot"),
-            (("loss_geo_e2_raw_scl",), "lambda_raw_g2_scl", 0.0, "raw_geo_e2_scl"),
-        ],
-    )
+        expert_diversity_geo = _safe_mean(expert_diversity_geo)
+        losses["expert_diversity_geo"] = expert_diversity_geo.detach()
+        losses["L_expert_diversity_geo"] = expert_diversity_geo * _get_float_arg(args, "lambda_expert_diversity_geo", 0.0)
 
     if entropy_geo is not None:
-        losses["entropy_geo"] = entropy_geo
+        losses["entropy_geo"] = entropy_geo.detach()
     if entropy_vis is not None:
-        losses["entropy_vis"] = entropy_vis
+        losses["entropy_vis"] = entropy_vis.detach()
 
     return losses

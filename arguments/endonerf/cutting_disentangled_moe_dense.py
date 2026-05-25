@@ -14,14 +14,14 @@ OptimizationParams = dict(
     percent_dense=0.01,
     opacity_reset_interval=3000,
     position_lr_max_steps=9000,
-    prune_interval=1000,
+    pruning_interval=1000,
     densify_until_iter=7000,
 )
 
 ModelHiddenParams = dict(
-    tracking_type='disentangled_moe',
+    tracking_type='heterogeneous_moe',
     enable_visibility=True,
-    K_geo=3,
+    K_geo=4,
     K_vis=2,
     geo_hidden_dim=64,
     vis_hidden_dim=64,
@@ -29,7 +29,7 @@ ModelHiddenParams = dict(
     temperature_geo_final=0.7,
     temperature_vis_init=2.0,
     temperature_vis_final=1.0,
-    max_disp_shared_ratio=0.01,
+    max_disp_hexplane_ratio=0.01,
     max_disp_smooth_ratio=0.0005,
     max_disp_local_ratio=0.0015,
     max_rot_shared=0.05,
@@ -41,29 +41,21 @@ ModelHiddenParams = dict(
 
     max_opacity_delta=4.0,
 
-    raw_scale_disp=0.05,
-    raw_scale_rot=0.05,
-    raw_scale_scale=0.05,
-    raw_scale_opacity=0.05,
 
     sat_threshold=0.8,
-    raw_limit=1.1,
 
-    freeze_scale_branch=True,
-    scale_branch_multiplier=0.0,
 
-    freeze_rot_branch=True,
-    rot_branch_multiplier=0.0,
 
     lambda_balance_geo=0.005,
     lambda_balance_vis=0.001,
 
     target_geo_static=0.30,
-    target_geo_smooth=0.50,
+    target_geo_hexplane=0.35,
     target_geo_local=0.20,
+    target_geo_residual_smooth=0.15,
 
     target_geo_static_stage2=0.40,
-    target_geo_smooth_stage2=0.60,
+    target_geo_hexplane_stage2=0.60,
 
     lambda_route_conf_geo=0.002,
     lambda_route_conf_vis=0.001,
@@ -80,29 +72,17 @@ ModelHiddenParams = dict(
     lambda_sat_g1_disp=5e-4,
     lambda_sat_g2_disp=1e-4,
 
-    lambda_sat_g1_rot=0.0,
-    lambda_sat_g2_rot=0.0,
 
-    lambda_sat_g1_scl=0.0,
-    lambda_sat_g2_scl=0.0,
 
     lambda_mag_g1_mu=1e-4,
     lambda_mag_g2_mu=2e-5,
 
-    lambda_mag_g1_rot=0.0,
-    lambda_mag_g2_rot=0.0,
 
-    lambda_mag_g1_scl=0.0,
-    lambda_mag_g2_scl=0.0,
 
     lambda_raw_g1_disp=1e-4,
     lambda_raw_g2_disp=1e-4,
 
-    lambda_raw_g1_rot=0.0,
-    lambda_raw_g2_rot=0.0,
 
-    lambda_raw_g1_scl=0.0,
-    lambda_raw_g2_scl=0.0,
 
     warmup_iters=1000,
     enable_shared_only_iter=1000,
