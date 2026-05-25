@@ -80,7 +80,10 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.percent_dense,
             self.spatial_lr_scale,
-            {"tracking_type": getattr(self._deformation.deformation_net, "tracking_mode", "original")},
+            {
+                "tracking_type": getattr(self._deformation.deformation_net, "tracking_mode", "original"),
+                "tracking_arch_version": self._deformation.deformation_net.get_tracking_arch_version(),
+            },
         )
 
     def restore(self, model_args, training_args):
@@ -134,10 +137,22 @@ class GaussianModel:
             raise ValueError(f"Unsupported checkpoint format with {len(remaining)} payload entries")
 
         saved_tracking_type = metadata.get("tracking_type")
+        saved_tracking_arch_version = metadata.get("tracking_arch_version")
         current_tracking_type = getattr(self._deformation.deformation_net, "tracking_mode", "original")
+        current_tracking_arch_version = self._deformation.deformation_net.get_tracking_arch_version()
         if saved_tracking_type is not None and saved_tracking_type != current_tracking_type:
             raise ValueError(
                 f"Checkpoint tracking_type '{saved_tracking_type}' does not match current model tracking_type '{current_tracking_type}'"
+            )
+        if current_tracking_type == "hetero_moe" and saved_tracking_type == current_tracking_type and saved_tracking_arch_version is None:
+            raise ValueError(
+                "This heterogeneous_moe checkpoint predates the residual-MoE architecture update and cannot be resumed automatically. "
+                "Start from a compatible checkpoint or retrain with the updated architecture."
+            )
+        if saved_tracking_arch_version is not None and saved_tracking_arch_version != current_tracking_arch_version:
+            raise ValueError(
+                "Checkpoint tracking architecture version "
+                f"'{saved_tracking_arch_version}' does not match current version '{current_tracking_arch_version}'."
             )
 
         try:
@@ -301,10 +316,22 @@ class GaussianModel:
         meta_path = os.path.join(path, "deformation_meta.pth")
         metadata = torch.load(meta_path, map_location="cpu") if os.path.exists(meta_path) else {}
         saved_tracking_type = metadata.get("tracking_type") if isinstance(metadata, dict) else None
+        saved_tracking_arch_version = metadata.get("tracking_arch_version") if isinstance(metadata, dict) else None
         current_tracking_type = getattr(self._deformation.deformation_net, "tracking_mode", "original")
+        current_tracking_arch_version = self._deformation.deformation_net.get_tracking_arch_version()
         if saved_tracking_type is not None and saved_tracking_type != current_tracking_type:
             raise ValueError(
                 f"Saved deformation tracking_type '{saved_tracking_type}' does not match current model tracking_type '{current_tracking_type}'"
+            )
+        if current_tracking_type == "hetero_moe" and saved_tracking_type == current_tracking_type and saved_tracking_arch_version is None:
+            raise ValueError(
+                "This heterogeneous_moe deformation checkpoint predates the residual-MoE architecture update and cannot be loaded automatically. "
+                "Start from a compatible checkpoint or retrain with the updated architecture."
+            )
+        if saved_tracking_arch_version is not None and saved_tracking_arch_version != current_tracking_arch_version:
+            raise ValueError(
+                "Saved deformation tracking architecture version "
+                f"'{saved_tracking_arch_version}' does not match current version '{current_tracking_arch_version}'."
             )
         try:
             self._deformation.load_state_dict(weight_dict)
@@ -329,7 +356,10 @@ class GaussianModel:
         torch.save(self._deformation_table, os.path.join(path, "deformation_table.pth"))
         torch.save(self._deformation_accum, os.path.join(path, "deformation_accum.pth"))
         torch.save(
-            {"tracking_type": getattr(self._deformation.deformation_net, "tracking_mode", "original")},
+            {
+                "tracking_type": getattr(self._deformation.deformation_net, "tracking_mode", "original"),
+                "tracking_arch_version": self._deformation.deformation_net.get_tracking_arch_version(),
+            },
             os.path.join(path, "deformation_meta.pth"),
         )
 

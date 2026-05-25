@@ -4,7 +4,7 @@ ModelParams = dict(
 )
 
 OptimizationParams = dict(
-    coarse_iterations=2000,
+    coarse_iterations=1000,
     deformation_lr_init=0.00016,
     deformation_lr_final=0.0000016,
     deformation_lr_delay_mult=0.01,
@@ -14,7 +14,7 @@ OptimizationParams = dict(
     percent_dense=0.01,
     opacity_reset_interval=3000,
     position_lr_max_steps=9000,
-    pruning_interval=1000,
+    pruning_interval=3000,
 )
 
 ModelHiddenParams = dict(

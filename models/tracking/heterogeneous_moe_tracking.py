@@ -85,12 +85,32 @@ class TrackingPhase:
     group_lr_scales: Dict[str, float] = field(default_factory=dict)
 
     def is_group_trainable(self, group_name: str) -> bool:
-        if group_name in {"always", "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"}:
+        if group_name in {
+            "always",
+            "xyz",
+            "f_dc",
+            "f_rest",
+            "opacity",
+            "scaling",
+            "rotation",
+            "tracking_base_deformation",
+            "tracking_base_grid",
+        }:
             return True
         return any(group_name.startswith(prefix) for prefix in self.trainable_group_prefixes)
 
     def lr_scale_for_group(self, group_name: str) -> float:
-        if group_name in {"always", "xyz", "f_dc", "f_rest", "opacity", "scaling", "rotation"}:
+        if group_name in {
+            "always",
+            "xyz",
+            "f_dc",
+            "f_rest",
+            "opacity",
+            "scaling",
+            "rotation",
+            "tracking_base_deformation",
+            "tracking_base_grid",
+        }:
             return 1.0
         for prefix, scale in self.group_lr_scales.items():
             if group_name.startswith(prefix):

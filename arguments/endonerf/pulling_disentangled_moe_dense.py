@@ -4,7 +4,7 @@ ModelParams = dict(
 )
 
 OptimizationParams = dict(
-    coarse_iterations=2000,
+    coarse_iterations=1000,
     deformation_lr_init=0.00016,
     deformation_lr_final=0.0000016,
     deformation_lr_delay_mult=0.01,
@@ -14,8 +14,8 @@ OptimizationParams = dict(
     percent_dense=0.01,
     opacity_reset_interval=3000,
     position_lr_max_steps=9000,
-    pruning_interval=1000,
-    densify_until_iter=7000,
+    pruning_interval=3000,
+    densify_until_iter=15000,
 )
 
 ModelHiddenParams = dict(
@@ -30,8 +30,8 @@ ModelHiddenParams = dict(
     temperature_vis_init=2.0,
     temperature_vis_final=1.0,
     max_disp_hexplane_ratio=0.01,
-    max_disp_smooth_ratio=0.0005,
-    max_disp_local_ratio=0.0015,
+    max_disp_smooth_ratio=0.01,
+    max_disp_local_ratio=0.03,
     max_rot_shared=0.05,
     max_rot_smooth=0.03,
     max_rot_local=0.08,

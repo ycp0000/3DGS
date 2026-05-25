@@ -31,7 +31,7 @@ class Deformation(nn.Module):
         if tracking_mode not in {"original", "split", "hetero_moe"}:
             raise ValueError(f"Unsupported tracking_type: {tracking_mode}")
         self.tracking_mode = tracking_mode
-        self.use_backbone = self.tracking_mode in {"original", "split"}
+        self.use_backbone = self.tracking_mode in {"original", "split", "hetero_moe"}
         self.no_grid = bool(getattr(args, "no_grid", False) and self.use_backbone)
 
         self.grid: Optional[HexPlaneField] = None
@@ -207,15 +207,24 @@ class Deformation(nn.Module):
         if time_features is None:
             raise RuntimeError("hetero_moe tracking requires time_features from the time encoder")
 
+        hidden = self.query_time(rays_pts_emb, time_emb).float()
+        base_pts, base_scales, base_rotations, base_opacity = self._forward_original(
+            hidden,
+            rays_pts_emb,
+            scales_emb,
+            rotations_emb,
+            opacity_emb,
+        )
+
         phase = self.get_tracking_phase()
         if phase is None:
             raise RuntimeError("Tracking phase is unavailable for hetero_moe mode")
 
         pts, scales, rotations, opacity, aux = self.heterogeneous_head(
-            means3d=rays_pts_emb[:, :3],
-            scales=scales_emb[:, :3],
-            rotations=rotations_emb[:, :4],
-            opacity_logits=opacity_emb[:, :1],
+            means3d=base_pts,
+            scales=base_scales,
+            rotations=base_rotations,
+            opacity_logits=base_opacity,
             time_values=time_emb[:, :1],
             time_features=time_features,
             scene_scale=scene_scale,
@@ -232,15 +241,37 @@ class Deformation(nn.Module):
                 parameter_list.append(param)
         return parameter_list
 
+    def _get_backbone_mlp_parameters(self):
+        modules = (
+            self.feature_out,
+            self.pos_deform,
+            self.scales_deform,
+            self.rotations_deform,
+            self.opacity_deform,
+        )
+        parameters = []
+        for module in modules:
+            if module is not None:
+                parameters.extend(list(module.parameters()))
+        return parameters
+
     def get_grid_parameters(self):
         if self.grid is None:
             return []
         return list(self.grid.parameters())
 
     def get_tracking_parameter_groups(self) -> Dict[str, Iterable[nn.Parameter]]:
-        if self.heterogeneous_head is None:
-            return {}
-        return self.heterogeneous_head.named_parameter_groups()
+        groups: Dict[str, Iterable[nn.Parameter]] = {}
+        if self.tracking_mode == "hetero_moe" and self.use_backbone:
+            backbone_parameters = self._get_backbone_mlp_parameters()
+            if backbone_parameters:
+                groups["tracking_base_deformation"] = backbone_parameters
+            grid_parameters = self.get_grid_parameters()
+            if grid_parameters:
+                groups["tracking_base_grid"] = grid_parameters
+        if self.heterogeneous_head is not None:
+            groups.update(self.heterogeneous_head.named_parameter_groups())
+        return groups
 
     def set_aabb(self, xyz_max, xyz_min) -> None:
         if self.grid is not None:
@@ -287,6 +318,13 @@ class Deformation(nn.Module):
         if self.heterogeneous_head is None:
             return (("single",), ("single",))
         return (self.heterogeneous_head.GEO_EXPERT_NAMES, self.heterogeneous_head.VIS_EXPERT_NAMES)
+
+    def get_tracking_arch_version(self) -> str:
+        if self.tracking_mode == "hetero_moe":
+            return "hetero_residual_v2"
+        if self.tracking_mode == "split":
+            return "split_v1"
+        return "original_v1"
 
 
 class deform_network(nn.Module):

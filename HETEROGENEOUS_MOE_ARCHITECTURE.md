@@ -2,7 +2,7 @@
 
 ## Goal
 
-`tracking_type='heterogeneous_moe'` replaces the old single-backbone dynamic head with a true heterogeneous Mixture-of-Experts tracking module. The design follows the MoE-GS-style idea that different motion patterns should be modeled by different experts instead of forcing all dynamics through one shared deformation head.
+`tracking_type='heterogeneous_moe'` now keeps the old dynamic deformation path as a baseline floor and augments it with a true heterogeneous Mixture-of-Experts residual tracking module. The design follows the MoE-GS-style idea that different motion patterns should be modeled by different experts instead of forcing all dynamics through one shared deformation head, but it no longer asks the MoE branch to replace the entire baseline deformation path.
 
 The implemented objective is:
 
@@ -17,8 +17,8 @@ The implemented objective is:
 In heterogeneous mode the runtime path is:
 
 1. `scene/deformation.py` selects `tracking_mode='hetero_moe'`.
-2. `Deformation.forward_dynamic()` obtains the current `TrackingPhase` from `HeterogeneousMoEScheduler`.
-3. The time encoder provides `time_features`; the heterogeneous head receives:
+2. `Deformation.forward_dynamic()` first runs the original dynamic path to obtain baseline translation / scale / rotation / opacity updates.
+3. The time encoder provides `time_features`; the heterogeneous head receives the **baseline-deformed** state:
    - `means3d`
    - `scales`
    - `rotations`
@@ -27,15 +27,15 @@ In heterogeneous mode the runtime path is:
    - `time_features`
    - `scene_scale`
    - `phase`
-4. `HeterogeneousMoETracking.forward()` computes geometry routing, geometry-expert outputs, visibility routing, and visibility-expert outputs.
+4. `HeterogeneousMoETracking.forward()` computes geometry routing, geometry-expert residuals, visibility routing, and visibility-expert residuals.
 5. The module returns:
-   - translated means `means3d_t`
-   - unchanged `scales`
-   - unchanged `rotations`
-   - updated `opacity_logits_t`
+   - residual-updated translated means `means3d_t`
+   - baseline `scales`
+   - baseline `rotations`
+   - residual-updated `opacity_logits_t`
    - auxiliary routing and regularization statistics
 
-In the current implementation, heterogeneous mode predicts translation and opacity changes only. `d_rot` is zero and `d_scale` is zero by design.
+In the current corrective implementation, the MoE residual branch predicts translation and opacity changes only. `d_rot` is zero and `d_scale` is zero for the residual branch by design, while final scale/rotation remain inherited from the original path.
 
 ## Geometry Branch
 
@@ -69,10 +69,12 @@ Routing supports:
 
 ### Geometry output
 
-Each active expert predicts a bounded translation field. The final geometry update is the weighted sum of expert outputs:
+Each active expert predicts a bounded translation residual. The final geometry update inside the residual branch is the weighted sum of expert outputs:
 
 - `d_mu = sum_k pi_geo[k] * d_mu_k`
 - `means3d_t = means3d + d_mu`
+
+Here `means3d` is already the baseline-deformed position from the original dynamic path, so the MoE branch acts as a residual correction rather than a full replacement.
 
 Bounding is scene-scale-aware:
 
@@ -108,10 +110,12 @@ This means the visibility decision depends on what kind of motion the geometry b
 
 ### Visibility output
 
-The visibility branch predicts an opacity-logit delta:
+The visibility branch predicts an opacity-logit residual:
 
 - `d_opacity = sum_j pi_vis[j] * d_opacity_j`
 - `opacity_logits_t = opacity_update(opacity_logits, d_opacity)`
+
+As with geometry, `opacity_logits` here already includes the original dynamic opacity update, so the MoE branch only supplies a residual correction.
 
 The transient branch is bounded by `max_opacity_delta`.
 
@@ -233,10 +237,11 @@ The tracking package exports:
 
 The final heterogeneous tracking stack should be understood as:
 
-- a scene-scale-bounded geometry MoE,
-- a smaller visibility MoE conditioned on geometry outcome,
+- the original dynamic deformation path as the baseline floor,
+- a scene-scale-bounded geometry residual MoE,
+- a smaller visibility residual MoE conditioned on geometry outcome,
 - a staged optimization schedule that teaches experts before teaching the router,
 - a temporally grounded motion regularizer,
-- a displacement-first design where rotation and scale are intentionally left unchanged in heterogeneous mode.
+- a corrective design where rotation and scale remain baseline-driven while MoE currently refines translation and opacity.
 
 That is the architecture that the current codebase actually trains and evaluates.

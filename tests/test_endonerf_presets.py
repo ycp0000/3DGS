@@ -89,6 +89,20 @@ def _assert_legacy_fallbacks(args):
 
 
 
+def _load_preset_args(preset_name: str):
+    module = _load_module(ENDONERF_PRESET_DIR / preset_name)
+    return merge_hparams(
+        _build_default_args(),
+        {
+            "ModelParams": getattr(module, "ModelParams", {}),
+            "OptimizationParams": getattr(module, "OptimizationParams", {}),
+            "ModelHiddenParams": getattr(module, "ModelHiddenParams", {}),
+            "PipelineParams": getattr(module, "PipelineParams", {}),
+        },
+    )
+
+
+
 def test_endonerf_presets_only_use_known_parser_keys():
     args = _build_default_args()
 
@@ -122,7 +136,8 @@ def test_merge_hparams_keeps_endonerf_pruning_and_tracking_regularizers():
         },
     )
 
-    assert merged.pruning_interval == 1000
+    assert merged.pruning_interval == 3000
+    assert merged.densify_until_iter == 15000
     assert merged.lambda_mag_g1_mu == 1e-4
     assert merged.lambda_mag_g2_mu == 2e-5
     assert merged.lambda_sat_g1_disp == 5e-4
@@ -200,6 +215,26 @@ def test_get_combined_args_allows_cli_overrides_on_top_of_legacy_cfg_args(tmp_pa
     assert merged.max_disp_hexplane_ratio == 0.125
     assert merged.target_geo_smooth == 0.9
     _assert_legacy_fallbacks(merged)
+
+
+
+def test_main_heterogeneous_presets_match_baseline_protocol_and_motion_caps():
+    for scene_name in ("cutting", "pulling"):
+        baseline = _load_preset_args(f"{scene_name}_original.py")
+        for variant in (
+            f"{scene_name}_geo_moe_only.py",
+            f"{scene_name}_disentangled_moe.py",
+            f"{scene_name}_disentangled_moe_dense.py",
+            f"{scene_name}_disentangled_moe_sparse.py",
+        ):
+            candidate = _load_preset_args(variant)
+            assert candidate.coarse_iterations == baseline.coarse_iterations
+            assert candidate.pruning_interval == baseline.pruning_interval
+            assert candidate.densify_until_iter == baseline.densify_until_iter
+            assert candidate.iterations == baseline.iterations
+            assert candidate.position_lr_max_steps == baseline.position_lr_max_steps
+            assert candidate.max_disp_smooth_ratio == 0.01
+            assert candidate.max_disp_local_ratio == 0.03
 
 
 

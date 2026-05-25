@@ -26,12 +26,21 @@ A more detailed implementation note is in [HETEROGENEOUS_MOE_ARCHITECTURE.md](HE
 
 ## Important scope note
 
-The current heterogeneous implementation predicts:
+The corrected heterogeneous implementation is now a **residual augmentation** over the original dynamic deformation path.
 
-- geometry translation updates
-- opacity-logit updates
+That means heterogeneous mode:
 
-It does **not** currently apply learned rotation or scale deltas in heterogeneous mode. In this mode, `d_rot = 0` and `d_scale = 0` by design. Keep that in mind when interpreting gains or failure modes.
+- keeps the original deformation backbone active as the baseline floor,
+- applies MoE residuals to geometry translation and opacity logits,
+- keeps scale and rotation driven by the original path in the current corrective patch.
+
+So in `tracking_type='heterogeneous_moe'`:
+
+- translation = original dynamic translation + MoE residual translation
+- opacity logits = original dynamic opacity update + MoE residual opacity delta
+- `d_rot = 0` and `d_scale = 0` remain true for the MoE residual branch itself
+
+This change matters for interpretation: the main MoE experiment is no longer a lower-DoF replacement model. It is now a baseline-preserving residual expert layer, which is the fair comparison for asking whether MoE helps.
 
 ## Environment setup
 
@@ -118,7 +127,7 @@ Why:
 
 ### Stage 3: Run the full heterogeneous MoE
 
-Then run the full geometry + visibility MoE.
+Then run the full geometry + visibility residual MoE.
 
 ```bash
 python train.py \
@@ -217,6 +226,8 @@ Use the following order for each scene:
 3. `*_disentangled_moe.py`
 4. `*_disentangled_moe_dense.py`
 5. `*_disentangled_moe_sparse.py`
+
+After the corrective patch above, these presets are intended to share the same coarse/pruning/densification protocol so the comparison isolates architecture rather than training-budget drift.
 
 This is the minimum useful ladder because it answers:
 
