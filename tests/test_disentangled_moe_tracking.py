@@ -1345,6 +1345,34 @@ def test_cams_optimizer_groups_cover_output_affecting_motion_parameters():
             assert id(param) in grouped_params
 
 
+def test_cams_gs_uses_local_rotation_and_scale_caps():
+    tracking = CAMSGSTracking(
+        time_feature_dim=8,
+        max_rot_local=0.10,
+        max_scale_local=0.10,
+        max_rot_smooth=0.05,
+        max_scale_smooth=0.05,
+    )
+
+    assert tracking.motion.max_rot_delta == 0.10
+    assert tracking.motion.max_scale_delta == 0.10
+
+
+def test_deformation_wires_cams_gs_local_rotation_and_scale_caps():
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs"
+    args.max_rot_local = 0.10
+    args.max_scale_local = 0.10
+    args.max_rot_smooth = 0.01
+    args.max_scale_smooth = 0.01
+
+    model = Deformation(D=1, W=8, args=args)
+
+    assert model.cams_head is not None
+    assert model.cams_head.motion.max_rot_delta == 0.10
+    assert model.cams_head.motion.max_scale_delta == 0.10
+
+
 def test_cams_gs_forward_emits_patch_c_aux_and_supports_tracking_losses():
     args = _build_deformation_args()
     args.tracking_type = "cams_gs"

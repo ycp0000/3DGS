@@ -15,6 +15,7 @@ from arguments import (
     PipelineParams,
     get_combined_args,
 )
+from models.tracking.cams_gs_tracking import CAMSGSScheduler
 from utils.params_utils import merge_hparams
 
 ENDONERF_PRESET_DIR = ROOT / "arguments" / "endonerf"
@@ -257,3 +258,25 @@ def test_cams_gs_presets_use_known_parser_keys_and_tracking_type():
         assert candidate.position_lr_max_steps == baseline.position_lr_max_steps
         assert candidate.max_disp_smooth_ratio == 0.01
         assert candidate.max_disp_local_ratio == 0.03
+
+
+def test_cams_gs_early_phases_preset_has_explicit_stage_boundaries():
+    candidate = _load_preset_args("cutting_cams_gs_early_phases.py")
+    assert candidate.tracking_type == "cams_gs"
+    assert candidate.stage_global_only_end == 600
+    assert candidate.stage_graph_bootstrap_end == 2700
+    assert candidate.stage_local_motion_end == 3600
+    assert candidate.stage_visibility_enable_iter == 6300
+    assert candidate.stage_lifecycle_enable_iter == 7650
+
+    scheduler = CAMSGSScheduler(candidate)
+    assert scheduler.build(599, candidate.iterations).name == "global_only"
+    assert scheduler.build(600, candidate.iterations).name == "graph_bootstrap"
+    assert scheduler.build(2699, candidate.iterations).name == "graph_bootstrap"
+    assert scheduler.build(2700, candidate.iterations).name == "local_motion_only"
+    assert scheduler.build(3599, candidate.iterations).name == "local_motion_only"
+    assert scheduler.build(3600, candidate.iterations).name == "motion_warmup"
+    assert scheduler.build(6299, candidate.iterations).name == "motion_warmup"
+    assert scheduler.build(6300, candidate.iterations).name == "visibility_refine"
+    assert scheduler.build(7649, candidate.iterations).name == "visibility_refine"
+    assert scheduler.build(7650, candidate.iterations).name == "joint_finetune"
