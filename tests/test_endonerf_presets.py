@@ -244,3 +244,16 @@ def test_get_float_arg_treats_non_finite_values_as_unset():
 
     args.value = -float("inf")
     assert _get_float_arg(args, "value", 4.56) == 4.56
+
+
+def test_cams_gs_presets_use_known_parser_keys_and_tracking_type():
+    for scene_name in ("cutting", "pulling"):
+        baseline = _load_preset_args(f"{scene_name}_original.py")
+        candidate = _load_preset_args(f"{scene_name}_cams_gs.py")
+        assert candidate.tracking_type == "cams_gs"
+        assert candidate.coarse_iterations == baseline.coarse_iterations
+        assert candidate.pruning_interval == baseline.pruning_interval
+        assert candidate.iterations == baseline.iterations
+        assert candidate.position_lr_max_steps == baseline.position_lr_max_steps
+        assert candidate.max_disp_smooth_ratio == 0.01
+        assert candidate.max_disp_local_ratio == 0.03

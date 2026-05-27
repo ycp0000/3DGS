@@ -66,7 +66,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     cov3D_precomp = None
     
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        scales = pc._scaling
+        rotations = pc._rotation
     else:
         scales = pc._scaling
         rotations = pc._rotation
@@ -88,11 +89,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 opacity[deformation_point],
                 time[deformation_point],
             )
+            deformation_aux = pc._deformation.get_aux_outputs()
         else:
             means3D_deform = means3D.new_zeros((0, means3D.shape[-1]))
             scales_deform = scales.new_zeros((0, scales.shape[-1]))
             rotations_deform = rotations.new_zeros((0, rotations.shape[-1]))
             opacity_deform = opacity.new_zeros((0, opacity.shape[-1]))
+            deformation_aux = {}
     # print(time.max())
     with torch.no_grad():
         if deformation_point.any():
@@ -114,6 +117,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
     opacity_final = pc.opacity_activation(opacity_final)
+    if pipe.compute_cov3D_python:
+        cov3D_precomp = pc.covariance_activation(scales_final, scaling_modifier, rotations_final)
+        scales_final = None
+        rotations_final = None
 
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -130,6 +137,18 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             shs = pc.get_features
     else:
         colors_precomp = override_color
+
+    appearance_rgb_delta = deformation_aux.get("appearance_rgb_delta") if stage != "coarse" else None
+    if appearance_rgb_delta is not None and deformation_point.any():
+        if colors_precomp is None:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            shs = None
+        colors_precomp = colors_precomp.clone()
+        colors_precomp[deformation_point] = torch.clamp(colors_precomp[deformation_point] + appearance_rgb_delta, 0.0, 1.0)
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, depth = rasterizer(
@@ -149,5 +168,5 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "viewspace_points": screenspace_points,
             "visibility_filter" : radii > 0,
             "radii": radii,
-            "deformation_aux": pc._deformation.get_aux_outputs() if stage != "coarse" and deformation_point.any() else {},}
+            "deformation_aux": deformation_aux if stage != "coarse" and deformation_point.any() else {},}
 

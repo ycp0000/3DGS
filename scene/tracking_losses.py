@@ -220,6 +220,35 @@ def _add_geo_expert_regularization(
             )
 
 
+def _add_cams_patch_c_losses(
+    losses: Dict[str, torch.Tensor],
+    aux: Dict[str, torch.Tensor],
+    args,
+    phase: str | None,
+) -> None:
+    appearance_offsets = _get_aux_tensor(aux, "appearance_offsets")
+    lifecycle_probs = _get_aux_tensor(aux, "lifecycle_probs")
+    lifecycle_logits = _get_aux_tensor(aux, "lifecycle_logits")
+
+    if appearance_offsets is not None and phase in {"visibility_refine", "joint_finetune"}:
+        appearance_energy = appearance_offsets.square().mean()
+        losses["appearance_offset_energy"] = appearance_energy.detach()
+        losses["L_appearance_reg"] = appearance_energy * _get_float_arg(args, "lambda_appearance_reg", 1e-4)
+
+    if lifecycle_probs is not None and phase == "joint_finetune":
+        persistent_prob = lifecycle_probs[:, :1]
+        transient_prob = lifecycle_probs[:, 1:2] if lifecycle_probs.shape[-1] > 1 else 1.0 - persistent_prob
+        lifecycle_balance = (persistent_prob.mean() - _get_float_arg(args, "target_lifecycle_persistent", 0.8)) ** 2
+        losses["mean_lifecycle_persistent"] = persistent_prob.mean().detach()
+        losses["mean_lifecycle_transient"] = transient_prob.mean().detach()
+        losses["L_lifecycle_balance"] = lifecycle_balance * _get_float_arg(args, "lambda_lifecycle_balance", 1e-4)
+
+    if lifecycle_logits is not None and phase == "joint_finetune":
+        lifecycle_energy = lifecycle_logits.square().mean()
+        losses["lifecycle_logit_energy"] = lifecycle_energy.detach()
+        losses["L_lifecycle_reg"] = lifecycle_energy * _get_float_arg(args, "lambda_lifecycle_reg", 1e-4)
+
+
 def compute_tracking_losses(
     aux: Dict[str, torch.Tensor],
     iteration: int,
@@ -282,6 +311,7 @@ def compute_tracking_losses(
             losses["L_balance_geo"] = torch.zeros((), device=usage_geo.device, dtype=usage_geo.dtype)
 
         _add_geo_expert_regularization(losses, aux, args, resolved_geo_names)
+        _add_cams_patch_c_losses(losses, aux, args, aux.get("tracking_phase_name"))
 
     if pi_vis is not None:
         usage_vis = pi_vis.mean(dim=0)

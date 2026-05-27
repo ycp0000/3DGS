@@ -180,6 +180,16 @@ class ModelHiddenParams(ParamGroup):
         self.entropy_end_iter = 2500
         self.enable_visibility = True
 
+        self.stage_global_only_end = -1
+        self.stage_graph_bootstrap_end = -1
+        self.stage_local_motion_end = -1
+        self.stage_visibility_enable_iter = -1
+        self.stage_lifecycle_enable_iter = -1
+        self.lambda_appearance_reg = 1e-4
+        self.lambda_lifecycle_balance = 1e-4
+        self.lambda_lifecycle_reg = 1e-4
+        self.target_lifecycle_persistent = 0.8
+
         self.current_iteration = 0
         super().__init__(parser, "ModelHiddenParams")
         

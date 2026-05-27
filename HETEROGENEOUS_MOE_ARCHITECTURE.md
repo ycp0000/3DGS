@@ -1,5 +1,7 @@
 # Heterogeneous MoE Tracking Architecture
 
+> Legacy architecture note kept for comparison only. The repository's current main tracking path is CAMS-GS (`tracking_type='cams_gs'`); see `CAMS_GS_ARCHITECTURE.md` for the active design.
+
 ## Goal
 
 `tracking_type='heterogeneous_moe'` now keeps the old dynamic deformation path as a baseline floor and augments it with a true heterogeneous Mixture-of-Experts residual tracking module. The design follows the MoE-GS-style idea that different motion patterns should be modeled by different experts instead of forcing all dynamics through one shared deformation head, but it no longer asks the MoE branch to replace the entire baseline deformation path.
@@ -16,7 +18,7 @@ The implemented objective is:
 
 In heterogeneous mode the runtime path is:
 
-1. `scene/deformation.py` selects `tracking_mode='hetero_moe'`.
+1. User configs select `tracking_type='heterogeneous_moe'`, which maps internally in `scene/deformation.py` to `tracking_mode='hetero_moe'`.
 2. `Deformation.forward_dynamic()` first runs the original dynamic path to obtain baseline translation / scale / rotation / opacity updates.
 3. The time encoder provides `time_features`; the heterogeneous head receives the **baseline-deformed** state:
    - `means3d`

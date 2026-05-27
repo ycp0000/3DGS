@@ -1,50 +1,105 @@
 # EndoMoeGaussian
 
-EndoMoeGaussian extends the original endoscopic dynamic Gaussian Splatting pipeline with a heterogeneous Mixture-of-Experts tracking module designed for deformable surgical scenes.
+EndoMoeGaussian now centers on **CAMS-GS**: a Cut-Aware Motion Scaffold Gaussian Splatting path for dynamic endoscopic 3D Gaussian Splatting.
 
-The current codebase supports three tracking regimes:
+The repository still contains earlier tracking paths for comparison, but the current forward-looking experimental path is:
 
-- `tracking_type='original'`: original deformation path.
-- `tracking_type='split'`: intermediate split-head path.
-- `tracking_type='heterogeneous_moe'`: final heterogeneous geometry/visibility MoE path.
+- `tracking_type='cams_gs'`
 
-The heterogeneous path is the main experimental target in this repository.
+Supported tracking modes in the codebase are:
 
-## What is implemented now
+- `tracking_type='original'`: original deformation path
+- `tracking_type='split'`: split-head intermediate path
+- `tracking_type='heterogeneous_moe'`: older residual heterogeneous MoE path
+- `tracking_type='cams_gs'`: current Cut-Aware Motion Scaffold Gaussian Splatting path
 
-The current heterogeneous tracking stack is a displacement-first MoE with:
+A detailed implementation note for the current CAMS-GS path is in [CAMS_GS_ARCHITECTURE.md](CAMS_GS_ARCHITECTURE.md).
 
-- 4 geometry experts: `static`, `hexplane`, `local`, `smooth`
-- 2 visibility experts: `stable`, `transient`
-- a staged training scheduler that activates experts progressively
-- phase-aware optimizer gating
+## What CAMS-GS implements now
+
+The current CAMS-GS path replaces the old per-Gaussian MoE story with a structured tracking design built around:
+
+- a **staged curriculum** from global motion to joint refinement
+- a **cut-aware scaffold gate** over `global / local / cut_graph` geometry experts
+- a **real 3-branch geometry composition** for translation updates
+- a **visibility / appearance head** that affects opacity and rendered color
+- a **lifecycle head** that affects opacity persistence in late training
+- phase-aware optimizer gating through named tracking parameter groups
+- checkpoint metadata validation for architecture-safe restore/load
 - adjacent-time temporal regularization from the current batch
-- checkpoint metadata checks to prevent architecture-mismatched resume/load
-- preset/config compatibility guards for legacy names such as `prune_interval`
 
-A more detailed implementation note is in [HETEROGENEOUS_MOE_ARCHITECTURE.md](HETEROGENEOUS_MOE_ARCHITECTURE.md).
+The current CAMS-GS implementation is not just an aux-logging branch: the geometry routing, visibility gating, lifecycle gating, and appearance modulation now affect the actual forward/render path.
 
-## Important scope note
+## High-level CAMS-GS data flow
 
-The corrected heterogeneous implementation is now a **residual augmentation** over the original dynamic deformation path.
+At a high level, `tracking_type='cams_gs'` runs as follows:
 
-That means heterogeneous mode:
+1. `scene/deformation.py` computes the original backbone dynamic deformation state.
+2. The CAMS head receives the **backbone-updated** Gaussian state plus time features.
+3. `CutGraphGating` predicts scaffold weights and cut-aware gate values.
+4. `CAMSGSTracking` converts those into a 3-way geometry routing distribution `pi_geo` over:
+   - `global`
+   - `local`
+   - `cut_graph`
+5. `MotionDecomposition` predicts three bounded motion branches and composes them with `pi_geo`.
+6. `VisibilityAppearanceHead` predicts:
+   - `pi_vis`
+   - `visibility_alpha`
+   - `appearance_rgb_delta`
+7. `GaussianLifecycleHead` predicts:
+   - `lifecycle_probs`
+   - `lifecycle_alpha`
+8. The CAMS head returns updated geometry / scale / rotation / opacity logits and aux statistics.
+9. `gaussian_renderer/__init__.py` uses CAMS outputs during rendering:
+   - opacity is already gated inside `models/tracking/cams_gs_tracking.py` through visibility and lifecycle
+   - precomputed RGB is modulated by `appearance_rgb_delta`
 
-- keeps the original deformation backbone active as the baseline floor,
-- applies MoE residuals to geometry translation and opacity logits,
-- keeps scale and rotation driven by the original path in the current corrective patch.
+## Current training curriculum
 
-So in `tracking_type='heterogeneous_moe'`:
+`models/tracking/cams_gs_tracking.py` defines the staged curriculum through `CAMSGSScheduler`.
 
-- translation = original dynamic translation + MoE residual translation
-- opacity logits = original dynamic opacity update + MoE residual opacity delta
-- `d_rot = 0` and `d_scale = 0` remain true for the MoE residual branch itself
+The current schedule is:
 
-This change matters for interpretation: the main MoE experiment is no longer a lower-DoF replacement model. It is now a baseline-preserving residual expert layer, which is the fair comparison for asking whether MoE helps.
+1. `global_only`
+   - train the backbone time path and global motion branch
+   - visibility off
+2. `graph_bootstrap`
+   - activate cut-graph scaffold learning
+   - visibility off
+3. `local_motion_only`
+   - activate local and cut-graph motion refinement
+   - visibility off
+4. `motion_warmup`
+   - continue motion refinement before visibility is enabled
+   - visibility off
+5. `visibility_refine`
+   - enable visibility and appearance learning
+   - lifecycle still off
+6. `joint_finetune`
+   - enable lifecycle together with full CAMS-GS refinement
+
+This schedule matters because it prevents early appearance/lifecycle noise from dominating before geometry routing has stabilized.
+
+## Current EndoNeRF presets
+
+The current CAMS-GS EndoNeRF presets are:
+
+- `arguments/endonerf/cutting_cams_gs.py`
+- `arguments/endonerf/pulling_cams_gs.py`
+
+These currently use:
+
+- `tracking_type='cams_gs'`
+- `iterations=9000`
+- `coarse_iterations=1000`
+- `position_lr_max_steps=9000`
+- `pruning_interval=3000`
+- `camera_extent=10`
+- EndoNeRF-style k-plane settings
 
 ## Environment setup
 
-Follow the base 3DGS / 4DGaussians dependency setup first.
+Follow the original dependency stack first.
 
 ```bash
 git clone https://github.com/ycp0000/3DGS.git
@@ -57,44 +112,22 @@ pip install -e submodules/depth-diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 ```
 
-This repository has been used with:
+This project has been used with the original 3DGS / 4DGaussians-style environment, including PyTorch 1.13.1 + CUDA 11.6 in the earlier setup.
 
-- Python 3.7-style environment from the original codebase
-- PyTorch 1.13.1 + CUDA 11.6 in the original setup
+## Dataset setup
 
-## Dataset preparation
-
-For EndoNeRF-style endoscopic data, use the EndoNeRF directory layout expected by the existing loaders and set:
+For EndoNeRF-style scenes, keep the repository’s expected dataset layout and use:
 
 - `extra_mark='endonerf'`
 - `camera_extent=10`
 
-The repository already contains EndoNeRF presets under:
+The EndoNeRF presets in `arguments/endonerf/` already set these values.
 
-- `arguments/endonerf/`
+## Recommended CAMS-GS workflow
 
-Useful preset families include:
+Do not judge the method from one run without comparing it against the existing baselines.
 
-- baseline original tracking:
-  - `arguments/endonerf/cutting_original.py`
-  - `arguments/endonerf/pulling_original.py`
-- full heterogeneous MoE:
-  - `arguments/endonerf/cutting_disentangled_moe.py`
-  - `arguments/endonerf/pulling_disentangled_moe.py`
-- geo-only heterogeneous ablation:
-  - `arguments/endonerf/cutting_geo_moe_only.py`
-  - `arguments/endonerf/pulling_geo_moe_only.py`
-- dense / sparse routing variants:
-  - `arguments/endonerf/*_disentangled_moe_dense.py`
-  - `arguments/endonerf/*_disentangled_moe_sparse.py`
-
-## Recommended training workflow
-
-Do **not** jump directly to the final MoE preset and declare success or failure from one run. Use a staged experiment ladder.
-
-### Stage 1: Sanity-check the baseline
-
-Run the original tracking preset first.
+### 1. Run the original baseline
 
 ```bash
 python train.py \
@@ -105,63 +138,48 @@ python train.py \
 
 Why:
 
-- verifies data loading and scene scaling are correct
-- gives you the baseline PSNR / SSIM / LPIPS reference
-- tells you whether later failures are from MoE logic or from the scene/setup itself
+- validates the scene/data setup
+- gives the baseline PSNR / SSIM / LPIPS reference
+- separates CAMS issues from dataset/setup issues
 
-### Stage 2: Check the geometry-only heterogeneous path
-
-Run the geometry-only MoE ablation next.
+### 2. Run CAMS-GS
 
 ```bash
 python train.py \
   -s <ENDONERF_SCENE_PATH> \
-  --expname "endonerf/cutting_geo_moe_only" \
-  --configs arguments/endonerf/cutting_geo_moe_only.py
+  --expname "endonerf/cutting_cams_gs" \
+  --configs arguments/endonerf/cutting_cams_gs.py
 ```
 
-Why:
-
-- isolates whether the geometry routing story is already helping
-- separates geometry specialization issues from visibility routing issues
-
-### Stage 3: Run the full heterogeneous MoE
-
-Then run the full geometry + visibility residual MoE.
+For pulling scenes, switch to:
 
 ```bash
 python train.py \
   -s <ENDONERF_SCENE_PATH> \
-  --expname "endonerf/cutting_hetero_moe" \
-  --configs arguments/endonerf/cutting_disentangled_moe.py
+  --expname "endonerf/pulling_cams_gs" \
+  --configs arguments/endonerf/pulling_cams_gs.py
 ```
 
-For pulling scenes, switch to the matching `pulling_*` preset.
-
-### Stage 4: Compare dense and sparse routing variants
-
-If the full heterogeneous run is stable, compare dense vs sparse routing.
+### 3. Render the trained model
 
 ```bash
-python train.py \
-  -s <ENDONERF_SCENE_PATH> \
-  --expname "endonerf/cutting_hetero_moe_dense" \
-  --configs arguments/endonerf/cutting_disentangled_moe_dense.py
-
-python train.py \
-  -s <ENDONERF_SCENE_PATH> \
-  --expname "endonerf/cutting_hetero_moe_sparse" \
-  --configs arguments/endonerf/cutting_disentangled_moe_sparse.py
+python render.py \
+  --model_path "output/endonerf/cutting_cams_gs" \
+  --skip_train \
+  --configs arguments/endonerf/cutting_cams_gs.py
 ```
 
-Why:
+### 4. Evaluate metrics
 
-- tells you whether sparse routing improves specialization or just destabilizes training
-- helps diagnose whether the router is benefiting from competition or suffering from premature sparsity
+```bash
+python metrics.py -m \
+  "output/endonerf/cutting_original" \
+  "output/endonerf/cutting_cams_gs"
+```
 
 ## Output layout
 
-If you pass `--expname`, training writes to:
+If you pass `--expname`, outputs are written under:
 
 ```text
 ./output/<expname>/
@@ -170,104 +188,49 @@ If you pass `--expname`, training writes to:
 For example:
 
 ```text
-./output/endonerf/cutting_hetero_moe/
+./output/endonerf/cutting_cams_gs/
 ```
 
-This directory stores:
+Typical contents include:
 
 - `cfg_args`
 - checkpoints such as `chkpnt*.pth`
 - point clouds under `point_cloud/`
-- render/eval outputs used later by `render.py` and `metrics.py`
+- render/eval outputs used by `render.py` and `metrics.py`
 
-## Rendering workflow
+## What to inspect during CAMS-GS runs
 
-After training, render the saved model.
+Do not only look at final PSNR.
 
-```bash
-python render.py \
-  --model_path "output/endonerf/cutting_hetero_moe" \
-  --skip_train \
-  --configs arguments/endonerf/cutting_disentangled_moe.py
-```
+For CAMS-GS runs, inspect:
 
-Use the preset that matches the run you trained.
+- geometry routing:
+  - `usage_geo_global`
+  - `usage_geo_local`
+  - `usage_geo_cut_graph`
+  - `route_max_prob_geo`
+  - `route_margin_geo`
+- visibility routing:
+  - `usage_vis_stable`
+  - `usage_vis_transient`
+  - `route_max_prob_vis`
+  - `route_margin_vis`
+- motion magnitude:
+  - `mean_norm_d_mu`
+  - `mean_norm_d_rot`
+  - `mean_norm_d_scale`
+  - `mean_abs_d_opacity`
+- temporal regularization:
+  - `L_geo_temp`
+  - `temporal_pair_count`
+- Patch C late-stage signals:
+  - `L_appearance_reg`
+  - `L_lifecycle_balance`
+  - `L_lifecycle_reg`
 
-Recommended practice:
+These are needed to diagnose whether CAMS-GS is improving because of better motion structure, or simply shifting capacity around.
 
-- render baseline and MoE runs with the same evaluation path
-- keep output folders separate and named clearly
-- do not compare runs that used mismatched presets or mismatched `tracking_type`
-
-## Metric evaluation workflow
-
-Evaluate one or more trained runs with:
-
-```bash
-python metrics.py -m \
-  "output/endonerf/cutting_original" \
-  "output/endonerf/cutting_geo_moe_only" \
-  "output/endonerf/cutting_hetero_moe"
-```
-
-Use this to compare:
-
-- baseline original tracking
-- geo-only MoE
-- full heterogeneous MoE
-- dense vs sparse routing variants
-
-## Recommended experiment ladder
-
-Use the following order for each scene:
-
-1. `*_original.py`
-2. `*_geo_moe_only.py`
-3. `*_disentangled_moe.py`
-4. `*_disentangled_moe_dense.py`
-5. `*_disentangled_moe_sparse.py`
-
-After the corrective patch above, these presets are intended to share the same coarse/pruning/densification protocol so the comparison isolates architecture rather than training-budget drift.
-
-This is the minimum useful ladder because it answers:
-
-- does heterogeneous geometry help at all?
-- does visibility routing add value on top of geometry routing?
-- does sparse routing help or hurt?
-
-## What to record for every run
-
-For every experiment, keep a small run sheet with:
-
-- scene name
-- preset path
-- output directory
-- final iteration reached
-- best / final PSNR
-- SSIM
-- LPIPS
-- qualitative render notes
-- any instability signs
-- whether routing collapsed or diversified
-
-For heterogeneous runs, also inspect training logs / saved summaries for:
-
-- `usage_geo_static`
-- `usage_geo_hexplane`
-- `usage_geo_local`
-- `usage_geo_smooth`
-- `usage_vis_stable`
-- `usage_vis_transient`
-- `route_max_prob_geo`
-- `route_max_prob_vis`
-- `expert_diversity_geo`
-- `L_geo_temp`
-
-These are important because headline image metrics alone are not enough to diagnose whether the MoE is actually learning specialization.
-
-## How to analyze results
-
-Do not interpret results with only one question: "Did PSNR go up?"
+## How to analyze CAMS-GS results
 
 Use three layers of analysis.
 
@@ -275,94 +238,91 @@ Use three layers of analysis.
 
 Compare:
 
-- baseline vs geo-only
-- geo-only vs full heterogeneous
-- dense vs sparse
+- original vs CAMS-GS
+- cutting vs pulling generality
 
 Questions:
 
-- Did the full MoE beat the baseline?
-- If not, did geo-only help while visibility hurt?
-- Did sparse routing improve specialization but reduce image quality?
-- Are gains consistent across scenes or only on one scene?
+- Does CAMS-GS improve PSNR / SSIM / LPIPS consistently?
+- Are gains scene-specific or stable across scenes?
+- Are metrics improving together, or is one metric trading against temporal plausibility?
 
-### 2. Routing-behavior layer
+### 2. Routing-and-stage layer
 
 Questions:
 
-- Did one geometry expert dominate nearly all points?
-- Did the visibility router collapse to `stable`?
-- Did the local/smooth experts activate only after their scheduled phases?
-- Did route confidence become too sharp too early?
-- Did balance targets look incompatible with the scene?
+- Does the geometry routing collapse to one branch?
+- Does `cut_graph` activate meaningfully or remain unused?
+- Does visibility stay near `stable`, or does `transient` activate in dynamic regions?
+- Do the late-stage lifecycle losses become active only during `joint_finetune`?
 
 ### 3. Failure-mode layer
 
 Questions:
 
-- Are renders sharper but temporally unstable?
-- Are metrics flat because translation-only modeling is insufficient?
-- Is the MoE over-regularized and under-moving?
-- Is one expert saturating at its displacement bound?
-- Does the scene simply lack enough motion diversity for the extra MoE capacity to help?
+- Are renders sharper but less temporally coherent?
+- Is the cut-graph branch active but not helping metrics?
+- Is appearance modulation helping specular/transient structure or just adding noise?
+- Is lifecycle gating over-suppressing opacity in hard frames?
+- Does the scene need stronger scale/rotation modeling than the current CAMS schedule provides?
 
-## If the MoE does not improve stably
+## If CAMS-GS does not improve stably
 
-That is a valid experimental outcome. Do **not** patch the story after one failed run without diagnosis.
+That is still a useful result.
 
 Bring back:
 
-- the exact preset used
-- the scene name
-- final metrics
+- scene name
+- preset path
+- output directory
 - baseline metrics
-- qualitative render observations
-- any routing usage statistics you logged
-- whether the failure is:
-  - no improvement
-  - unstable improvement
-  - better metrics but worse temporal behavior
-  - better qualitative motion but worse PSNR/LPIPS
+- CAMS-GS metrics
+- routing usage statistics
+- qualitative observations
+- whether the failure looks like:
+  - router collapse
+  - ineffective cut-graph branch
+  - unstable visibility/lifecycle gating
+  - over-regularized motion
+  - improved local appearance but worse global reconstruction
 
-Then we can reason about the next step from evidence instead of guessing.
+That evidence is enough to decide whether the next step should be:
 
-Typical next-step diagnoses include:
+- scheduler retiming
+- stronger cut-graph motion capacity
+- weaker lifecycle suppression
+- different appearance modulation bounds
+- better scale/rotation modeling
 
-- router collapse
-- weak local expert capacity
-- over-strong temporal or saturation regularization
-- visibility routing hurting a scene that needs geometry help more than opacity help
-- schedule timing mismatches
-- translation-only limitation in scenes where rotation/scale changes matter
+## Suggested feedback package
 
-## Suggested feedback package for the next iteration
-
-When you want another round of analysis, send back something like this:
+When you want the next debugging or redesign round, send back something like:
 
 ```text
 Scene: cutting
-Preset: arguments/endonerf/cutting_disentangled_moe.py
-Run dir: output/endonerf/cutting_hetero_moe
+Preset: arguments/endonerf/cutting_cams_gs.py
+Run dir: output/endonerf/cutting_cams_gs
 Baseline metrics: PSNR=?, SSIM=?, LPIPS=?
-MoE metrics: PSNR=?, SSIM=?, LPIPS=?
-Observed routing: geo_static=?, geo_hexplane=?, geo_local=?, geo_smooth=?
-Observed visibility: stable=?, transient=?
+CAMS-GS metrics: PSNR=?, SSIM=?, LPIPS=?
+Geometry routing: global=?, local=?, cut_graph=?
+Visibility routing: stable=?, transient=?
+Late-stage lifecycle stats: persistent=?, transient=?
 Qualitative notes: ...
 Failure suspicion: ...
 ```
 
-That will make the next debugging / redesign round much faster and more grounded.
+## Verification status
 
-## Verification status of the current code path
+Current focused regression coverage includes:
 
-The current heterogeneous integration has focused regression coverage for:
-
-- heterogeneous scheduler behavior
-- heterogeneous forward output shapes
-- sparse visibility routing behavior
-- adjacent-time temporal loss
+- CAMS-GS scheduler behavior
+- CAMS-GS parameter-group exposure
+- checkpoint metadata compatibility
+- train-time aux merging
+- cut-graph route affecting geometry output
+- visibility / lifecycle / appearance control exposure
+- phase-gated Patch C losses
 - EndoNeRF preset key validity
-- legacy config alias compatibility
 
 Relevant tests:
 
@@ -371,10 +331,10 @@ Relevant tests:
 
 ## Notes and caveats
 
-- `full_eval.py` is for other benchmark families and is not the main EndoNeRF workflow.
-- `render.py` and `metrics.py` should be run with output paths that match the exact preset/run being compared.
-- Resume/load safety now checks `tracking_type`, so mismatched checkpoints should fail loudly instead of silently loading the wrong architecture.
-- Some old import names remain for compatibility, but the real implementation target is `HeterogeneousMoETracking`.
+- `full_eval.py` is not the main EndoNeRF workflow here.
+- `render.py` and `metrics.py` should always be run with the exact preset that matches the trained checkpoint.
+- `tracking_type` metadata checks are active, so incompatible checkpoints should fail loudly.
+- The older heterogeneous MoE path remains in the repository for comparison, but it is no longer the main architectural story.
 
 ## Acknowledgement
 
@@ -386,4 +346,4 @@ This repository builds on ideas and code from:
 - HexPlane
 - TiNeuVox
 
-Please also see the original upstream acknowledgements in the project history.
+Please also see the upstream acknowledgements in the original project history.

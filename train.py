@@ -216,6 +216,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 values = [a[key] for a in deformation_aux_list if key in a]
                 if not values:
                     continue
+                if not torch.is_tensor(values[0]):
+                    merged_aux[key] = values[0]
+                    continue
                 if values[0].dim() == 0:
                     merged_aux[key] = torch.stack(values).mean()
                 else:
