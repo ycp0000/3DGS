@@ -96,4 +96,18 @@ class VisibilityAppearanceHead(nn.Module):
             "route_max_prob_vis": route_max_prob_vis,
             "route_margin_vis": route_margin_vis,
             "route_top1_vis_mean": route_max_prob_vis.mean(),
+            "vis_expert_rgb_delta": torch.stack(
+                (
+                    torch.zeros_like(appearance_rgb_delta),
+                    appearance_rgb_delta,
+                ),
+                dim=1,
+            ),
+            "vis_expert_visibility_alpha": torch.stack(
+                (
+                    torch.ones_like(visibility_alpha),
+                    torch.zeros_like(visibility_alpha),
+                ),
+                dim=1,
+            ),
         }

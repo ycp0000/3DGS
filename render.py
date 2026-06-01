@@ -21,8 +21,12 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args, ModelHiddenParams
 from gaussian_renderer import GaussianModel
+from utils.device_utils import get_device
 from time import time
-import open3d as o3d
+try:
+    import open3d as o3d
+except ImportError:
+    o3d = None
 from utils.graphics_utils import fov2focal
 
 
@@ -128,8 +132,9 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
         if hasattr(hyperparam, "iterations") and hyperparam.iterations < infer_iter:
             hyperparam.iterations = infer_iter
 
+        device = get_device()
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        background = torch.tensor(bg_color, dtype=torch.float32, device=device)
         
         if not skip_train:
             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, reconstruct=not skip_train)
@@ -139,6 +144,8 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
             render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, reconstruct=not skip_video)
 
 def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
+    if o3d is None:
+        raise ImportError("open3d is required for point cloud reconstruction")
     import cv2
     import copy
     output_frame_folder = os.path.join("reconstruct", name)

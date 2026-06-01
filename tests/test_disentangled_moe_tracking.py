@@ -21,6 +21,8 @@ from models.tracking import (
 from models.tracking.cut_graph_gating import CutGraphGating
 from models.tracking.motion_decomposition import MotionDecomposition
 
+from utils.device_utils import _CPUEventStub, get_device, get_device_str, safe_cuda_event
+
 _TRACKING_LOSSES_SPEC = importlib.util.spec_from_file_location(
     "tracking_losses_module",
     ROOT / "scene" / "tracking_losses.py",
@@ -62,6 +64,29 @@ gaussian_model_loader = _GAUSSIAN_MODEL_SPEC.loader
 assert gaussian_model_loader is not None
 gaussian_model_loader.exec_module(gaussian_model_module)
 GaussianModel = gaussian_model_module.GaussianModel
+
+
+def test_device_utils_respects_environment_variable(monkeypatch):
+    monkeypatch.setenv("ENDOGAUSSIAN_DEVICE", "cpu")
+    assert get_device().type == "cpu"
+    assert get_device_str() == "cpu"
+
+
+def test_device_utils_force_cpu_overrides_cuda(monkeypatch):
+    monkeypatch.delenv("ENDOGAUSSIAN_DEVICE", raising=False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    assert get_device(force_cpu=True).type == "cpu"
+    assert get_device_str(force_cpu=True) == "cpu"
+
+
+def test_safe_cuda_event_returns_cpu_stub_when_cuda_unavailable(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    event_a = safe_cuda_event(enable_timing=True)
+    event_b = safe_cuda_event(enable_timing=True)
+    assert isinstance(event_a, _CPUEventStub)
+    event_a.record()
+    event_b.record()
+    assert event_a.elapsed_time(event_b) >= 0.0
 
 
 def _quaternion_multiply(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -969,6 +994,56 @@ def test_cams_cut_graph_route_changes_rendered_geometry():
     assert not torch.allclose(local_pts, cut_pts)
 
 
+
+
+def test_cams_gs_emits_expert_proposals_and_gaussian_priors_for_pixel_router():
+    model = CAMSGSTracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="joint_finetune",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+    n = 5
+    means3d = torch.randn(n, 3)
+    scales = torch.randn(n, 3)
+    rotations = torch.randn(n, 4)
+    rotations[:, 0] = 1.0
+    opacity = torch.randn(n, 1)
+    time_values = torch.rand(n, 1)
+    time_features = torch.randn(n, 8)
+    scene_scale = torch.tensor(1.0)
+
+    _, _, _, _, aux = model(
+        means3d=means3d,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=time_values,
+        time_features=time_features,
+        scene_scale=scene_scale,
+        phase=phase,
+    )
+
+    assert torch.allclose(aux["gaussian_pi_geo_prior"], aux["pi_geo"])
+    assert torch.allclose(aux["gaussian_pi_vis_prior"], aux["pi_vis"])
+    assert aux["geo_expert_means3d"].shape == (n, 3, 3)
+    assert aux["geo_expert_scales"].shape == (n, 3, 3)
+    assert aux["geo_expert_rotations"].shape == (n, 3, 4)
+    assert aux["geo_expert_opacity_logits"].shape == (n, 3, 1)
+    assert aux["geo_expert_d_mu"].shape == (n, 3, 3)
+    assert aux["vis_expert_rgb_delta"].shape == (n, 2, 3)
+    assert aux["vis_expert_visibility_alpha"].shape == (n, 2, 1)
+    assert aux["lifecycle_expert_alpha"].shape == (n, 2, 1)
+    assert torch.allclose(aux["lifecycle_expert_alpha"].sum(dim=1), torch.ones(n, 1), atol=1e-5)
+
+
 def test_cams_visibility_and_lifecycle_change_opacity_outputs():
     model = CAMSGSTracking(time_feature_dim=8)
     phase = TrackingPhase(
@@ -1007,46 +1082,56 @@ def test_cams_visibility_and_lifecycle_change_opacity_outputs():
 
     def _visibility_open(*args, **kwargs):
         count = kwargs["time_features"].shape[0]
+        zeros_rgb = torch.zeros(count, 3)
         return {
             "visibility_logits": torch.tensor([[12.0, -12.0]]).repeat(count, 1),
-            "appearance_offsets": torch.zeros(count, 3),
-            "appearance_rgb_delta": torch.zeros(count, 3),
+            "appearance_offsets": zeros_rgb,
+            "appearance_rgb_delta": zeros_rgb,
             "pi_vis": torch.tensor([[1.0, 0.0]]).repeat(count, 1),
             "visibility_alpha": torch.ones(count, 1),
             "entropy_vis": torch.zeros(()),
             "route_max_prob_vis": torch.ones(count),
             "route_margin_vis": torch.ones(count),
             "route_top1_vis_mean": torch.tensor(1.0),
+            "vis_expert_rgb_delta": torch.stack((zeros_rgb, zeros_rgb), dim=1),
+            "vis_expert_visibility_alpha": torch.tensor([[[1.0], [0.0]]]).repeat(count, 1, 1),
         }
 
     def _visibility_closed(*args, **kwargs):
         count = kwargs["time_features"].shape[0]
+        zeros_rgb = torch.zeros(count, 3)
         return {
             "visibility_logits": torch.tensor([[-12.0, 12.0]]).repeat(count, 1),
-            "appearance_offsets": torch.zeros(count, 3),
-            "appearance_rgb_delta": torch.zeros(count, 3),
+            "appearance_offsets": zeros_rgb,
+            "appearance_rgb_delta": zeros_rgb,
             "pi_vis": torch.tensor([[0.0, 1.0]]).repeat(count, 1),
             "visibility_alpha": torch.zeros(count, 1),
             "entropy_vis": torch.zeros(()),
             "route_max_prob_vis": torch.ones(count),
             "route_margin_vis": torch.ones(count),
             "route_top1_vis_mean": torch.tensor(1.0),
+            "vis_expert_rgb_delta": torch.stack((zeros_rgb, zeros_rgb), dim=1),
+            "vis_expert_visibility_alpha": torch.tensor([[[1.0], [0.0]]]).repeat(count, 1, 1),
         }
 
     def _lifecycle_alive(*args, **kwargs):
         count = kwargs["time_features"].shape[0]
+        probs = torch.tensor([[1.0, 0.0]]).repeat(count, 1)
         return {
             "lifecycle_logits": torch.tensor([[12.0, -12.0]]).repeat(count, 1),
-            "lifecycle_probs": torch.tensor([[1.0, 0.0]]).repeat(count, 1),
+            "lifecycle_probs": probs,
             "lifecycle_alpha": torch.ones(count, 1),
+            "lifecycle_expert_alpha": probs.unsqueeze(-1),
         }
 
     def _lifecycle_dead(*args, **kwargs):
         count = kwargs["time_features"].shape[0]
+        probs = torch.tensor([[0.0, 1.0]]).repeat(count, 1)
         return {
             "lifecycle_logits": torch.tensor([[-12.0, 12.0]]).repeat(count, 1),
-            "lifecycle_probs": torch.tensor([[0.0, 1.0]]).repeat(count, 1),
+            "lifecycle_probs": probs,
             "lifecycle_alpha": torch.zeros(count, 1),
+            "lifecycle_expert_alpha": probs.unsqueeze(-1),
         }
 
     model.visibility.forward = _visibility_open
@@ -1222,6 +1307,191 @@ def test_renderer_applies_appearance_delta_and_opacity_gate_to_rasterizer_inputs
     assert torch.allclose(_FakeRasterizer.last_kwargs["colors_precomp"][1], base_colors[1])
     assert torch.allclose(_FakeRasterizer.last_kwargs["opacities"], torch.tensor([[4.1], [0.2]]))
     assert torch.allclose(outputs["deformation_aux"]["appearance_rgb_delta"], torch.tensor([[0.3, -0.1, 0.2]]))
+
+
+def test_renderer_pixel_routing_preserves_expert_appearance_and_opacity_controls(monkeypatch):
+    class _FakeRasterizer:
+        calls = []
+
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            type(self).calls.append(kwargs)
+            count = kwargs["means3D"].shape[0]
+            color_value = 0.0
+            if kwargs.get("colors_precomp") is not None:
+                color_value = float(kwargs["colors_precomp"][0, 0].item())
+            opacity_value = float(kwargs["opacities"][0, 0].item()) if kwargs.get("opacities") is not None else 0.0
+            render_value = torch.full((3, 1, 1), color_value + opacity_value)
+            return render_value, torch.ones(count), torch.zeros(1, 1)
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+
+    class _FakeDeformation:
+        def __call__(self, means3d, scales, rotations, opacity, time):
+            return means3d + 1.0, scales + 2.0, rotations + 3.0, opacity + 4.0
+
+        def get_aux_outputs(self):
+            return {
+                "geo_expert_means3d": torch.tensor([[[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]]),
+                "geo_expert_scales": torch.tensor([[[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]]),
+                "geo_expert_rotations": torch.tensor([[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]]),
+                "geo_expert_opacity_logits": torch.tensor([[[4.1], [4.1]]]),
+                "gaussian_pi_geo_prior": torch.tensor([[3.0, -3.0]]),
+                "appearance_rgb_delta": torch.tensor([[0.3, -0.1, 0.2]]),
+                "vis_expert_rgb_delta": torch.tensor([[[0.0, 0.0, 0.0], [-0.2, 0.1, -0.1]]]),
+                "vis_expert_visibility_alpha": torch.tensor([[[1.0], [0.0]]]),
+                "lifecycle_expert_alpha": torch.tensor([[[1.0], [1.0]]]),
+                "visibility_alpha": torch.ones(1, 1),
+                "lifecycle_alpha": torch.ones(1, 1),
+            }
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.get_xyz = torch.tensor([[0.0, 0.0, 0.0]])
+            self._opacity = torch.tensor([[0.1]])
+            self._scaling = torch.tensor([[1.0, 1.0, 1.0]])
+            self._rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+            self._deformation_table = torch.tensor([True])
+            self._deformation_accum = torch.zeros(1, 3)
+            self._deformation = _FakeDeformation()
+            self.active_sh_degree = 0
+            self.max_sh_degree = 0
+            self.scaling_activation = lambda value: value
+            self.rotation_activation = lambda value: value
+            self.opacity_activation = lambda value: value
+            self.get_features = torch.zeros(1, 1, 3)
+
+    point_cloud = _FakePointCloud()
+    camera = SimpleNamespace(
+        FoVx=0.5,
+        FoVy=0.5,
+        image_height=1,
+        image_width=1,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+        time=0.0,
+    )
+    pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
+    base_colors = torch.tensor([[0.2, 0.2, 0.2]])
+
+    outputs = renderer.render(camera, point_cloud, pipe, torch.zeros(3), override_color=base_colors, stage="fine")
+
+    expert_render_calls = [
+        call
+        for call in _FakeRasterizer.calls
+        if call.get("colors_precomp") is not None
+        and call["colors_precomp"].shape == (1, 3)
+        and float(call["colors_precomp"][0, 0].item()) <= 1.0
+    ]
+    assert torch.allclose(expert_render_calls[0]["colors_precomp"][0], torch.tensor([0.5, 0.1, 0.4]))
+    assert torch.allclose(expert_render_calls[1]["colors_precomp"][0], torch.tensor([0.3, 0.2, 0.3]))
+    assert torch.allclose(expert_render_calls[0]["opacities"], torch.tensor([[4.1]]))
+    assert torch.allclose(expert_render_calls[1]["opacities"], torch.tensor([[0.0]]))
+    assert outputs["deformation_aux"]["pixel_routing_weights"].shape == (2, 1, 1)
+
+
+def test_tracking_losses_use_covered_pixel_routing_weights_only():
+    args = _build_loss_args()
+    aux = {
+        "pixel_routing_weights": torch.tensor(
+            [
+                [[0.9, 0.0], [0.0, 0.0]],
+                [[0.1, 0.0], [0.0, 0.0]],
+            ]
+        ),
+        "pi_vis": torch.tensor([[1.0, 0.0]]),
+        "d_mu": torch.zeros(1, 3),
+    }
+
+    losses = compute_tracking_losses(
+        aux=aux,
+        iteration=10,
+        args=args,
+        prev_d_mu=None,
+        active_geo=2,
+        active_vis=1,
+        enable_visibility=False,
+        geo_expert_names=("global", "local"),
+        vis_expert_names=("stable", "transient"),
+    )
+
+    assert torch.allclose(losses["usage_geo_global"], torch.tensor(0.9))
+    assert torch.allclose(losses["usage_geo_local"], torch.tensor(0.1))
+
+
+def test_renderer_pixel_routing_masks_uncovered_experts_and_aggregates_radii(monkeypatch):
+    class _FakeRasterizer:
+        calls = []
+
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            type(self).calls.append(kwargs)
+            mean_x = float(kwargs["means3D"][0, 0].item())
+            color_value = float(kwargs["colors_precomp"][0, 0].item()) if kwargs.get("colors_precomp") is not None else 0.0
+            render_value = torch.full((3, 1, 1), color_value)
+            radii = torch.tensor([0.0]) if mean_x < 15.0 else torch.tensor([2.0])
+            return render_value, radii, torch.zeros(1, 1)
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+
+    class _FakeDeformation:
+        def __call__(self, means3d, scales, rotations, opacity, time):
+            return means3d + 1.0, scales, rotations, opacity
+
+        def get_aux_outputs(self):
+            return {
+                "geo_expert_means3d": torch.tensor([[[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]]),
+                "geo_expert_scales": torch.tensor([[[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]]]),
+                "geo_expert_rotations": torch.tensor([[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]]),
+                "geo_expert_opacity_logits": torch.tensor([[[1.0], [1.0]]]),
+                "gaussian_pi_geo_prior": torch.tensor([[1.0, 0.0]]),
+                "vis_expert_rgb_delta": torch.zeros(1, 2, 3),
+                "vis_expert_visibility_alpha": torch.ones(1, 2, 1),
+                "lifecycle_expert_alpha": torch.ones(1, 2, 1),
+                "visibility_alpha": torch.ones(1, 1),
+                "lifecycle_alpha": torch.ones(1, 1),
+            }
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.get_xyz = torch.tensor([[0.0, 0.0, 0.0]])
+            self._opacity = torch.tensor([[0.1]])
+            self._scaling = torch.tensor([[1.0, 1.0, 1.0]])
+            self._rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+            self._deformation_table = torch.tensor([True])
+            self._deformation_accum = torch.zeros(1, 3)
+            self._deformation = _FakeDeformation()
+            self.active_sh_degree = 0
+            self.max_sh_degree = 0
+            self.scaling_activation = lambda value: value
+            self.rotation_activation = lambda value: value
+            self.opacity_activation = lambda value: value
+            self.get_features = torch.zeros(1, 1, 3)
+
+    point_cloud = _FakePointCloud()
+    camera = SimpleNamespace(
+        FoVx=0.5,
+        FoVy=0.5,
+        image_height=1,
+        image_width=1,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+        time=0.0,
+    )
+    pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
+    base_colors = torch.tensor([[0.2, 0.2, 0.2]])
+
+    outputs = renderer.render(camera, point_cloud, pipe, torch.zeros(3), override_color=base_colors, stage="fine")
+
+    assert torch.allclose(outputs["render"], torch.full((3, 1, 1), 0.2))
+    assert torch.allclose(outputs["radii"], torch.tensor([2.0]))
+    assert torch.allclose(outputs["deformation_aux"]["pixel_routing_weights"], torch.tensor([[[1.0]], [[0.0]]]))
 
 
 def test_cams_visibility_head_exposes_render_affecting_controls():
@@ -1408,9 +1678,19 @@ def test_cams_gs_forward_emits_patch_c_aux_and_supports_tracking_losses():
     assert aux["global_motion"].shape == points.shape
     assert aux["local_motion"].shape == points.shape
     assert aux["cut_graph_motion"].shape == points.shape
+    assert aux["geo_expert_d_mu"].shape == (points.shape[0], len(model.cams_head.GEO_EXPERT_NAMES), 3)
+    assert aux["geo_expert_means3d"].shape == (points.shape[0], len(model.cams_head.GEO_EXPERT_NAMES), 3)
+    assert aux["geo_expert_scales"].shape == (points.shape[0], len(model.cams_head.GEO_EXPERT_NAMES), 3)
+    assert aux["geo_expert_rotations"].shape == (points.shape[0], len(model.cams_head.GEO_EXPERT_NAMES), 4)
+    assert aux["geo_expert_opacity_logits"].shape == (points.shape[0], len(model.cams_head.GEO_EXPERT_NAMES), 1)
+    assert aux["gaussian_pi_geo_prior"].shape == (points.shape[0], len(model.cams_head.GEO_EXPERT_NAMES))
+    assert aux["gaussian_pi_vis_prior"].shape == (points.shape[0], len(model.cams_head.VIS_EXPERT_NAMES))
     assert aux["visibility_alpha"].shape == (points.shape[0], 1)
     assert aux["appearance_rgb_delta"].shape == (points.shape[0], 3)
+    assert aux["vis_expert_rgb_delta"].shape == (points.shape[0], len(model.cams_head.VIS_EXPERT_NAMES), 3)
+    assert aux["vis_expert_visibility_alpha"].shape == (points.shape[0], len(model.cams_head.VIS_EXPERT_NAMES), 1)
     assert aux["lifecycle_alpha"].shape == (points.shape[0], 1)
+    assert aux["lifecycle_expert_alpha"].shape == (points.shape[0], 2, 1)
     assert aux["scaffold_weights"].shape == (points.shape[0], 3)
     assert aux["cut_gate_logits"].shape == (points.shape[0], 3)
     assert aux["cut_gate_values"].shape == (points.shape[0], 3)

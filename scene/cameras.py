@@ -12,6 +12,7 @@
 import torch
 from torch import nn
 import numpy as np
+from utils.device_utils import get_device
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 
 class Camera(nn.Module):
@@ -35,8 +36,8 @@ class Camera(nn.Module):
             self.data_device = torch.device(data_device)
         except Exception as e:
             print(e)
-            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
-            self.data_device = torch.device("cuda")
+            print(f"[Warning] Custom device {data_device} failed, fallback to auto-detected device" )
+            self.data_device = get_device()
         
         self.original_image = image.clamp(0.0, 1.0)
         self.original_depth = depth

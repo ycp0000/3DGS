@@ -5,6 +5,7 @@ from utils.general_utils import PILtoTorch
 from utils.graphics_utils import fov2focal, focal2fov
 import torch
 from utils.camera_utils import loadCam
+from utils.device_utils import get_device
 from utils.graphics_utils import focal2fov
 
 class FourDGSdataset(Dataset):
@@ -37,7 +38,7 @@ class FourDGSdataset(Dataset):
             time = caminfo.time
         
         return Camera(colmap_id=index,R=R,T=T,FoVx=FovX,FoVy=FovY,image=image, depth=depth,mask=mask,gt_alpha_mask=None,
-                          image_name=f"{index}",uid=index,data_device=torch.device("cuda"),time=time,
+                          image_name=f"{index}",uid=index,data_device=get_device(),time=time,
                           Znear=Znear, Zfar=Zfar)
     
     def __len__(self):

@@ -15,25 +15,35 @@ from PIL import Image
 import torch
 import torchvision.transforms.functional as tf
 from utils.loss_utils import ssim
-# from lpipsPyTorch import lpips
-import lpips
+from lpipsPyTorch import LPIPS as LocalLPIPS
+try:
+    import lpips as external_lpips
+except ImportError:
+    external_lpips = None
 import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
 import numpy as np
 
+from utils.device_utils import get_device
 
-def array2tensor(array, device="cuda", dtype=torch.float32):
-    return torch.tensor(array, dtype=dtype, device=device)
+
+def array2tensor(array, device=None, dtype=torch.float32):
+    resolved_device = get_device() if device is None else device
+    return torch.tensor(array, dtype=dtype, device=resolved_device)
 
 # Learned Perceptual Image Patch Similarity
 class LPIPS(object):
     """
     borrowed from https://github.com/huster-wgm/Pytorch-metrics/blob/master/metrics.py
     """
-    def __init__(self, device="cuda"):
-        self.model = lpips.LPIPS(net='vgg').to(device)
+    def __init__(self, device=None):
+        resolved_device = get_device() if device is None else device
+        if external_lpips is not None:
+            self.model = external_lpips.LPIPS(net='vgg').to(resolved_device)
+        else:
+            self.model = LocalLPIPS(net_type='vgg').to(resolved_device)
 
     def __call__(self, y_pred, y_true, normalized=True):
         """
@@ -50,7 +60,7 @@ class LPIPS(object):
         return torch.mean(error)
     
 lpips = LPIPS()
-def cal_lpips(a, b, device="cuda", batch=2):
+def cal_lpips(a, b, device=None, batch=2):
     """Compute lpips.
     a, b: [batch, H, W, 3]"""
     if not torch.is_tensor(a):
@@ -77,9 +87,9 @@ def readImages(renders_dir, gt_dir, masks_dir):
         gt = np.array(Image.open(gt_dir / fname))
         mask = np.array(Image.open(masks_dir / fname))
         
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        masks.append(tf.to_tensor(mask).unsqueeze(0).cuda())
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].to(get_device()))
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].to(get_device()))
+        masks.append(tf.to_tensor(mask).unsqueeze(0).to(get_device()))
         image_names.append(fname)
     return renders, gts, masks, image_names
 
@@ -151,8 +161,9 @@ def evaluate(model_paths):
         #     print("Unable to compute metrics for model", scene_dir)
 
 if __name__ == "__main__":
-    device = torch.device("cuda:0")
-    torch.cuda.set_device(device)
+    device = get_device()
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")

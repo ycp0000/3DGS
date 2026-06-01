@@ -155,6 +155,7 @@ class MotionDecomposition(nn.Module):
         blended_local = local_delta * local_mix
         blended_cut_graph = cut_graph_delta * cut_graph_mix
         d_mu = blended_global + blended_local + blended_cut_graph
+        geo_expert_d_mu = torch.stack((global_delta, local_delta, cut_graph_delta), dim=1)
 
         raw_d_rot = self.rotation_head(local_features)
         d_rot = torch.tanh(raw_d_rot) * self.max_rot_delta
@@ -178,6 +179,18 @@ class MotionDecomposition(nn.Module):
             d_opacity_logit = torch.zeros_like(opacity_logits)
             opacity_out = opacity_logits
 
+        geo_expert_means3d = torch.stack(
+            (
+                means3d + global_delta,
+                means3d + local_delta,
+                means3d + cut_graph_delta,
+            ),
+            dim=1,
+        )
+        geo_expert_scales = scales_out.unsqueeze(1).expand(-1, 3, -1)
+        geo_expert_rotations = rotations_out.unsqueeze(1).expand(-1, 3, -1)
+        geo_expert_opacity_logits = opacity_out.unsqueeze(1).expand(-1, 3, -1)
+
         return {
             "means3d": means3d + d_mu,
             "scales": scales_out,
@@ -190,4 +203,9 @@ class MotionDecomposition(nn.Module):
             "global_motion": blended_global,
             "local_motion": blended_local,
             "cut_graph_motion": blended_cut_graph,
+            "geo_expert_d_mu": geo_expert_d_mu,
+            "geo_expert_means3d": geo_expert_means3d,
+            "geo_expert_scales": geo_expert_scales,
+            "geo_expert_rotations": geo_expert_rotations,
+            "geo_expert_opacity_logits": geo_expert_opacity_logits,
         }

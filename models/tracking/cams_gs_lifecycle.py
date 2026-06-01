@@ -64,4 +64,11 @@ class GaussianLifecycleHead(nn.Module):
             "lifecycle_logits": lifecycle_logits,
             "lifecycle_probs": lifecycle_probs,
             "lifecycle_alpha": lifecycle_alpha,
+            "lifecycle_expert_alpha": torch.stack(
+                (
+                    lifecycle_probs[:, 0:1],
+                    lifecycle_probs[:, 1:2],
+                ),
+                dim=1,
+            ),
         }

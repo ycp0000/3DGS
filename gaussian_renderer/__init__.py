@@ -11,19 +11,30 @@
 
 import torch
 import math
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+try:
+    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+except ImportError as exc:
+    GaussianRasterizationSettings = None
+    GaussianRasterizer = None
+    _RASTERIZER_IMPORT_ERROR = exc
+else:
+    _RASTERIZER_IMPORT_ERROR = None
 from scene.gaussian_model import GaussianModel
+from utils.device_utils import get_device
 from utils.sh_utils import eval_sh
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine"):
     """
-    Render the scene. 
-    
+    Render the scene.
+
     Background tensor (bg_color) must be on GPU!
     """
- 
+    if GaussianRasterizer is None or GaussianRasterizationSettings is None:
+        raise ImportError("diff_gaussian_rasterization is required for rendering") from _RASTERIZER_IMPORT_ERROR
+
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
+    device = get_device()
+    screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device=device) + 0
     try:
         screenspace_points.retain_grad()
     except:
@@ -41,10 +52,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         tanfovy=tanfovy,
         bg=bg_color,
         scale_modifier=scaling_modifier,
-        viewmatrix=viewpoint_camera.world_view_transform.cuda(),
-        projmatrix=viewpoint_camera.full_proj_transform.cuda(),
+        viewmatrix=viewpoint_camera.world_view_transform.to(device),
+        projmatrix=viewpoint_camera.full_proj_transform.to(device),
         sh_degree=pc.active_sh_degree,
-        campos=viewpoint_camera.camera_center.cuda(),
+        campos=viewpoint_camera.camera_center.to(device),
         prefiltered=False,
         debug=pipe.debug
     )
@@ -129,7 +140,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.to(device).repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -142,7 +153,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     if appearance_rgb_delta is not None and deformation_point.any():
         if colors_precomp is None:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.cuda().repeat(pc.get_features.shape[0], 1))
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.to(device).repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -150,16 +161,141 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp = colors_precomp.clone()
         colors_precomp[deformation_point] = torch.clamp(colors_precomp[deformation_point] + appearance_rgb_delta, 0.0, 1.0)
 
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, depth = rasterizer(
-        means3D = means3D_final,
-        means2D = means2D,
-        shs = shs,
-        colors_precomp = colors_precomp,
-        opacities = opacity_final,
-        scales = scales_final,
-        rotations = rotations_final,
-        cov3D_precomp = cov3D_precomp)
+    geo_expert_means3d = deformation_aux.get("geo_expert_means3d") if stage != "coarse" else None
+    use_pixel_routing = geo_expert_means3d is not None and deformation_point.any()
+
+    if use_pixel_routing:
+        num_experts = geo_expert_means3d.shape[1]
+        H, W = int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)
+        geo_expert_scales = deformation_aux["geo_expert_scales"]
+        geo_expert_rotations = deformation_aux["geo_expert_rotations"]
+        geo_expert_opacity_logits = deformation_aux["geo_expert_opacity_logits"]
+        gaussian_pi_geo_prior = deformation_aux["gaussian_pi_geo_prior"]
+        vis_expert_rgb_delta = deformation_aux.get("vis_expert_rgb_delta")
+        vis_expert_visibility_alpha = deformation_aux.get("vis_expert_visibility_alpha")
+        lifecycle_expert_alpha = deformation_aux.get("lifecycle_expert_alpha")
+
+        if colors_precomp is None and shs is None:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.to(device).repeat(pc.get_features.shape[0], 1))
+            dir_pp_normalized = dir_pp / dir_pp.norm(dim=1, keepdim=True)
+            colors_precomp = torch.clamp_min(eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized) + 0.5, 0.0)
+            shs = None
+
+        expert_renders = []
+        expert_depths = []
+        expert_radii_list = []
+        pi_geo_weight_logits = []
+
+        for expert_idx in range(num_experts):
+            expert_means3D = torch.zeros_like(means3D)
+            expert_scales = torch.zeros_like(scales)
+            expert_rotations = torch.zeros_like(rotations)
+            expert_opacity_logits = torch.zeros_like(opacity)
+
+            expert_means3D[deformation_point] = geo_expert_means3d[deformation_point, expert_idx]
+            expert_scales[deformation_point] = geo_expert_scales[deformation_point, expert_idx]
+            expert_rotations[deformation_point] = geo_expert_rotations[deformation_point, expert_idx]
+            expert_opacity_logits[deformation_point] = geo_expert_opacity_logits[deformation_point, expert_idx]
+
+            expert_means3D[~deformation_point] = means3D[~deformation_point]
+            expert_scales[~deformation_point] = scales[~deformation_point]
+            expert_rotations[~deformation_point] = rotations[~deformation_point]
+            expert_opacity_logits[~deformation_point] = opacity[~deformation_point]
+
+            expert_opacity_final = pc.opacity_activation(expert_opacity_logits)
+            if vis_expert_visibility_alpha is not None:
+                vis_index = min(expert_idx, vis_expert_visibility_alpha.shape[1] - 1)
+                expert_opacity_final = expert_opacity_final * vis_expert_visibility_alpha[:, vis_index]
+            if lifecycle_expert_alpha is not None:
+                life_index = min(expert_idx, lifecycle_expert_alpha.shape[1] - 1)
+                expert_opacity_final = expert_opacity_final * lifecycle_expert_alpha[:, life_index]
+
+            expert_scales_final = pc.scaling_activation(expert_scales)
+            expert_rotations_final = pc.rotation_activation(expert_rotations)
+
+            expert_cov3D = None
+            expert_scales_raster = expert_scales_final
+            expert_rotations_raster = expert_rotations_final
+            if pipe.compute_cov3D_python:
+                expert_cov3D = pc.covariance_activation(expert_scales_final, scaling_modifier, expert_rotations_final)
+                expert_scales_raster = None
+                expert_rotations_raster = None
+
+            expert_colors = colors_precomp
+            if expert_colors is not None:
+                expert_colors = expert_colors.clone()
+                if vis_expert_rgb_delta is not None:
+                    vis_rgb_index = min(expert_idx, vis_expert_rgb_delta.shape[1] - 1)
+                    expert_colors[deformation_point] = torch.clamp(
+                        expert_colors[deformation_point] + vis_expert_rgb_delta[deformation_point, vis_rgb_index],
+                        0.0,
+                        1.0,
+                    )
+
+            expert_render, expert_radii, expert_depth = rasterizer(
+                means3D=expert_means3D,
+                means2D=means2D,
+                shs=shs if expert_colors is None else None,
+                colors_precomp=expert_colors,
+                opacities=expert_opacity_final,
+                scales=expert_scales_raster,
+                rotations=expert_rotations_raster,
+                cov3D_precomp=expert_cov3D,
+            )
+
+            weight_map = torch.zeros((means3D.shape[0],), device=means3D.device, dtype=expert_render.dtype)
+            weight_map[deformation_point] = gaussian_pi_geo_prior[deformation_point, expert_idx]
+            weight_render, _, _ = rasterizer(
+                means3D=expert_means3D,
+                means2D=means2D,
+                shs=None,
+                colors_precomp=weight_map.unsqueeze(-1).expand(-1, 3),
+                opacities=expert_opacity_final,
+                scales=expert_scales_raster,
+                rotations=expert_rotations_raster,
+                cov3D_precomp=expert_cov3D,
+            )
+
+            expert_renders.append(expert_render)
+            expert_depths.append(expert_depth)
+            expert_radii_list.append(expert_radii)
+            pi_geo_weight_logits.append(weight_render.mean(dim=0))
+
+        expert_renders_stacked = torch.stack(expert_renders, dim=0)
+        expert_depths_stacked = torch.stack(expert_depths, dim=0)
+        expert_radii_stacked = torch.stack(expert_radii_list, dim=0)
+        pi_geo_weight_logits = torch.stack(pi_geo_weight_logits, dim=0)
+        expert_pixel_covered = pi_geo_weight_logits > 0
+        coverage_present = expert_pixel_covered.any(dim=0, keepdim=True)
+        masked_weight_logits = torch.where(
+            expert_pixel_covered,
+            pi_geo_weight_logits,
+            torch.full_like(pi_geo_weight_logits, -1e9),
+        )
+        pi_geo_weights = torch.softmax(masked_weight_logits, dim=0)
+        pi_geo_weights = torch.where(
+            coverage_present.expand_as(pi_geo_weights),
+            pi_geo_weights,
+            torch.zeros_like(pi_geo_weights),
+        )
+
+        rendered_image = (expert_renders_stacked * pi_geo_weights.unsqueeze(1)).sum(dim=0)
+        depth = (expert_depths_stacked * pi_geo_weights).sum(dim=0)
+        radii = expert_radii_stacked.max(dim=0).values
+
+        deformation_aux["expert_renders"] = expert_renders_stacked
+        deformation_aux["pixel_routing_weights"] = pi_geo_weights
+    else:
+        rendered_image, radii, depth = rasterizer(
+            means3D = means3D_final,
+            means2D = means2D,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            opacities = opacity_final,
+            scales = scales_final,
+            rotations = rotations_final,
+            cov3D_precomp = cov3D_precomp)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.

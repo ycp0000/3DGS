@@ -264,6 +264,7 @@ def compute_tracking_losses(
 ) -> Dict[str, torch.Tensor]:
     del prev_d_mu
 
+    pixel_routing_weights = aux.get("pixel_routing_weights")
     pi_geo = aux.get("pi_geo")
     pi_vis = aux.get("pi_vis")
 
@@ -276,8 +277,22 @@ def compute_tracking_losses(
 
     losses: Dict[str, torch.Tensor] = {}
 
-    if pi_geo is not None:
+    if pixel_routing_weights is not None:
+        covered_pixels = pixel_routing_weights.sum(dim=0) > 0
+        if covered_pixels.any():
+            usage_geo = pixel_routing_weights[:, covered_pixels].mean(dim=1)
+        else:
+            usage_geo = torch.zeros(
+                (pixel_routing_weights.shape[0],),
+                device=pixel_routing_weights.device,
+                dtype=pixel_routing_weights.dtype,
+            )
+    elif pi_geo is not None:
         usage_geo = pi_geo.mean(dim=0)
+    else:
+        usage_geo = None
+
+    if usage_geo is not None:
         resolved_geo_names = _resolve_expert_names(
             geo_expert_names,
             usage_geo.numel(),

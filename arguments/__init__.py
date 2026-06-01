@@ -14,6 +14,7 @@ import math
 import sys
 import os
 
+from utils.device_utils import get_device_str
 from utils.params_utils import normalize_legacy_config_keys
 
 
@@ -60,7 +61,7 @@ class ModelParams(ParamGroup):
         self._images = "images"
         self._resolution = -1
         self._white_background = True
-        self.data_device = "cuda"
+        self.data_device = get_device_str()
         self.eval = True
         self.render_process=False
         self.extra_mark = None

@@ -14,6 +14,7 @@ import os
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lpips_loss, TV_loss
+from lpipsPyTorch import LPIPS as LocalLPIPS
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -28,7 +29,11 @@ from utils.timer import Timer
 import cv2
 from torchmetrics.functional.regression import pearson_corrcoef
 
-import lpips
+try:
+    import lpips as external_lpips
+except ImportError:
+    external_lpips = None
+from utils.device_utils import get_device, safe_cuda_event
 from utils.scene_utils import render_training_image
 from time import time
 from scene.tracking_losses import compute_tracking_losses
@@ -49,11 +54,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    device = get_device()
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    background = torch.tensor(bg_color, dtype=torch.float32, device=device)
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = safe_cuda_event(enable_timing=True)
+    iter_end = safe_cuda_event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -63,7 +69,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     progress_bar = tqdm(range(first_iter, final_iter), desc="Training progress")
     first_iter += 1
     
-    lpips_model = lpips.LPIPS(net="vgg").cuda()
+    if external_lpips is not None:
+        lpips_model = external_lpips.LPIPS(net="vgg").to(device)
+    else:
+        lpips_model = LocalLPIPS(net_type="vgg").to(device)
     video_cams = scene.getVideoCameras()
     
     for iteration in range(first_iter, final_iter+1):
@@ -128,9 +137,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage)
             image, depth, viewspace_point_tensor, visibility_filter, radii = \
                 render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            gt_image = viewpoint_cam.original_image.cuda().float()
-            gt_depth = viewpoint_cam.original_depth.cuda().float()
-            mask = viewpoint_cam.mask.cuda()
+            gt_image = viewpoint_cam.original_image.to(device).float()
+            gt_depth = viewpoint_cam.original_depth.to(device).float()
+            mask = viewpoint_cam.mask.to(device)
             
             # depth_refine_iteration = 5
             # depth_refine_bounds = 4 * depth_refine_iteration
@@ -167,7 +176,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             color_diff = color_diff.reshape(color_diff.shape[0], -1)
             quantile = torch.quantile(color_diff, 0.98, dim=1)
             color_to_refine = (color_diff > quantile).reshape(*mask_tensor.shape)
-            mask_tensor[color_to_refine] = torch.ones(color_to_refine.sum()).bool().cuda()
+            mask_tensor[color_to_refine] = torch.ones(color_to_refine.sum(), device=device, dtype=torch.bool)
                 
         if iteration % 500 == 0 and iteration < 1000:
             tmp = (color_to_refine.squeeze().detach().cpu().numpy()*255).astype(np.uint8)
@@ -183,7 +192,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         scene_mode = getattr(scene, "mode", "binocular")
         if (gt_depth_tensor!=0).sum() < 10:
-            depth_loss = torch.tensor(0.).cuda()
+            depth_loss = torch.zeros((), device=device)
         elif scene_mode == 'binocular':
             depth_pred = depth_tensor.clone()
             depth_gt = gt_depth_tensor.clone()
@@ -599,7 +608,8 @@ def training_report(
 
 def setup_seed(seed):
      torch.manual_seed(seed)
-     torch.cuda.manual_seed_all(seed)
+     if torch.cuda.is_available():
+         torch.cuda.manual_seed_all(seed)
      np.random.seed(seed)
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
@@ -607,7 +617,8 @@ def setup_seed(seed):
 if __name__ == "__main__":
     # Set up command line argument parser
     # torch.set_default_tensor_type('torch.FloatTensor')
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     parser = ArgumentParser(description="Training script parameters")
     setup_seed(6666)
     lp = ModelParams(parser)
