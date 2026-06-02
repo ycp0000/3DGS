@@ -122,6 +122,45 @@ def _accumulate_weighted_loss(
     losses[total_name] = weighted if total_name not in losses else losses[total_name] + weighted
 
 
+def _add_geo_spatial_loss(losses: Dict[str, torch.Tensor], aux: Dict[str, torch.Tensor], args) -> None:
+    """
+    Compute spatial smoothness loss using kNN neighbors.
+
+    Penalizes motion discrepancies between spatially nearby Gaussians to encourage
+    coherent motion in local regions.
+    """
+    lambda_geo_spatial = _get_float_arg(args, "lambda_geo_spatial", 0.0)
+    if lambda_geo_spatial <= 0:
+        return
+
+    d_mu = _get_aux_tensor(aux, "d_mu")
+    means3d_canonical = _get_aux_tensor(aux, "means3d_canonical")
+
+    if d_mu is None or means3d_canonical is None:
+        return
+
+    if d_mu.numel() == 0 or means3d_canonical.shape[0] < 9:
+        return
+
+    k = 8
+    try:
+        from simple_knn._C import distCUDA2
+        with torch.no_grad():
+            neighbor_sq_dists = distCUDA2(means3d_canonical.float().contiguous())
+            neighbor_indices_all = neighbor_sq_dists.argsort(dim=-1)
+            neighbor_indices = neighbor_indices_all[:, 1:k+1].long()
+    except Exception:
+        return
+
+    neighbor_d_mu = d_mu[neighbor_indices]
+    d_mu_expanded = d_mu.unsqueeze(1)
+    motion_diff_sq = (neighbor_d_mu - d_mu_expanded).square().sum(dim=-1)
+
+    spatial_roughness = motion_diff_sq.mean()
+    losses["geo_spatial_roughness"] = _safe_mean(spatial_roughness).detach()
+    losses["L_geo_spatial"] = spatial_roughness * lambda_geo_spatial
+
+
 def _add_temporal_regularization(losses: Dict[str, torch.Tensor], aux: Dict[str, torch.Tensor], args) -> None:
     d_mu_sequence = _get_aux_tensor(aux, "d_mu_sequence")
     time_sequence = _get_aux_tensor(aux, "time_sequence")
@@ -365,6 +404,7 @@ def compute_tracking_losses(
     if d_mu is not None:
         losses["mean_norm_d_mu"] = _safe_mean(torch.norm(d_mu, dim=-1)).detach()
         _add_temporal_regularization(losses, aux, args)
+        _add_geo_spatial_loss(losses, aux, args)
 
     if d_rot is not None:
         losses["mean_norm_d_rot"] = _safe_mean(torch.norm(d_rot, dim=-1)).detach()

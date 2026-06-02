@@ -13,7 +13,7 @@ class VisibilityAppearanceHead(nn.Module):
         super().__init__()
         self.time_feature_dim = int(time_feature_dim)
         hidden_dim = max(16, self.time_feature_dim)
-        feature_dim = self.time_feature_dim + 6
+        feature_dim = self.time_feature_dim + 2
 
         self.visibility_head = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
@@ -45,27 +45,70 @@ class VisibilityAppearanceHead(nn.Module):
     def iter_regularized_grids(self):
         return iter(())
 
+    def _compute_view_direction(self, means3d: torch.Tensor, camera_center: torch.Tensor) -> torch.Tensor:
+        """Compute normalized view direction vectors."""
+        dir_vec = means3d - camera_center.unsqueeze(0)
+        return dir_vec / dir_vec.norm(dim=1, keepdim=True).clamp_min(1e-6)
+
+    def _compute_camera_depth(self, means3d: torch.Tensor, world_view_transform: torch.Tensor) -> torch.Tensor:
+        """Compute depth in camera space."""
+        means3d_homogeneous = torch.cat([means3d, torch.ones_like(means3d[:, :1])], dim=-1)
+        view_coords = means3d_homogeneous @ world_view_transform.T
+        return view_coords[:, 2:3]
+
+    def _compute_screen_projection(self, means3d: torch.Tensor, full_proj_transform: torch.Tensor,
+                                     image_width: int, image_height: int) -> torch.Tensor:
+        """Compute normalized screen coordinates."""
+        means3d_homogeneous = torch.cat([means3d, torch.ones_like(means3d[:, :1])], dim=-1)
+        points_proj = means3d_homogeneous @ full_proj_transform.T
+        points_proj = points_proj / points_proj[:, 3:4].clamp_min(1e-6)
+        screen_x = points_proj[:, 0] / image_width * 2 - 1
+        screen_y = points_proj[:, 1] / image_height * 2 - 1
+        return torch.stack([screen_x, screen_y], dim=-1)
+
     def _build_features(
         self,
         time_features: torch.Tensor,
-        gating_state: Dict[str, torch.Tensor],
+        means3d: torch.Tensor,
+        opacity: torch.Tensor,
+        d_mu_norm: torch.Tensor,
+        camera: object = None,
     ) -> torch.Tensor:
-        return torch.cat(
-            (
-                time_features,
-                gating_state["scaffold_weights"],
-                gating_state["cut_gate_values"],
-            ),
-            dim=-1,
-        )
+        """Build view-dependent visibility router features."""
+        features = [time_features, opacity, d_mu_norm]
+
+        if camera is not None:
+            try:
+                camera_center = camera.camera_center.to(means3d.device, means3d.dtype)
+                view_dir = self._compute_view_direction(means3d, camera_center)
+                features.append(view_dir)
+
+                world_view_transform = camera.world_view_transform.to(means3d.device, means3d.dtype)
+                cam_depth = self._compute_camera_depth(means3d, world_view_transform)
+                features.append(cam_depth)
+
+                full_proj_transform = camera.full_proj_transform.to(means3d.device, means3d.dtype)
+                screen_proj = self._compute_screen_projection(
+                    means3d, full_proj_transform,
+                    int(camera.image_width), int(camera.image_height)
+                )
+                features.append(screen_proj)
+            except Exception:
+                pass
+
+        return torch.cat(features, dim=-1)
 
     def forward(
         self,
         time_features: torch.Tensor,
-        gating_state: Dict[str, torch.Tensor],
+        means3d: torch.Tensor,
+        opacity: torch.Tensor,
+        d_mu: torch.Tensor,
         phase: TrackingPhase,
+        camera: object = None,
     ) -> Dict[str, torch.Tensor]:
-        features = self._build_features(time_features, gating_state)
+        d_mu_norm = d_mu.norm(dim=-1, keepdim=True)
+        features = self._build_features(time_features, means3d, opacity, d_mu_norm, camera)
         visibility_logits = self.visibility_head(features)
         appearance_offsets = self.appearance_head(features)
         appearance_rgb_delta = 0.1 * torch.tanh(appearance_offsets)

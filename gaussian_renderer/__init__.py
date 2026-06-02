@@ -99,6 +99,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 rotations[deformation_point],
                 opacity[deformation_point],
                 time[deformation_point],
+                camera=viewpoint_camera,
             )
             deformation_aux = pc._deformation.get_aux_outputs()
         else:

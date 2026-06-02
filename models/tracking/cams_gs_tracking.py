@@ -243,6 +243,7 @@ class CAMSGSTracking(nn.Module):
         time_features: torch.Tensor,
         scene_scale: torch.Tensor,
         phase: TrackingPhase,
+        camera: object = None,
     ):
         gating_state = self.cut_graph(
             means3d=means3d,
@@ -263,8 +264,11 @@ class CAMSGSTracking(nn.Module):
         )
         visibility_state = self.visibility(
             time_features=time_features,
-            gating_state=gating_state,
+            means3d=motion_state["means3d"],
+            opacity=opacity_logits,
+            d_mu=motion_state["d_mu"],
             phase=phase,
+            camera=camera,
         )
         lifecycle_state = self.lifecycle(
             time_features=time_features,
@@ -272,6 +276,7 @@ class CAMSGSTracking(nn.Module):
             phase=phase,
         )
         aux = {
+            "means3d_canonical": means3d,
             "d_mu": motion_state["d_mu"],
             "d_rot": motion_state["d_rot"],
             "d_scale": motion_state["d_scale"],

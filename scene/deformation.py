@@ -132,10 +132,10 @@ class Deformation(nn.Module):
             h = self.grid(rays_pts_emb[:, :3], time_emb[:, :1])
         return self.feature_out(h)
 
-    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity=None, time_emb=None, time_features=None):
+    def forward(self, rays_pts_emb, scales_emb=None, rotations_emb=None, opacity=None, time_emb=None, time_features=None, camera=None):
         if time_emb is None:
             return self.forward_static(rays_pts_emb[:, :3])
-        return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, time_emb, time_features)
+        return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, time_emb, time_features, camera)
 
     def forward_static(self, rays_pts_emb):
         if not self.use_backbone:
@@ -195,7 +195,7 @@ class Deformation(nn.Module):
         self.latest_aux = {}
         return pts, scales, rotations, opacity
 
-    def forward_dynamic(self, rays_pts_emb, scales_emb, rotations_emb, opacity_emb, time_emb, time_features):
+    def forward_dynamic(self, rays_pts_emb, scales_emb, rotations_emb, opacity_emb, time_emb, time_features, camera=None):
         if self.tracking_mode == "original":
             hidden = self.query_time(rays_pts_emb, time_emb).float()
             return self._forward_original(hidden, rays_pts_emb, scales_emb, rotations_emb, opacity_emb)
@@ -247,6 +247,7 @@ class Deformation(nn.Module):
             time_features=time_features,
             scene_scale=scene_scale,
             phase=phase,
+            camera=camera,
         )
         self.latest_aux = aux
         self.latest_d_mu = aux["d_mu"].detach()
