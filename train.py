@@ -479,9 +479,23 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     timer = Timer()
     scene = Scene(dataset, gaussians, load_coarse=None)
     timer.start()
+
+    # Coarse stage: static reconstruction
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                              checkpoint_iterations, checkpoint, debug_from,
                              gaussians, scene, "coarse", tb_writer, opt.coarse_iterations,timer)
+
+    # Save checkpoint at end of coarse stage
+    coarse_checkpoint_path = scene.model_path + "/chkpnt_coarse.pth"
+    print(f"\n[ITER {opt.coarse_iterations}] Saving coarse stage checkpoint to {coarse_checkpoint_path}")
+    torch.save((gaussians.capture(), opt.coarse_iterations), coarse_checkpoint_path)
+
+    # Load coarse checkpoint before fine stage to preserve static reconstruction
+    print(f"[ITER {opt.coarse_iterations}] Loading coarse checkpoint for fine stage")
+    (model_params, _) = torch.load(coarse_checkpoint_path)
+    gaussians.restore(model_params, opt)
+
+    # Fine stage: dynamic optimization
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, "fine", tb_writer, opt.iterations,timer)
