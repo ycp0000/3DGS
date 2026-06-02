@@ -206,6 +206,10 @@ class MotionDecomposition(nn.Module):
         geo_expert_rotations = rotations_out.unsqueeze(1).expand(-1, 3, -1)
         geo_expert_opacity_logits = opacity_out.unsqueeze(1).expand(-1, 3, -1)
 
+        global_motion_norm = global_delta.norm(dim=-1, keepdim=True)
+        local_motion_norm = local_delta.norm(dim=-1, keepdim=True)
+        cut_graph_motion_norm = cut_graph_delta.norm(dim=-1, keepdim=True)
+
         return {
             "means3d": means3d + d_mu,
             "scales": scales_out,
@@ -218,6 +222,9 @@ class MotionDecomposition(nn.Module):
             "global_motion": blended_global,
             "local_motion": blended_local,
             "cut_graph_motion": blended_cut_graph,
+            "global_motion_norm": global_motion_norm,
+            "local_motion_norm": local_motion_norm,
+            "cut_graph_motion_norm": cut_graph_motion_norm,
             "geo_expert_d_mu": geo_expert_d_mu,
             "geo_expert_means3d": geo_expert_means3d,
             "geo_expert_scales": geo_expert_scales,

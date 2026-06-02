@@ -259,6 +259,49 @@ def _add_geo_expert_regularization(
             )
 
 
+def _add_cams_motion_magnitude_loss(
+    losses: Dict[str, torch.Tensor],
+    aux: Dict[str, torch.Tensor],
+    args,
+) -> None:
+    global_motion_norm = _get_aux_tensor(aux, "global_motion_norm")
+    local_motion_norm = _get_aux_tensor(aux, "local_motion_norm")
+    cut_graph_motion_norm = _get_aux_tensor(aux, "cut_graph_motion_norm")
+
+    if global_motion_norm is not None:
+        global_mag = _safe_mean(global_motion_norm)
+        losses["global_motion_magnitude"] = global_mag.detach()
+        _accumulate_weighted_loss(
+            losses,
+            total_name="L_motion_mag",
+            metric_name="global_motion_mag_loss",
+            metric_value=global_mag,
+            weight=_get_float_arg(args, "lambda_motion_mag_global", 1e-4),
+        )
+
+    if local_motion_norm is not None:
+        local_mag = _safe_mean(local_motion_norm)
+        losses["local_motion_magnitude"] = local_mag.detach()
+        _accumulate_weighted_loss(
+            losses,
+            total_name="L_motion_mag",
+            metric_name="local_motion_mag_loss",
+            metric_value=local_mag,
+            weight=_get_float_arg(args, "lambda_motion_mag_local", 2e-5),
+        )
+
+    if cut_graph_motion_norm is not None:
+        cut_graph_mag = _safe_mean(cut_graph_motion_norm)
+        losses["cut_graph_motion_magnitude"] = cut_graph_mag.detach()
+        _accumulate_weighted_loss(
+            losses,
+            total_name="L_motion_mag",
+            metric_name="cut_graph_motion_mag_loss",
+            metric_value=cut_graph_mag,
+            weight=_get_float_arg(args, "lambda_motion_mag_cut_graph", 2e-5),
+        )
+
+
 def _add_cams_patch_c_losses(
     losses: Dict[str, torch.Tensor],
     aux: Dict[str, torch.Tensor],
@@ -365,6 +408,7 @@ def compute_tracking_losses(
             losses["L_balance_geo"] = torch.zeros((), device=usage_geo.device, dtype=usage_geo.dtype)
 
         _add_geo_expert_regularization(losses, aux, args, resolved_geo_names)
+        _add_cams_motion_magnitude_loss(losses, aux, args)
         _add_cams_patch_c_losses(losses, aux, args, aux.get("tracking_phase_name"))
 
     if pi_vis is not None:
