@@ -22,6 +22,25 @@ ModelHiddenParams = dict(
     enable_visibility=True,
     max_disp_smooth_ratio=0.01,
     max_disp_local_ratio=0.03,
+
+    # Tracking loss weights - CRITICAL for CAMS-GS training stability
+    lambda_balance_geo=0.01,
+    lambda_balance_vis=0.005,
+    lambda_route_conf_geo=0.002,
+    lambda_route_conf_vis=0.001,
+    lambda_decouple=0.01,
+    lambda_geo_temp=0.003,
+    lambda_vis_sparse=0.001,
+
+    # Geometry routing targets
+    target_usage_geo_global=0.45,
+    target_usage_geo_local=0.10,
+    target_usage_geo_cut_graph=0.45,
+
+    # Visibility routing targets
+    target_usage_vis_stable=0.85,
+    target_usage_vis_transient=0.15,
+
     kplanes_config={
         'grid_dimensions': 2,
         'input_coordinate_dim': 4,
