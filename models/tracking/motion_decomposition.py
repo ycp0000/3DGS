@@ -137,7 +137,6 @@ class MotionDecomposition(nn.Module):
         gating_state: Dict[str, torch.Tensor],
         phase: TrackingPhase,
     ) -> Dict[str, torch.Tensor]:
-        del phase
         scale = torch.as_tensor(scene_scale, device=means3d.device, dtype=means3d.dtype).reshape(()).abs().clamp_min(1e-6)
 
         global_delta = torch.tanh(self.global_motion(time_features)) * (self.max_disp_global_ratio * scale)
@@ -148,9 +147,25 @@ class MotionDecomposition(nn.Module):
         local_mix = gating_state.get("local_mix")
         cut_graph_mix = gating_state.get("cut_graph_mix")
         if global_mix is None or local_mix is None or cut_graph_mix is None:
-            global_mix = torch.ones((means3d.shape[0], 1), device=means3d.device, dtype=means3d.dtype)
-            local_mix = torch.ones((means3d.shape[0], 1), device=means3d.device, dtype=means3d.dtype)
-            cut_graph_mix = torch.zeros((means3d.shape[0], 1), device=means3d.device, dtype=means3d.dtype)
+            mixes = torch.zeros((means3d.shape[0], 3), device=means3d.device, dtype=means3d.dtype)
+            mixes[:, 0] = 1.0
+        else:
+            mixes = torch.cat((global_mix, local_mix, cut_graph_mix), dim=-1)
+
+        active_geo = max(1, min(int(getattr(phase, "active_geo", mixes.shape[-1])), mixes.shape[-1]))
+        active_mask = torch.zeros_like(mixes)
+        active_mask[:, :active_geo] = 1.0
+        mixes = mixes * active_mask
+
+        mixes_sum = mixes.sum(dim=-1, keepdim=True)
+        fallback = torch.zeros_like(mixes)
+        fallback[:, 0] = 1.0
+        mixes = torch.where(mixes_sum > 1e-8, mixes / mixes_sum.clamp_min(1e-8), fallback)
+
+        global_mix = mixes[:, 0:1]
+        local_mix = mixes[:, 1:2]
+        cut_graph_mix = mixes[:, 2:3]
+
         blended_global = global_delta * global_mix
         blended_local = local_delta * local_mix
         blended_cut_graph = cut_graph_delta * cut_graph_mix

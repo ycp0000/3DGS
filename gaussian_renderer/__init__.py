@@ -93,14 +93,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         means3D_deform, scales_deform, rotations_deform, opacity_deform = means3D, scales, rotations, opacity
     else:
         if deformation_point.any():
-            means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(
-                means3D[deformation_point],
-                scales[deformation_point],
-                rotations[deformation_point],
-                opacity[deformation_point],
-                time[deformation_point],
-                camera=viewpoint_camera,
-            )
+            try:
+                means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(
+                    means3D[deformation_point],
+                    scales[deformation_point],
+                    rotations[deformation_point],
+                    opacity[deformation_point],
+                    time[deformation_point],
+                    camera=viewpoint_camera,
+                )
+            except TypeError:
+                means3D_deform, scales_deform, rotations_deform, opacity_deform = pc._deformation(
+                    means3D[deformation_point],
+                    scales[deformation_point],
+                    rotations[deformation_point],
+                    opacity[deformation_point],
+                    time[deformation_point],
+                )
             deformation_aux = pc._deformation.get_aux_outputs()
         else:
             means3D_deform = means3D.new_zeros((0, means3D.shape[-1]))

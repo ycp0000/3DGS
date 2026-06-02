@@ -216,14 +216,28 @@ class CAMSGSTracking(nn.Module):
         self.visibility.reset_parameters()
         self.lifecycle.reset_parameters()
 
-    def _build_geo_probabilities(self, gating_state: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _build_geo_probabilities(
+        self,
+        gating_state: Dict[str, torch.Tensor],
+        phase: TrackingPhase,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         scaffold_weights = gating_state["scaffold_weights"]
         cut_gate_values = gating_state["cut_gate_values"][:, :1]
         global_mix = scaffold_weights[:, :1]
         local_mix = scaffold_weights[:, 1:2] * cut_gate_values
         cut_graph_mix = scaffold_weights[:, 2:3] * (1.0 - cut_gate_values)
         pi_geo = torch.cat((global_mix, local_mix, cut_graph_mix), dim=-1)
-        pi_geo = pi_geo / pi_geo.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        active_geo = max(1, min(int(getattr(phase, "active_geo", pi_geo.shape[-1])), pi_geo.shape[-1]))
+        active_mask = torch.zeros_like(pi_geo)
+        active_mask[:, :active_geo] = 1.0
+        pi_geo = pi_geo * active_mask
+
+        pi_geo_sum = pi_geo.sum(dim=-1, keepdim=True)
+        fallback = torch.zeros_like(pi_geo)
+        fallback[:, 0] = 1.0
+        pi_geo = torch.where(pi_geo_sum > 1e-8, pi_geo / pi_geo_sum.clamp_min(1e-8), fallback)
+
         gating_state["local_mix"] = pi_geo[:, 1:2]
         gating_state["global_mix"] = pi_geo[:, 0:1]
         gating_state["cut_graph_mix"] = pi_geo[:, 2:3]
@@ -251,7 +265,7 @@ class CAMSGSTracking(nn.Module):
             time_features=time_features,
             phase=phase,
         )
-        pi_geo, entropy_geo, route_max_prob_geo, route_margin_geo = self._build_geo_probabilities(gating_state)
+        pi_geo, entropy_geo, route_max_prob_geo, route_margin_geo = self._build_geo_probabilities(gating_state, phase)
         motion_state = self.motion(
             means3d=means3d,
             scales=scales,

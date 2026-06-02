@@ -907,10 +907,13 @@ def test_cams_local_motion_depends_on_spatial_position():
     gating_state = {
         "scaffold_weights": torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32),
         "cut_gate_values": torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32),
+        "global_mix": torch.zeros(2, 1),
+        "local_mix": torch.ones(2, 1),
+        "cut_graph_mix": torch.zeros(2, 1),
     }
     phase = TrackingPhase(
         name="local_motion_only",
-        active_geo=1,
+        active_geo=3,
         active_vis=1,
         enable_visibility=False,
         temperature_geo=1.0,
@@ -926,6 +929,40 @@ def test_cams_local_motion_depends_on_spatial_position():
 
     assert not torch.allclose(out_a["local_motion"], out_b["local_motion"])
     assert not torch.allclose(out_a["d_mu"], out_b["d_mu"])
+
+
+def test_motion_decomposition_global_only_masks_non_global_mixes():
+    motion = MotionDecomposition(time_feature_dim=8)
+    means = torch.zeros(2, 3)
+    scales = torch.zeros(2, 3)
+    rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
+    opacity = torch.zeros(2, 1)
+    time_features = torch.randn(2, 8)
+    gating_state = {
+        "scaffold_weights": torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32),
+        "cut_gate_values": torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32),
+        "global_mix": torch.full((2, 1), 0.2),
+        "local_mix": torch.full((2, 1), 0.3),
+        "cut_graph_mix": torch.full((2, 1), 0.5),
+    }
+    phase = TrackingPhase(
+        name="global_only",
+        active_geo=1,
+        active_vis=1,
+        enable_visibility=False,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+
+    outputs = motion(means, scales, rotations, opacity, time_features, torch.tensor(1.0), gating_state, phase)
+
+    assert torch.allclose(outputs["local_motion"], torch.zeros_like(outputs["local_motion"]), atol=1e-6)
+    assert torch.allclose(outputs["cut_graph_motion"], torch.zeros_like(outputs["cut_graph_motion"]), atol=1e-6)
+    assert torch.allclose(outputs["d_mu"], outputs["global_motion"], atol=1e-6)
 
 
 def test_cams_cut_graph_route_changes_rendered_geometry():
@@ -994,6 +1031,207 @@ def test_cams_cut_graph_route_changes_rendered_geometry():
     assert not torch.allclose(local_pts, cut_pts)
 
 
+
+
+def test_cams_global_only_phase_disables_local_and_cut_graph_contributions():
+    model = CAMSGSTracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="global_only",
+        active_geo=1,
+        active_vis=1,
+        enable_visibility=False,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+
+    means3d = torch.zeros(2, 3)
+    scales = torch.zeros(2, 3)
+    rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    opacity = torch.zeros(2, 1)
+    time_values = torch.zeros(2, 1)
+    time_features = torch.randn(2, 8)
+    scene_scale = torch.tensor(1.0)
+
+    def _fake_cut_graph(*args, **kwargs):
+        means = kwargs["means3d"]
+        scaffold_logits = torch.zeros(means.shape[0], 3)
+        cut_gate_logits = torch.zeros(means.shape[0], 3)
+        return {
+            "scaffold_logits": scaffold_logits,
+            "scaffold_weights": torch.softmax(scaffold_logits, dim=-1),
+            "cut_gate_logits": cut_gate_logits,
+            "cut_gate_values": torch.sigmoid(cut_gate_logits),
+            "xyz_norm": torch.zeros_like(means),
+        }
+
+    model.cut_graph.forward = _fake_cut_graph
+
+    def _fake_motion(*args, **kwargs):
+        means = kwargs["means3d"]
+        gating_state = kwargs["gating_state"]
+        global_delta = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=means.dtype)
+        local_delta = torch.tensor([[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=means.dtype)
+        cut_delta = torch.tensor([[100.0, 0.0, 0.0], [100.0, 0.0, 0.0]], dtype=means.dtype)
+        global_mix = gating_state["global_mix"]
+        local_mix = gating_state["local_mix"]
+        cut_mix = gating_state["cut_graph_mix"]
+        blended_global = global_delta * global_mix
+        blended_local = local_delta * local_mix
+        blended_cut = cut_delta * cut_mix
+        d_mu = blended_global + blended_local + blended_cut
+        return {
+            "means3d": means + d_mu,
+            "scales": kwargs["scales"],
+            "rotations": kwargs["rotations"],
+            "opacity_logits": kwargs["opacity_logits"],
+            "d_mu": d_mu,
+            "d_rot": torch.zeros((means.shape[0], 3), dtype=means.dtype),
+            "d_scale": torch.zeros_like(kwargs["scales"]),
+            "d_opacity_logit": torch.zeros_like(kwargs["opacity_logits"]),
+            "global_motion": blended_global,
+            "local_motion": blended_local,
+            "cut_graph_motion": blended_cut,
+            "geo_expert_d_mu": torch.stack((global_delta, local_delta, cut_delta), dim=1),
+            "geo_expert_means3d": torch.stack((means + global_delta, means + local_delta, means + cut_delta), dim=1),
+            "geo_expert_scales": kwargs["scales"].unsqueeze(1).expand(-1, 3, -1),
+            "geo_expert_rotations": kwargs["rotations"].unsqueeze(1).expand(-1, 3, -1),
+            "geo_expert_opacity_logits": kwargs["opacity_logits"].unsqueeze(1).expand(-1, 3, -1),
+        }
+
+    model.motion.forward = _fake_motion
+
+    pts, _, _, _, aux = model(
+        means3d=means3d,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=time_values,
+        time_features=time_features,
+        scene_scale=scene_scale,
+        phase=phase,
+    )
+
+    assert torch.allclose(aux["pi_geo"], torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), atol=1e-5)
+    assert torch.allclose(aux["d_mu"], torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), atol=1e-5)
+    assert torch.allclose(aux["local_motion"], torch.zeros_like(aux["local_motion"]), atol=1e-5)
+    assert torch.allclose(aux["cut_graph_motion"], torch.zeros_like(aux["cut_graph_motion"]), atol=1e-5)
+    assert torch.allclose(pts, means3d + torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]), atol=1e-5)
+
+
+def test_cams_open_phase_allows_non_global_experts_to_change_output():
+    model = CAMSGSTracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="joint_finetune",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+
+    means3d = torch.zeros(2, 3)
+    scales = torch.zeros(2, 3)
+    rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+    opacity = torch.zeros(2, 1)
+    time_values = torch.zeros(2, 1)
+    time_features = torch.randn(2, 8)
+    scene_scale = torch.tensor(1.0)
+
+    def _fake_motion(*args, **kwargs):
+        means = kwargs["means3d"]
+        gating_state = kwargs["gating_state"]
+        global_delta = torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=means.dtype)
+        local_delta = torch.tensor([[10.0, 0.0, 0.0], [10.0, 0.0, 0.0]], dtype=means.dtype)
+        cut_delta = torch.tensor([[100.0, 0.0, 0.0], [100.0, 0.0, 0.0]], dtype=means.dtype)
+        global_mix = gating_state["global_mix"]
+        local_mix = gating_state["local_mix"]
+        cut_mix = gating_state["cut_graph_mix"]
+        blended_global = global_delta * global_mix
+        blended_local = local_delta * local_mix
+        blended_cut = cut_delta * cut_mix
+        d_mu = blended_global + blended_local + blended_cut
+        return {
+            "means3d": means + d_mu,
+            "scales": kwargs["scales"],
+            "rotations": kwargs["rotations"],
+            "opacity_logits": kwargs["opacity_logits"],
+            "d_mu": d_mu,
+            "d_rot": torch.zeros((means.shape[0], 3), dtype=means.dtype),
+            "d_scale": torch.zeros_like(kwargs["scales"]),
+            "d_opacity_logit": torch.zeros_like(kwargs["opacity_logits"]),
+            "global_motion": blended_global,
+            "local_motion": blended_local,
+            "cut_graph_motion": blended_cut,
+            "geo_expert_d_mu": torch.stack((global_delta, local_delta, cut_delta), dim=1),
+            "geo_expert_means3d": torch.stack((means + global_delta, means + local_delta, means + cut_delta), dim=1),
+            "geo_expert_scales": kwargs["scales"].unsqueeze(1).expand(-1, 3, -1),
+            "geo_expert_rotations": kwargs["rotations"].unsqueeze(1).expand(-1, 3, -1),
+            "geo_expert_opacity_logits": kwargs["opacity_logits"].unsqueeze(1).expand(-1, 3, -1),
+        }
+
+    model.motion.forward = _fake_motion
+
+    def _fake_local(*args, **kwargs):
+        means = kwargs["means3d"]
+        scaffold_logits = torch.full((means.shape[0], 3), -20.0)
+        scaffold_logits[:, 1] = 20.0
+        cut_gate_logits = torch.full((means.shape[0], 3), 20.0)
+        return {
+            "scaffold_logits": scaffold_logits,
+            "scaffold_weights": torch.softmax(scaffold_logits, dim=-1),
+            "cut_gate_logits": cut_gate_logits,
+            "cut_gate_values": torch.sigmoid(cut_gate_logits),
+            "xyz_norm": torch.zeros_like(means),
+        }
+
+    def _fake_cut(*args, **kwargs):
+        means = kwargs["means3d"]
+        scaffold_logits = torch.full((means.shape[0], 3), -20.0)
+        scaffold_logits[:, 2] = 20.0
+        cut_gate_logits = torch.full((means.shape[0], 3), -20.0)
+        return {
+            "scaffold_logits": scaffold_logits,
+            "scaffold_weights": torch.softmax(scaffold_logits, dim=-1),
+            "cut_gate_logits": cut_gate_logits,
+            "cut_gate_values": torch.sigmoid(cut_gate_logits),
+            "xyz_norm": torch.zeros_like(means),
+        }
+
+    model.cut_graph.forward = _fake_local
+    local_pts, _, _, _, local_aux = model(
+        means3d=means3d,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=time_values,
+        time_features=time_features,
+        scene_scale=scene_scale,
+        phase=phase,
+    )
+
+    model.cut_graph.forward = _fake_cut
+    cut_pts, _, _, _, cut_aux = model(
+        means3d=means3d,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=time_values,
+        time_features=time_features,
+        scene_scale=scene_scale,
+        phase=phase,
+    )
+
+    assert torch.allclose(local_aux["pi_geo"], torch.tensor([[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]]), atol=1e-4)
+    assert torch.allclose(cut_aux["pi_geo"], torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0]]), atol=1e-4)
+    assert not torch.allclose(local_pts, cut_pts)
 
 
 def test_cams_gs_emits_expert_proposals_and_gaussian_priors_for_pixel_router():
@@ -1508,11 +1746,12 @@ def test_cams_visibility_head_exposes_render_affecting_controls():
         topk_geo=1,
         topk_vis=1,
     )
-    gating_state = {
-        "scaffold_weights": torch.softmax(torch.randn(4, 3), dim=-1),
-        "cut_gate_values": torch.sigmoid(torch.randn(4, 3)),
-    }
-    outputs = head(torch.randn(4, 8), gating_state, phase)
+    time_features = torch.randn(4, 8)
+    means3d = torch.randn(4, 3)
+    opacity = torch.randn(4, 1)
+    d_mu = torch.randn(4, 3)
+
+    outputs = head(time_features, means3d, opacity, d_mu, phase)
 
     assert "visibility_alpha" in outputs
     assert "appearance_rgb_delta" in outputs
