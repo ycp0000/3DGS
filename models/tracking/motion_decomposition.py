@@ -172,6 +172,10 @@ class MotionDecomposition(nn.Module):
         d_mu = blended_global + blended_local + blended_cut_graph
         geo_expert_d_mu = torch.stack((global_delta, local_delta, cut_graph_delta), dim=1)
 
+        global_motion_norm = blended_global.norm(dim=-1, keepdim=True)
+        local_motion_norm = blended_local.norm(dim=-1, keepdim=True)
+        cut_graph_motion_norm = blended_cut_graph.norm(dim=-1, keepdim=True)
+
         raw_d_rot = self.rotation_head(local_features)
         d_rot = torch.tanh(raw_d_rot) * self.max_rot_delta
         if self.enable_rotation:
@@ -205,10 +209,6 @@ class MotionDecomposition(nn.Module):
         geo_expert_scales = scales_out.unsqueeze(1).expand(-1, 3, -1)
         geo_expert_rotations = rotations_out.unsqueeze(1).expand(-1, 3, -1)
         geo_expert_opacity_logits = opacity_out.unsqueeze(1).expand(-1, 3, -1)
-
-        global_motion_norm = global_delta.norm(dim=-1, keepdim=True)
-        local_motion_norm = local_delta.norm(dim=-1, keepdim=True)
-        cut_graph_motion_norm = cut_graph_delta.norm(dim=-1, keepdim=True)
 
         return {
             "means3d": means3d + d_mu,
