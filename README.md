@@ -6,7 +6,29 @@ The repository still contains earlier tracking paths for comparison, but the cur
 
 - `tracking_type='cams_gs'`
 
-**Latest Update (plan.md Strict Compliance)**: The implementation now strictly conforms to the original `plan.md` specification:
+**Latest Update (2026-06-02): MoE Training Stability Fixes**
+
+Three critical fixes for MoE stage-wise training have been implemented:
+
+1. **Active_geo masking** (fb12b44): Phase-aware expert activation control
+   - Enables three-stage MoE training (E_global → E_local → E_full)
+   - Dual-layer masking in router (`_build_geo_probabilities`) and motion blending
+   - Fallback to global-only when weights sum to zero
+   - Fixes training collapse where PSNR dropped from 24.97 to 9.47
+
+2. **Motion magnitude regularization** (0a5f77e): Prevents motion field saturation
+   - L_motion_mag loss with separate weights for global/local/cut_graph
+   - Default: `lambda_motion_mag_global=1e-4`, `lambda_motion_mag_local=2e-5`
+   - Exposed via tensorboard: `global_motion_magnitude`, `local_motion_magnitude`, `cut_graph_motion_magnitude`
+
+3. **Norm calculation timing fix** (fbb200d): Critical correctness fix
+   - Moved norm computation AFTER masking (was before)
+   - Ensures loss reflects actual applied motion, not raw expert deltas
+   - When `active_geo=1`, inactive expert norms now correctly equal 0
+
+**Next experiments**: Test MoE stage-wise training with new fixes on EndoNeRF scenes.
+
+**Previous Update (plan.md Strict Compliance)**: The implementation now strictly conforms to the original `plan.md` specification:
 
 - **View-dependent visibility routing**: visibility router receives view direction, camera depth, and screen projection coordinates from the camera, instead of only spatial/temporal features
 - **Geometry-visibility decoupling**: visibility router no longer depends on `scaffold_weights` or `cut_gate_values` from the geometry routing path
@@ -319,6 +341,94 @@ That evidence is enough to decide whether the next step should be:
 ## Suggested feedback package
 
 When you want the next debugging or redesign round, send back something like:
+
+```
+Scene: endonerf/cutting_001
+Baseline PSNR: 24.3
+CAMS-GS PSNR: 23.8
+Router collapse: usage_geo_global stayed >0.95 throughout
+Observation: local/cut_graph branches never activated
+```
+
+---
+
+## Next Experiments (2026-06-02)
+
+After implementing MoE training stability fixes (commits fb12b44, 0a5f77e, fbb200d), run these experiments to validate the fixes:
+
+### 1. Baseline verification
+
+Verify current CAMS-GS baseline before applying fixes:
+
+```bash
+# On server (autodl_356 or similar)
+cd /root/autodl-tmp/EndoMoeGaussian
+git pull origin main
+
+# Test on EndoNeRF cutting scene
+python train.py \
+  -s /root/autodl-tmp/data/endonerf/cutting_tissues_twice \
+  --expname "endonerf/cutting_cams_gs_baseline" \
+  --configs arguments/endonerf/cutting_cams_gs.py
+```
+
+**Monitor in tensorboard:**
+- `global_motion_magnitude`, `local_motion_magnitude`, `cut_graph_motion_magnitude`
+- `usage_geo_global`, `usage_geo_local`, `usage_geo_cut_graph`
+- `L_motion_mag` (should now be active)
+- PSNR curve stability
+
+### 2. Expected improvements
+
+With the fixes, training should now:
+- ✅ Correctly mask inactive experts (active_geo=1 → only global active)
+- ✅ Penalize actual applied motion, not raw deltas
+- ✅ Prevent motion field saturation via L_motion_mag
+- ✅ Avoid training collapse (PSNR should not drop from 24.97 to 9.47)
+
+### 3. Key metrics to compare
+
+Before fixes (expected issues):
+- PSNR collapse in fine stages
+- Router collapse (all weight on one expert)
+- Motion field saturation early
+- `local_motion_magnitude` non-zero even when `active_geo=1`
+
+After fixes (expected behavior):
+- Stable PSNR progression
+- Gradual expert activation across stages
+- Bounded motion magnitudes
+- `local_motion_magnitude` correctly equals 0 when `active_geo=1`
+
+### 4. Commands summary
+
+```bash
+# Pull latest fixes
+git pull origin main
+
+# Run experiment
+python train.py -s <SCENE_PATH> \
+  --expname "endonerf/cutting_cams_gs_fixed" \
+  --configs arguments/endonerf/cutting_cams_gs.py
+
+# Monitor tensorboard
+tensorboard --logdir output/endonerf/cutting_cams_gs_fixed
+
+# After training, evaluate
+python render.py --model_path output/endonerf/cutting_cams_gs_fixed \
+  --skip_train --configs arguments/endonerf/cutting_cams_gs.py
+
+python metrics.py -m output/endonerf/cutting_cams_gs_fixed
+```
+
+### 5. Report back
+
+After experiments complete, provide:
+- Final PSNR/SSIM/LPIPS
+- Tensorboard screenshots of motion magnitude curves
+- Expert usage statistics (`usage_geo_*` at different iterations)
+- Any observed training instabilities
+- Comparison with baseline (if available)
 
 ```text
 Scene: cutting
