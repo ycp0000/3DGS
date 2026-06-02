@@ -6,6 +6,13 @@ The repository still contains earlier tracking paths for comparison, but the cur
 
 - `tracking_type='cams_gs'`
 
+**Latest Update (plan.md Strict Compliance)**: The implementation now strictly conforms to the original `plan.md` specification:
+
+- **View-dependent visibility routing**: visibility router receives view direction, camera depth, and screen projection coordinates from the camera, instead of only spatial/temporal features
+- **Geometry-visibility decoupling**: visibility router no longer depends on `scaffold_weights` or `cut_gate_values` from the geometry routing path
+- **kNN spatial smoothness loss** (`L_geo_spatial`): penalizes motion discrepancies between spatially nearby Gaussians using k-nearest-neighbor graph; activated via `--lambda_geo_spatial 0.01`
+- **Camera parameter propagation**: camera information flows from `gaussian_renderer` through `scene/deformation.py` to `models/tracking/cams_gs_tracking.py` and into the visibility module
+
 Supported tracking modes in the codebase are:
 
 - `tracking_type='original'`: original deformation path
@@ -22,8 +29,9 @@ The current CAMS-GS path replaces the old per-Gaussian MoE story with a structur
 - a **staged curriculum** from global motion to joint refinement
 - a **cut-aware scaffold gate** over `global / local / cut_graph` geometry experts
 - a **real 3-branch geometry composition** for translation updates
-- a **visibility / appearance head** that affects opacity and rendered color
+- a **visibility / appearance head** with view-dependent features (view direction, camera depth, screen projection) that affects opacity and rendered color
 - a **lifecycle head** that affects opacity persistence in late training
+- **kNN spatial smoothness regularization** (`L_geo_spatial`) to encourage coherent motion among nearby Gaussians
 - phase-aware optimizer gating through named tracking parameter groups
 - checkpoint metadata validation for architecture-safe restore/load
 - adjacent-time temporal regularization from the current batch
@@ -35,7 +43,7 @@ The current CAMS-GS implementation is not just an aux-logging branch: the geomet
 At a high level, `tracking_type='cams_gs'` runs as follows:
 
 1. `scene/deformation.py` computes the original backbone dynamic deformation state.
-2. The CAMS head receives the **backbone-updated** Gaussian state plus time features.
+2. The CAMS head receives the **backbone-updated** Gaussian state, time features, and camera parameters.
 3. `CutGraphGating` predicts scaffold weights and cut-aware gate values.
 4. `CAMSGSTracking` converts those into a 3-way geometry routing distribution `pi_geo` over:
    - `global`
@@ -46,6 +54,8 @@ At a high level, `tracking_type='cams_gs'` runs as follows:
    - `pi_vis`
    - `visibility_alpha`
    - `appearance_rgb_delta`
+   - using **view-dependent features**: view direction, camera depth, screen projection
+   - without direct dependence on geometry routing logits/gates
 7. `GaussianLifecycleHead` predicts:
    - `lifecycle_probs`
    - `lifecycle_alpha`
@@ -160,7 +170,19 @@ python train.py \
   --configs arguments/endonerf/pulling_cams_gs.py
 ```
 
-### 3. Render the trained model
+### 3. Run CAMS-GS with kNN spatial smoothness
+
+```bash
+python train.py \
+  -s <ENDONERF_SCENE_PATH> \
+  --expname "endonerf/cutting_cams_gs_spatial" \
+  --configs arguments/endonerf/cutting_cams_gs.py \
+  --lambda_geo_spatial 0.01
+```
+
+Use this when you want the full plan.md-compliant version with spatial motion coherence.
+
+### 4. Render the trained model
 
 ```bash
 python render.py \
@@ -169,7 +191,7 @@ python render.py \
   --configs arguments/endonerf/cutting_cams_gs.py
 ```
 
-### 4. Evaluate metrics
+### 5. Evaluate metrics
 
 ```bash
 python metrics.py -m \
