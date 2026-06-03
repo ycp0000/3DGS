@@ -484,14 +484,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, extra_mark):
     # first_iter = 0
-    if not args.model_path:
-        unique_str = expname
-        args.model_path = os.path.join("./output/", unique_str)
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
-    tb_writer = None
+    tb_writer = prepare_output_and_logger(expname)
 
     gaussians = GaussianModel(dataset.sh_degree, hyper)
     dataset.model_path = args.model_path
@@ -518,6 +511,9 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, "fine", tb_writer, opt.iterations,timer)
+    if tb_writer is not None:
+        tb_writer.flush()
+        tb_writer.close()
 
 def prepare_output_and_logger(expname):    
     if not args.model_path:

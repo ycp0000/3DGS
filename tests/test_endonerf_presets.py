@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import sys
 from argparse import ArgumentParser
 from collections import UserDict
@@ -207,6 +208,22 @@ def test_get_combined_args_maps_legacy_cfg_args_aliases(tmp_path, monkeypatch):
     assert merged.max_disp_hexplane_ratio == 0.125
     assert merged.target_geo_smooth == 0.9
     _assert_legacy_fallbacks(merged)
+
+
+def test_get_combined_args_reads_cfg_args_with_nan_values(tmp_path, monkeypatch):
+    model_path = tmp_path / "model"
+    model_path.mkdir()
+    cfg_args = (
+        f"Namespace(model_path={str(model_path)!r}, target_geo_smooth=nan, "
+        "target_geo_hexplane=inf)"
+    )
+    (model_path / "cfg_args").write_text(cfg_args, encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", ["prog", "--model_path", str(model_path)])
+    merged = get_combined_args(_build_parser())
+
+    assert math.isnan(merged.target_geo_smooth)
+    assert math.isinf(merged.target_geo_hexplane)
 
 
 

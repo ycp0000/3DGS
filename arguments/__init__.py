@@ -267,7 +267,15 @@ def get_combined_args(parser : ArgumentParser):
     except (TypeError, FileNotFoundError):
         if cfgfilepath is not None:
             print("Config file not found at {}".format(cfgfilepath))
-    args_cfgfile = eval(cfgfile_string)
+    args_cfgfile = eval(
+        cfgfile_string,
+        {"__builtins__": {}},
+        {
+            "Namespace": Namespace,
+            "nan": float("nan"),
+            "inf": float("inf"),
+        },
+    )
 
     merged_dict = normalize_legacy_config_keys(vars(args_cfgfile).copy())
     for k, v in vars(args_cmdline).items():

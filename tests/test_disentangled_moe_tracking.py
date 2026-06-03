@@ -151,6 +151,25 @@ def _load_gaussian_renderer_module(monkeypatch, rasterizer_cls):
     return module
 
 
+def _load_render_module(monkeypatch):
+    scene_module = ModuleType("scene")
+    scene_module.Scene = object
+    renderer_module = ModuleType("gaussian_renderer")
+    renderer_module.render = lambda *args, **kwargs: {}
+    renderer_module.GaussianModel = object
+    monkeypatch.setitem(sys.modules, "scene", scene_module)
+    monkeypatch.setitem(sys.modules, "gaussian_renderer", renderer_module)
+
+    spec = importlib.util.spec_from_file_location(
+        "render_test_module",
+        ROOT / "render.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 PLANE_CONFIG = {
     "grid_dimensions": 2,
     "input_coordinate_dim": 4,
@@ -1928,6 +1947,23 @@ def test_renderer_pixel_routing_ignores_background_for_inactive_experts(monkeypa
     )
 
     assert torch.allclose(outputs["deformation_aux"]["pixel_routing_weights"], torch.tensor([[[1.0]], [[0.0]]]))
+
+
+def test_render_reconstruction_accepts_hw_and_channel_first_depth_shapes(monkeypatch):
+    render_module = _load_render_module(monkeypatch)
+
+    hw = torch.randn(4, 5)
+    chw = hw.unsqueeze(0)
+    hwc = hw.unsqueeze(-1)
+    bchw = hw.unsqueeze(0).unsqueeze(0)
+
+    assert render_module._tensor_to_hw_numpy(hw, "depth").shape == (4, 5)
+    assert render_module._tensor_to_hw_numpy(chw, "depth").shape == (4, 5)
+    assert render_module._tensor_to_hw_numpy(hwc, "depth").shape == (4, 5)
+    assert render_module._tensor_to_hw_numpy(bchw, "depth").shape == (4, 5)
+
+    with pytest.raises(ValueError, match="depth must have shape"):
+        render_module._tensor_to_hw_numpy(torch.randn(3, 4, 5), "depth")
 
 
 def test_cams_visibility_head_exposes_render_affecting_controls():

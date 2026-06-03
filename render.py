@@ -32,6 +32,21 @@ from utils.graphics_utils import fov2focal
 
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
+
+def _tensor_to_hw_numpy(tensor, name):
+    array = tensor.detach().cpu().numpy()
+    if array.ndim == 2:
+        return np.ascontiguousarray(array)
+    if array.ndim == 3:
+        if array.shape[0] == 1:
+            return np.ascontiguousarray(array[0])
+        if array.shape[-1] == 1:
+            return np.ascontiguousarray(array[..., 0])
+    if array.ndim == 4 and array.shape[0] == 1:
+        return _tensor_to_hw_numpy(torch.from_numpy(array[0]), name)
+    raise ValueError(f"{name} must have shape [H, W], [1, H, W], or [H, W, 1], got {array.shape}")
+
+
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, reconstruct=False):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
@@ -156,10 +171,8 @@ def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
     for i_frame in frames:
         rgb_tensor = images[i_frame]
         rgb_np = rgb_tensor.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).contiguous().to("cpu").numpy()
-        depth_np = depths[i_frame].cpu().numpy()
-        depth_np = depth_np.squeeze(0)
-        mask = masks[i_frame]
-        mask = mask.squeeze(0).cpu().numpy()
+        depth_np = _tensor_to_hw_numpy(depths[i_frame], "depth").astype(np.float32, copy=False)
+        mask = _tensor_to_hw_numpy(masks[i_frame], "mask")
         
         rgb_new = copy.deepcopy(rgb_np)
 
