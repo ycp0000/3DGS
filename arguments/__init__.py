@@ -47,7 +47,7 @@ class ParamGroup:
                     group.add_argument("--" + key, default=value, type=t)
 
     def extract(self, args):
-        group = GroupParams()
+        group = Namespace()
         for arg in vars(args).items():
             if arg[0] in vars(self) or ("_" + arg[0]) in vars(self):
                 setattr(group, arg[0], arg[1])
@@ -159,6 +159,11 @@ class ModelHiddenParams(ParamGroup):
         self.target_geo_hexplane_stage2 = float("nan")
         self.target_vis_stable = 0.85
         self.target_vis_transient = 0.15
+        self.target_usage_geo_global = 0.45
+        self.target_usage_geo_local = 0.10
+        self.target_usage_geo_cut_graph = 0.45
+        self.target_usage_vis_stable = 0.85
+        self.target_usage_vis_transient = 0.15
         self.sat_threshold = 0.8
         self.lambda_mag_g1_mu = 1e-4
         self.lambda_mag_g2_mu = 2e-5

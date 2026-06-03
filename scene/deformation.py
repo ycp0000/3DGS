@@ -224,13 +224,19 @@ class Deformation(nn.Module):
             raise RuntimeError(f"{self.tracking_mode} tracking requires time_features from the time encoder")
 
         hidden = self.query_time(rays_pts_emb, time_emb).float()
-        base_pts, base_scales, base_rotations, base_opacity = self._forward_original(
-            hidden,
-            rays_pts_emb,
-            scales_emb,
-            rotations_emb,
-            opacity_emb,
-        )
+        if self.tracking_mode == "cams_gs":
+            base_pts = rays_pts_emb[:, :3]
+            base_scales = scales_emb[:, :3]
+            base_rotations = rotations_emb[:, :4]
+            base_opacity = opacity_emb[:, :1]
+        else:
+            base_pts, base_scales, base_rotations, base_opacity = self._forward_original(
+                hidden,
+                rays_pts_emb,
+                scales_emb,
+                rotations_emb,
+                opacity_emb,
+            )
 
         phase = self.get_tracking_phase()
         if phase is None:

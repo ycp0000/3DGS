@@ -147,9 +147,15 @@ class HexPlaneField(nn.Module):
         print("feature_dim:",self.feat_dim)
 
     def set_aabb(self, xyz_max, xyz_min):
-        aabb = torch.tensor([
-            xyz_max,
-            xyz_min
+        device = self.aabb.device
+        dtype = self.aabb.dtype
+        if not isinstance(xyz_max, torch.Tensor):
+            xyz_max = torch.as_tensor(xyz_max)
+        if not isinstance(xyz_min, torch.Tensor):
+            xyz_min = torch.as_tensor(xyz_min)
+        aabb = torch.stack([
+            xyz_max.to(device=device, dtype=dtype),
+            xyz_min.to(device=device, dtype=dtype),
         ])
         self.aabb = nn.Parameter(aabb,requires_grad=True) # !!!!!
         print("Voxel Plane: set aabb=",self.aabb)

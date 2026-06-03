@@ -1821,6 +1821,55 @@ def test_cams_forward_dynamic_respects_no_ds_no_do_no_dr_end_to_end():
     assert torch.allclose(opacity_t, opacity)
 
 
+def test_cams_gs_uses_identity_base_instead_of_original_backbone_deformation():
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs"
+    args.no_ds = True
+    args.no_do = True
+    args.no_dr = True
+    model = Deformation(D=1, W=8, args=args)
+    phase = TrackingPhase(
+        name="global_only",
+        active_geo=1,
+        active_vis=1,
+        enable_visibility=False,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+    model.set_tracking_phase(phase)
+
+    with torch.no_grad():
+        for module in (model.pos_deform, model.scales_deform, model.rotations_deform, model.opacity_deform):
+            for parameter in module.parameters():
+                parameter.fill_(10.0)
+
+    points = torch.randn(4, 3)
+    scales = torch.randn(4, 3)
+    rotations = torch.randn(4, 4)
+    rotations[:, 0] = 1.0
+    opacity = torch.randn(4, 1)
+    times = torch.rand(4, 1)
+    time_features = torch.randn(4, 8)
+
+    pts_t, scales_t, rotations_t, opacity_t = model.forward_dynamic(
+        points,
+        scales,
+        rotations,
+        opacity,
+        times,
+        time_features,
+    )
+
+    assert torch.allclose(pts_t, points, atol=1e-3)
+    assert torch.allclose(scales_t, scales)
+    assert torch.allclose(rotations_t, rotations)
+    assert torch.allclose(opacity_t, opacity)
+
+
 def test_cams_lifecycle_class_semantics_match_balance_target():
     head = CAMSGSTracking(time_feature_dim=8).lifecycle
     phase = TrackingPhase(

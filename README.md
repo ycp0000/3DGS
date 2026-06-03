@@ -148,10 +148,18 @@ This project has been used with the original 3DGS / 4DGaussians-style environmen
 
 ## Dataset setup
 
-For EndoNeRF-style scenes, keep the repository’s expected dataset layout and use:
+For EndoNeRF-style scenes, use an absolute dataset path and keep the expected EndoNeRF files in that directory. For example, use `/root/3DGS/data/endonerf/cutting_tissues_twice`; do not omit the leading `/`.
+
+The scene directory must contain:
+
+- `poses_bounds.npy`
+
+The config must use:
 
 - `extra_mark='endonerf'`
 - `camera_extent=10`
+
+Without `extra_mark='endonerf'`, the loader will not enter the EndoNeRF branch and may fail with `Could not recognize scene type!`.
 
 The EndoNeRF presets in `arguments/endonerf/` already set these values.
 
@@ -163,7 +171,7 @@ Do not judge the method from one run without comparing it against the existing b
 
 ```bash
 python train.py \
-  -s <ENDONERF_SCENE_PATH> \
+  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
   --expname "endonerf/cutting_original" \
   --configs arguments/endonerf/cutting_original.py
 ```
@@ -178,7 +186,7 @@ Why:
 
 ```bash
 python train.py \
-  -s <ENDONERF_SCENE_PATH> \
+  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
   --expname "endonerf/cutting_cams_gs" \
   --configs arguments/endonerf/cutting_cams_gs.py
 ```
@@ -187,7 +195,7 @@ For pulling scenes, switch to:
 
 ```bash
 python train.py \
-  -s <ENDONERF_SCENE_PATH> \
+  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
   --expname "endonerf/pulling_cams_gs" \
   --configs arguments/endonerf/pulling_cams_gs.py
 ```
@@ -196,7 +204,7 @@ python train.py \
 
 ```bash
 python train.py \
-  -s <ENDONERF_SCENE_PATH> \
+  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
   --expname "endonerf/cutting_cams_gs_spatial" \
   --configs arguments/endonerf/cutting_cams_gs.py \
   --lambda_geo_spatial 0.01
@@ -407,7 +415,7 @@ After fixes (expected behavior):
 git pull origin main
 
 # Run experiment
-python train.py -s <SCENE_PATH> \
+python train.py -s /root/3DGS/data/endonerf/cutting_tissues_twice \
   --expname "endonerf/cutting_cams_gs_fixed" \
   --configs arguments/endonerf/cutting_cams_gs.py
 

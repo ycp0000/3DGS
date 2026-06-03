@@ -17,6 +17,7 @@ import json
 from typing import TYPE_CHECKING
 
 import numpy as np
+import torch
 
 from utils.system_utils import searchForMaxIteration
 
@@ -130,6 +131,10 @@ class Scene:
         
         xyz_max = scene_info.point_cloud.points.max(axis=0)
         xyz_min = scene_info.point_cloud.points.min(axis=0)
+        if not isinstance(xyz_max, torch.Tensor):
+            xyz_max = torch.from_numpy(xyz_max) if isinstance(xyz_max, np.ndarray) else torch.as_tensor(xyz_max)
+        if not isinstance(xyz_min, torch.Tensor):
+            xyz_min = torch.from_numpy(xyz_min) if isinstance(xyz_min, np.ndarray) else torch.as_tensor(xyz_min)
         self.gaussians._deformation.set_aabb(xyz_max, xyz_min)
 
         if self.loaded_iter:
