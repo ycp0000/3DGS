@@ -72,6 +72,8 @@ def _build_geo_target(
         "hexplane": _get_float_arg(args, "target_geo_hexplane", legacy_smooth * 0.7),
         "local": legacy_local,
         "smooth": _get_float_arg(args, "target_geo_residual_smooth", legacy_smooth * 0.3),
+        "global": 1.0,
+        "cut_graph": 1.0,
     }
 
     if tuple(active_geo_names) == ("static", "hexplane"):
@@ -84,7 +86,14 @@ def _build_geo_target(
             ),
         ]
     else:
-        values = [target_map.get(name, 1.0) for name in active_geo_names]
+        use_usage_targets = any(name in {"global", "cut_graph"} for name in active_geo_names)
+        if use_usage_targets:
+            values = [
+                _get_float_arg(args, f"target_usage_geo_{name}", target_map.get(name, 1.0))
+                for name in active_geo_names
+            ]
+        else:
+            values = [target_map.get(name, 1.0) for name in active_geo_names]
 
     target = torch.tensor(values, device=device, dtype=dtype)
     return _normalize_target(target)
@@ -359,20 +368,22 @@ def compute_tracking_losses(
 
     losses: Dict[str, torch.Tensor] = {}
 
+    pixel_usage_geo = None
     if pixel_routing_weights is not None:
         covered_pixels = pixel_routing_weights.sum(dim=0) > 0
         if covered_pixels.any():
-            usage_geo = pixel_routing_weights[:, covered_pixels].mean(dim=1)
+            pixel_usage_geo = pixel_routing_weights[:, covered_pixels].mean(dim=1)
         else:
-            usage_geo = torch.zeros(
+            pixel_usage_geo = torch.zeros(
                 (pixel_routing_weights.shape[0],),
                 device=pixel_routing_weights.device,
                 dtype=pixel_routing_weights.dtype,
             )
-    elif pi_geo is not None:
+
+    if pi_geo is not None:
         usage_geo = pi_geo.mean(dim=0)
     else:
-        usage_geo = None
+        usage_geo = pixel_usage_geo
 
     if usage_geo is not None:
         resolved_geo_names = _resolve_expert_names(
@@ -383,6 +394,16 @@ def compute_tracking_losses(
         )
         for index, expert_name in enumerate(resolved_geo_names):
             losses[f"usage_geo_{expert_name}"] = usage_geo[index]
+
+        if pixel_usage_geo is not None:
+            pixel_geo_names = _resolve_expert_names(
+                geo_expert_names,
+                pixel_usage_geo.numel(),
+                DEFAULT_GEO_EXPERT_NAMES,
+                prefix="geo",
+            )
+            for index, expert_name in enumerate(pixel_geo_names):
+                losses[f"pixel_usage_geo_{expert_name}"] = pixel_usage_geo[index].detach()
 
         if force_geo_expert is None:
             active_geo = max(1, min(int(active_geo), usage_geo.numel()))

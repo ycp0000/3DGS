@@ -1821,6 +1821,47 @@ def test_tracking_losses_use_covered_pixel_routing_weights_only():
     assert torch.allclose(losses["usage_geo_local"], torch.tensor(0.1))
 
 
+def test_tracking_losses_balance_uses_gaussian_route_prior_when_pixel_usage_collapses():
+    args = _build_loss_args()
+    args.lambda_balance_geo = 1.0
+    args.target_usage_geo_global = 0.5
+    args.target_usage_geo_local = 0.5
+    pi_geo = torch.tensor([[0.8, 0.2]], requires_grad=True)
+    aux = {
+        "pixel_routing_weights": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 0.0]],
+                [[0.0, 0.0], [0.0, 0.0]],
+            ]
+        ),
+        "pi_geo": pi_geo,
+        "pi_vis": torch.tensor([[1.0, 0.0]]),
+        "d_mu": torch.zeros(1, 3),
+    }
+
+    losses = compute_tracking_losses(
+        aux=aux,
+        iteration=10,
+        args=args,
+        prev_d_mu=None,
+        active_geo=2,
+        active_vis=1,
+        enable_visibility=False,
+        geo_expert_names=("global", "local"),
+        vis_expert_names=("stable", "transient"),
+    )
+
+    assert torch.allclose(losses["usage_geo_global"], torch.tensor(0.8))
+    assert torch.allclose(losses["usage_geo_local"], torch.tensor(0.2))
+    assert torch.allclose(losses["pixel_usage_geo_global"], torch.tensor(1.0))
+    assert torch.allclose(losses["pixel_usage_geo_local"], torch.tensor(0.0))
+
+    losses["L_balance_geo"].backward()
+    assert pi_geo.grad is not None
+    assert pi_geo.grad[0, 0] > 0
+    assert pi_geo.grad[0, 1] < 0
+
+
 def test_renderer_pixel_routing_masks_uncovered_experts_and_aggregates_radii(monkeypatch):
     class _FakeRasterizer:
         calls = []
