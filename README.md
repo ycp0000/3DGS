@@ -1,10 +1,34 @@
 # EndoMoeGaussian
 
-EndoMoeGaussian now centers on **CAMS-GS**: a Cut-Aware Motion Scaffold Gaussian Splatting path for dynamic endoscopic 3D Gaussian Splatting.
+EndoMoeGaussian extends **EndoGaussian / CAMS-GS** with an endoscopy-adapted Mixture-of-Experts dynamic fitting stage. The current forward-looking experimental path is:
 
-The repository still contains earlier tracking paths for comparison, but the current forward-looking experimental path is:
+- `tracking_type='cams_gs_moe'`
 
-- `tracking_type='cams_gs'`
+The codebase still keeps earlier tracking paths for controlled comparison, especially `tracking_type='cams_gs'` as the direct non-MoE baseline.
+
+**Latest Update (2026-06-03): EndoMoeGaussian Full Engineering Path**
+
+The dynamic stage now supports a complete EndoMoeGaussian path:
+
+1. **Identity dynamic base for fine stage**: `cams_gs` and `cams_gs_moe` start dynamic fitting from the static canonical Gaussian state instead of the original random deformation backbone, preventing the fine-stage PSNR collapse observed when the old dynamic MLP disturbed the static reconstruction.
+2. **Three independent geometry experts**:
+   - `E_global`: global low-amplitude motion expert
+   - `E_local`: local / cut-aware motion expert
+   - `E_full`: full geometry + visibility / lifecycle expert
+3. **Gaussian-level MoE router**:
+   - routes each Gaussian using time features, normalized 3D position, opacity, and expert motion magnitudes
+   - supports expert-forced stages, router-only training, and joint finetuning
+4. **Endoscopy-specific stabilization**:
+   - absolute EndoNeRF paths
+   - `extra_mark='endonerf'`
+   - tensor-safe AABB handling
+   - active-geo masking and motion magnitude regularization
+   - view-dependent visibility features
+
+The recommended EndoMoeGaussian presets are:
+
+- `arguments/endonerf/cutting_endomoeg.py`
+- `arguments/endonerf/pulling_endomoeg.py`
 
 **Latest Update (2026-06-02): MoE Training Stability Fixes**
 
@@ -41,6 +65,7 @@ Supported tracking modes in the codebase are:
 - `tracking_type='split'`: split-head intermediate path
 - `tracking_type='heterogeneous_moe'`: older residual heterogeneous MoE path
 - `tracking_type='cams_gs'`: current Cut-Aware Motion Scaffold Gaussian Splatting path
+- `tracking_type='cams_gs_moe'`: EndoMoeGaussian path with independent CAMS-GS experts and a Gaussian-level MoE router
 
 A detailed implementation note for the current CAMS-GS path is in [CAMS_GS_ARCHITECTURE.md](CAMS_GS_ARCHITECTURE.md).
 
@@ -114,14 +139,19 @@ This schedule matters because it prevents early appearance/lifecycle noise from 
 
 ## Current EndoNeRF presets
 
-The current CAMS-GS EndoNeRF presets are:
+The current EndoMoeGaussian EndoNeRF presets are:
+
+- `arguments/endonerf/cutting_endomoeg.py`
+- `arguments/endonerf/pulling_endomoeg.py`
+
+The CAMS-GS baseline EndoNeRF presets are:
 
 - `arguments/endonerf/cutting_cams_gs.py`
 - `arguments/endonerf/pulling_cams_gs.py`
 
 These currently use:
 
-- `tracking_type='cams_gs'`
+- `tracking_type='cams_gs_moe'` for EndoMoeGaussian, or `tracking_type='cams_gs'` for the non-MoE baseline
 - `iterations=9000`
 - `coarse_iterations=1000`
 - `position_lr_max_steps=9000`
@@ -162,6 +192,50 @@ The config must use:
 Without `extra_mark='endonerf'`, the loader will not enter the EndoNeRF branch and may fail with `Could not recognize scene type!`.
 
 The EndoNeRF presets in `arguments/endonerf/` already set these values.
+
+## Recommended EndoMoeGaussian workflow
+
+Start with the static-to-dynamic EndoMoeGaussian path after verifying the original and CAMS-GS baselines.
+
+### 1. Run EndoMoeGaussian on cutting
+
+```bash
+python train.py \
+  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
+  --expname "endonerf/cutting_endomoeg" \
+  --configs arguments/endonerf/cutting_endomoeg.py
+```
+
+### 2. Run EndoMoeGaussian on pulling
+
+```bash
+python train.py \
+  -s /root/3DGS/data/endonerf/pulling_soft_tissues \
+  --expname "endonerf/pulling_endomoeg" \
+  --configs arguments/endonerf/pulling_endomoeg.py
+```
+
+If your pulling scene directory has a different name, replace only the `-s` path and keep it absolute.
+
+### 3. Monitor EndoMoeGaussian training
+
+During the coarse-to-fine switch, PSNR should not fall to around 9 if the scene path and checkpoint state are correct. Watch:
+
+- `coarse/train_loss_patches/psnr` and `fine/train_loss_patches/psnr`
+- `tracking_phase_name`
+- `usage_geo_global`, `usage_geo_local`, `usage_geo_cut_graph`
+- `route_max_prob_geo`, `route_margin_geo`
+- `global_motion_magnitude`, `local_motion_magnitude`, `cut_graph_motion_magnitude`
+- `L_motion_mag`, `L_geo_temp`, `L_geo_spatial`
+
+### 4. Compare against baselines
+
+```bash
+python metrics.py -m \
+  "output/endonerf/cutting_original" \
+  "output/endonerf/cutting_cams_gs" \
+  "output/endonerf/cutting_endomoeg"
+```
 
 ## Recommended CAMS-GS workflow
 

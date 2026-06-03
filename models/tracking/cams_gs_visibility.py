@@ -13,7 +13,7 @@ class VisibilityAppearanceHead(nn.Module):
         super().__init__()
         self.time_feature_dim = int(time_feature_dim)
         hidden_dim = max(16, self.time_feature_dim)
-        feature_dim = self.time_feature_dim + 2
+        feature_dim = self.time_feature_dim + 8
 
         self.visibility_head = nn.Sequential(
             nn.Linear(feature_dim, hidden_dim),
@@ -93,8 +93,18 @@ class VisibilityAppearanceHead(nn.Module):
                     int(camera.image_width), int(camera.image_height)
                 )
                 features.append(screen_proj)
+                return torch.cat(features, dim=-1)
             except Exception:
                 pass
+
+        batch_size = means3d.shape[0]
+        features.extend(
+            (
+                torch.zeros((batch_size, 3), device=means3d.device, dtype=means3d.dtype),
+                torch.zeros((batch_size, 1), device=means3d.device, dtype=means3d.dtype),
+                torch.zeros((batch_size, 2), device=means3d.device, dtype=means3d.dtype),
+            )
+        )
 
         return torch.cat(features, dim=-1)
 

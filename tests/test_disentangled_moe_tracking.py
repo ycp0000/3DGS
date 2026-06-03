@@ -11,8 +11,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from models.tracking import (
+    CAMSGSMoETracking,
     CAMSGSScheduler,
     CAMSGSTracking,
+    EndoMoEGaussianScheduler,
     DisentangledMoETracking,
     HeterogeneousMoEScheduler,
     TrackingPhase,
@@ -166,6 +168,8 @@ class _DeformationStateStub:
             return "hetero_residual_v2"
         if self.tracking_mode == "cams_gs":
             return "cams_gs_v2"
+        if self.tracking_mode == "cams_gs_moe":
+            return "endomoeg_v1"
         if self.tracking_mode == "split":
             return "split_v1"
         return "original_v1"
@@ -476,6 +480,123 @@ def test_deformation_accepts_tracking_type_cams_gs():
     assert model.tracking_mode == "cams_gs"
     assert model.scheduler is not None
     assert model.cams_head is not None
+
+
+def test_deformation_accepts_tracking_type_cams_gs_moe():
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs_moe"
+
+    model = Deformation(D=1, W=8, args=args)
+
+    assert model.tracking_mode == "cams_gs_moe"
+    assert model.scheduler is not None
+    assert model.cams_moe_head is not None
+    assert model.get_tracking_arch_version() == "endomoeg_v1"
+
+
+def test_endomoeg_scheduler_builds_expert_router_and_joint_phases():
+    args = _build_deformation_args()
+    args.endomoeg_expert_global_end = 10
+    args.endomoeg_expert_local_end = 20
+    args.endomoeg_expert_full_end = 30
+    args.endomoeg_router_only_end = 40
+    scheduler = EndoMoEGaussianScheduler(args)
+
+    global_phase = scheduler.build(1, 100)
+    local_phase = scheduler.build(10, 100)
+    full_phase = scheduler.build(20, 100)
+    router_phase = scheduler.build(30, 100)
+    joint_phase = scheduler.build(40, 100)
+
+    assert global_phase.name == "moe_expert_global"
+    assert local_phase.name == "moe_expert_local"
+    assert full_phase.name == "moe_expert_full"
+    assert router_phase.name == "moe_router_only"
+    assert joint_phase.name == "moe_joint_finetune"
+    assert global_phase.is_group_trainable("tracking_time_encoder")
+    assert local_phase.is_group_trainable("tracking_time_encoder")
+    assert full_phase.is_group_trainable("tracking_time_encoder")
+    assert not router_phase.is_group_trainable("tracking_time_encoder")
+    assert joint_phase.is_group_trainable("tracking_time_encoder")
+
+
+def test_cams_gs_moe_emits_independent_expert_proposals_and_router_weights():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_router_only",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+    means3d = torch.randn(5, 3)
+    scales = torch.randn(5, 3)
+    rotations = torch.randn(5, 4)
+    rotations[:, 0] = 1.0
+    opacity = torch.randn(5, 1)
+    time_values = torch.rand(5, 1)
+    time_features = torch.randn(5, 8)
+
+    pts, scales_out, rotations_out, opacity_out, aux = model(
+        means3d=means3d,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=time_values,
+        time_features=time_features,
+        scene_scale=torch.tensor(1.0),
+        phase=phase,
+    )
+
+    assert pts.shape == means3d.shape
+    assert scales_out.shape == scales.shape
+    assert rotations_out.shape == rotations.shape
+    assert opacity_out.shape == opacity.shape
+    assert aux["geo_expert_means3d"].shape == (5, 3, 3)
+    assert aux["geo_expert_scales"].shape == (5, 3, 3)
+    assert aux["geo_expert_rotations"].shape == (5, 3, 4)
+    assert aux["geo_expert_opacity_logits"].shape == (5, 3, 1)
+    assert torch.allclose(aux["pi_geo"].sum(dim=-1), torch.ones(5), atol=1e-6)
+    assert aux["vis_expert_rgb_delta"].shape == (5, 3, 3)
+
+
+def test_cams_gs_moe_expert_stage_forces_single_expert_route():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_expert_local",
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+        force_geo_expert="local",
+    )
+    means3d = torch.randn(3, 3)
+    rotations = torch.randn(3, 4)
+    rotations[:, 0] = 1.0
+
+    _, _, _, _, aux = model(
+        means3d=means3d,
+        scales=torch.randn(3, 3),
+        rotations=rotations,
+        opacity_logits=torch.randn(3, 1),
+        time_values=torch.rand(3, 1),
+        time_features=torch.randn(3, 8),
+        scene_scale=torch.tensor(1.0),
+        phase=phase,
+    )
+
+    expected = torch.tensor([[0.0, 1.0, 0.0]]).expand(3, -1)
+    assert torch.allclose(aux["pi_geo"], expected)
 
 
 def test_cams_gs_tracking_groups_expose_patch_c_optimizer_groups():
@@ -1761,6 +1882,41 @@ def test_cams_visibility_head_exposes_render_affecting_controls():
 
     assert "visibility_alpha" in outputs
     assert "appearance_rgb_delta" in outputs
+    assert outputs["visibility_alpha"].shape == (4, 1)
+    assert outputs["appearance_rgb_delta"].shape == (4, 3)
+
+
+def test_cams_visibility_head_accepts_view_dependent_camera_features():
+    head = CAMSGSTracking(time_feature_dim=8).visibility
+    phase = TrackingPhase(
+        name="visibility_refine",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+    )
+    camera = SimpleNamespace(
+        camera_center=torch.zeros(3),
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        image_width=64,
+        image_height=64,
+    )
+
+    outputs = head(
+        torch.randn(4, 8),
+        torch.randn(4, 3),
+        torch.randn(4, 1),
+        torch.randn(4, 3),
+        phase,
+        camera=camera,
+    )
+
     assert outputs["visibility_alpha"].shape == (4, 1)
     assert outputs["appearance_rgb_delta"].shape == (4, 3)
 

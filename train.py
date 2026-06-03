@@ -45,6 +45,25 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+
+def validate_training_source_args(args):
+    source_path = os.path.abspath(args.source_path)
+    args.source_path = source_path
+
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Training source_path does not exist: {source_path}")
+
+    if getattr(args, "extra_mark", None) == "endonerf":
+        poses_bounds_path = os.path.join(source_path, "poses_bounds.npy")
+        if not os.path.exists(poses_bounds_path):
+            raise FileNotFoundError(
+                "EndoNeRF training requires poses_bounds.npy in the scene root. "
+                f"Expected: {poses_bounds_path}. "
+                "Pass the absolute scene directory with -s, for example /root/3DGS/data/endonerf/<scene>."
+            )
+
+    return args
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter, timer):
@@ -657,6 +676,9 @@ if __name__ == "__main__":
         from utils.params_utils import merge_hparams
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
+    args = validate_training_source_args(args)
+    print(f"Training source_path: {args.source_path}")
+    print(f"Training extra_mark: {getattr(args, 'extra_mark', None)}")
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)

@@ -129,6 +129,7 @@ class ModelHiddenParams(ParamGroup):
 
         self.max_disp_hexplane_ratio = 0.01
         self.max_disp_smooth_ratio = 0.01
+        self.max_disp_global_ratio = 0.01
         self.max_disp_local_ratio = 0.03
         self.max_rot_smooth = 0.05
         self.max_rot_local = 0.10
@@ -174,6 +175,9 @@ class ModelHiddenParams(ParamGroup):
         self.lambda_raw_g1_disp = 1e-4
         self.lambda_raw_g2_disp = 1e-4
         self.lambda_raw_g3_disp = float("nan")
+        self.lambda_motion_mag_global = 1e-4
+        self.lambda_motion_mag_local = 2e-5
+        self.lambda_motion_mag_cut_graph = 2e-5
 
         self.warmup_iters = 1000
         self.enable_shared_only_iter = 1000
@@ -195,6 +199,13 @@ class ModelHiddenParams(ParamGroup):
         self.lambda_lifecycle_balance = 1e-4
         self.lambda_lifecycle_reg = 1e-4
         self.target_lifecycle_persistent = 0.8
+        self.endomoeg_stage = ""
+        self.cams_moe_stage = ""
+        self.endomoeg_expert_global_end = -1
+        self.endomoeg_expert_local_end = -1
+        self.endomoeg_expert_full_end = -1
+        self.endomoeg_router_only_end = -1
+        self.moe_router_hidden_dim = 64
 
         self.current_iteration = 0
         super().__init__(parser, "ModelHiddenParams")

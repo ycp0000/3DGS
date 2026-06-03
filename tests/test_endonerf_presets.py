@@ -276,6 +276,19 @@ def test_cams_gs_presets_use_known_parser_keys_and_tracking_type():
         assert candidate.max_disp_local_ratio == 0.03
 
 
+def test_endomoeg_presets_use_known_parser_keys_and_tracking_type():
+    for scene_name in ("cutting", "pulling"):
+        baseline = _load_preset_args(f"{scene_name}_original.py")
+        candidate = _load_preset_args(f"{scene_name}_endomoeg.py")
+        assert candidate.tracking_type == "cams_gs_moe"
+        assert candidate.extra_mark == "endonerf"
+        assert candidate.coarse_iterations == baseline.coarse_iterations
+        assert candidate.pruning_interval == baseline.pruning_interval
+        assert candidate.iterations == baseline.iterations
+        assert candidate.endomoeg_expert_global_end == 1800
+        assert candidate.endomoeg_router_only_end == 7600
+
+
 def test_cams_gs_early_phases_preset_has_explicit_stage_boundaries():
     candidate = _load_preset_args("cutting_cams_gs_early_phases.py")
     assert candidate.tracking_type == "cams_gs"

@@ -1,4 +1,5 @@
 from .cams_gs_lifecycle import GaussianLifecycleHead
+from .cams_gs_moe_tracking import CAMSGSMoETracking, EndoMoEGaussianScheduler, VolumeAwareGaussianRouter
 from .cams_gs_tracking import CAMSGSScheduler, CAMSGSTracking
 from .cams_gs_visibility import VisibilityAppearanceHead
 from .cut_graph_gating import CutGraphGating
@@ -15,15 +16,18 @@ DisentangledMoETracking = HeterogeneousMoETracking
 
 __all__ = [
     "CAMSGSScheduler",
+    "CAMSGSMoETracking",
     "CAMSGSTracking",
     "CutGraphGating",
     "DisentangledMoETracking",
     "GaussianLifecycleHead",
+    "EndoMoEGaussianScheduler",
     "HeterogeneousMoEScheduler",
     "HeterogeneousMoETracking",
     "MotionDecomposition",
     "SplitTrackingHead",
     "TrackingPhase",
     "VisibilityAppearanceHead",
+    "VolumeAwareGaussianRouter",
     "shape_debug_check",
 ]

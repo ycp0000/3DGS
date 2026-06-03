@@ -6,8 +6,10 @@ import torch.nn as nn
 import torch.nn.init as init
 
 from models.tracking import (
+    CAMSGSMoETracking,
     CAMSGSScheduler,
     CAMSGSTracking,
+    EndoMoEGaussianScheduler,
     HeterogeneousMoEScheduler,
     HeterogeneousMoETracking,
     SplitTrackingHead,
@@ -30,7 +32,9 @@ class Deformation(nn.Module):
         tracking_mode = getattr(args, "tracking_type", "original").lower()
         if tracking_mode in {"disentangled", "disentangled_moe", "heterogeneous", "heterogeneous_moe"}:
             tracking_mode = "hetero_moe"
-        if tracking_mode not in {"original", "split", "hetero_moe", "cams_gs"}:
+        if tracking_mode in {"endomoeg", "endo_moe_gaussian", "endomoegaussian"}:
+            tracking_mode = "cams_gs_moe"
+        if tracking_mode not in {"original", "split", "hetero_moe", "cams_gs", "cams_gs_moe"}:
             raise ValueError(f"Unsupported tracking_type: {tracking_mode}")
         self.tracking_mode = tracking_mode
         self.use_backbone = self.tracking_mode in {"original", "split", "hetero_moe", "cams_gs"}
@@ -56,6 +60,7 @@ class Deformation(nn.Module):
         self.split_head: Optional[SplitTrackingHead] = None
         self.heterogeneous_head: Optional[HeterogeneousMoETracking] = None
         self.cams_head: Optional[CAMSGSTracking] = None
+        self.cams_moe_head: Optional[CAMSGSMoETracking] = None
         self.scheduler = None
 
         if self.tracking_mode == "split":
@@ -98,6 +103,20 @@ class Deformation(nn.Module):
                 max_rot_local=getattr(args, "max_rot_local", getattr(args, "max_rot_smooth", 0.05)),
                 max_scale_local=getattr(args, "max_scale_local", getattr(args, "max_scale_smooth", 0.05)),
                 max_opacity_delta=getattr(args, "max_opacity_delta", 4.0),
+                enable_scale=not bool(getattr(args, "no_ds", False)),
+                enable_rotation=not bool(getattr(args, "no_dr", False)),
+                enable_opacity=not bool(getattr(args, "no_do", False)),
+            )
+        elif self.tracking_mode == "cams_gs_moe":
+            self.scheduler = EndoMoEGaussianScheduler(args)
+            self.cams_moe_head = CAMSGSMoETracking(
+                time_feature_dim=getattr(args, "timenet_output", 32),
+                max_disp_global_ratio=getattr(args, "max_disp_global_ratio", getattr(args, "max_disp_smooth_ratio", 0.01)),
+                max_disp_local_ratio=getattr(args, "max_disp_local_ratio", 0.03),
+                max_rot_delta=getattr(args, "max_rot_local", getattr(args, "max_rot_smooth", 0.05)),
+                max_scale_delta=getattr(args, "max_scale_local", getattr(args, "max_scale_smooth", 0.05)),
+                max_opacity_delta=getattr(args, "max_opacity_delta", 4.0),
+                moe_router_hidden_dim=getattr(args, "moe_router_hidden_dim", 64),
                 enable_scale=not bool(getattr(args, "no_ds", False)),
                 enable_rotation=not bool(getattr(args, "no_dr", False)),
                 enable_opacity=not bool(getattr(args, "no_do", False)),
@@ -218,18 +237,18 @@ class Deformation(nn.Module):
             self.latest_d_mu = aux["d_mu"].detach()
             return pts, scales, rotations, opacity
 
-        if self.heterogeneous_head is None and self.cams_head is None:
+        if self.heterogeneous_head is None and self.cams_head is None and self.cams_moe_head is None:
             raise RuntimeError(f"{self.tracking_mode} tracking mode selected but head is not initialized")
         if time_features is None:
             raise RuntimeError(f"{self.tracking_mode} tracking requires time_features from the time encoder")
 
-        hidden = self.query_time(rays_pts_emb, time_emb).float()
-        if self.tracking_mode == "cams_gs":
+        if self.tracking_mode in {"cams_gs", "cams_gs_moe"}:
             base_pts = rays_pts_emb[:, :3]
             base_scales = scales_emb[:, :3]
             base_rotations = rotations_emb[:, :4]
             base_opacity = opacity_emb[:, :1]
         else:
+            hidden = self.query_time(rays_pts_emb, time_emb).float()
             base_pts, base_scales, base_rotations, base_opacity = self._forward_original(
                 hidden,
                 rays_pts_emb,
@@ -242,7 +261,12 @@ class Deformation(nn.Module):
         if phase is None:
             raise RuntimeError(f"Tracking phase is unavailable for {self.tracking_mode} mode")
 
-        tracking_head = self.heterogeneous_head if self.tracking_mode == "hetero_moe" else self.cams_head
+        if self.tracking_mode == "hetero_moe":
+            tracking_head = self.heterogeneous_head
+        elif self.tracking_mode == "cams_gs_moe":
+            tracking_head = self.cams_moe_head
+        else:
+            tracking_head = self.cams_head
         assert tracking_head is not None
         pts, scales, rotations, opacity, aux = tracking_head(
             means3d=base_pts,
@@ -298,6 +322,8 @@ class Deformation(nn.Module):
             groups.update(self.heterogeneous_head.named_parameter_groups())
         if self.cams_head is not None:
             groups.update(self.cams_head.named_parameter_groups())
+        if self.cams_moe_head is not None:
+            groups.update(self.cams_moe_head.named_parameter_groups())
         return groups
 
     def set_aabb(self, xyz_max, xyz_min) -> None:
@@ -307,6 +333,8 @@ class Deformation(nn.Module):
             self.heterogeneous_head.set_aabb(xyz_max, xyz_min)
         if self.cams_head is not None:
             self.cams_head.set_aabb(xyz_max, xyz_min)
+        if self.cams_moe_head is not None:
+            self.cams_moe_head.set_aabb(xyz_max, xyz_min)
 
     def iter_regularized_grids(self):
         if self.grid is not None:
@@ -316,6 +344,8 @@ class Deformation(nn.Module):
             yield from self.heterogeneous_head.iter_regularized_grids()
         if self.cams_head is not None:
             yield from self.cams_head.iter_regularized_grids()
+        if self.cams_moe_head is not None:
+            yield from self.cams_moe_head.iter_regularized_grids()
 
     def set_scene_scale(self, scale: float) -> None:
         scale = float(scale)
@@ -346,12 +376,16 @@ class Deformation(nn.Module):
             self.heterogeneous_head.reset_parameters()
         if self.cams_head is not None:
             self.cams_head.reset_parameters()
+        if self.cams_moe_head is not None:
+            self.cams_moe_head.reset_parameters()
 
     def get_expert_names(self):
         if self.heterogeneous_head is not None:
             return (self.heterogeneous_head.GEO_EXPERT_NAMES, self.heterogeneous_head.VIS_EXPERT_NAMES)
         if self.cams_head is not None:
             return (self.cams_head.GEO_EXPERT_NAMES, self.cams_head.VIS_EXPERT_NAMES)
+        if self.cams_moe_head is not None:
+            return (self.cams_moe_head.GEO_EXPERT_NAMES, self.cams_moe_head.VIS_EXPERT_NAMES)
         return (("single",), ("single",))
 
     def get_tracking_arch_version(self) -> str:
@@ -359,6 +393,8 @@ class Deformation(nn.Module):
             return "hetero_residual_v2"
         if self.tracking_mode == "cams_gs":
             return "cams_gs_v2"
+        if self.tracking_mode == "cams_gs_moe":
+            return "endomoeg_v1"
         if self.tracking_mode == "split":
             return "split_v1"
         return "original_v1"

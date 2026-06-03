@@ -158,6 +158,11 @@ class GaussianModel:
                 "This cams_gs checkpoint predates the CAMS-GS architecture update and cannot be resumed automatically. "
                 "Start from a compatible checkpoint or retrain with the updated architecture."
             )
+        if current_tracking_type == "cams_gs_moe" and saved_tracking_type == current_tracking_type and saved_tracking_arch_version is None:
+            raise ValueError(
+                "This cams_gs_moe checkpoint predates the EndoMoeGaussian architecture update and cannot be resumed automatically. "
+                "Start from a compatible checkpoint or retrain with the updated architecture."
+            )
         if saved_tracking_arch_version is not None and saved_tracking_arch_version != current_tracking_arch_version:
             raise ValueError(
                 "Checkpoint tracking architecture version "
@@ -340,6 +345,11 @@ class GaussianModel:
         if current_tracking_type == "cams_gs" and saved_tracking_type == current_tracking_type and saved_tracking_arch_version is None:
             raise ValueError(
                 "This cams_gs deformation checkpoint predates the CAMS-GS architecture update and cannot be loaded automatically. "
+                "Start from a compatible checkpoint or retrain with the updated architecture."
+            )
+        if current_tracking_type == "cams_gs_moe" and saved_tracking_type == current_tracking_type and saved_tracking_arch_version is None:
+            raise ValueError(
+                "This cams_gs_moe deformation checkpoint predates the EndoMoeGaussian architecture update and cannot be loaded automatically. "
                 "Start from a compatible checkpoint or retrain with the updated architecture."
             )
         if saved_tracking_arch_version is not None and saved_tracking_arch_version != current_tracking_arch_version:
