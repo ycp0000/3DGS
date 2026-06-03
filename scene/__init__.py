@@ -56,23 +56,40 @@ class Scene:
                 self.loaded_iter = load_iteration
             print("Loading trained model at iteration {}".format(self.loaded_iter))
         
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
-        elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
+        source_path = os.path.abspath(args.source_path)
+        args.source_path = source_path
+        poses_bounds_path = os.path.join(source_path, "poses_bounds.npy")
+        extra_mark = getattr(args, "extra_mark", None)
+
+        if not os.path.exists(source_path):
+            raise FileNotFoundError(f"Scene source_path does not exist: {source_path}")
+
+        if extra_mark == "endonerf":
+            if not os.path.exists(poses_bounds_path):
+                raise FileNotFoundError(
+                    "EndoNeRF scene requires poses_bounds.npy at "
+                    f"{poses_bounds_path}. Check that -s is an absolute scene directory, e.g. /root/3DGS/data/endonerf/<scene>."
+                )
+            scene_info = sceneLoadTypeCallbacks["endonerf"](source_path, args.white_background, args.eval, scene_mode=self.mode)
+            print("Found poses_bounds.npy and extra_mark='endonerf', assuming EndoNeRF data")
+        elif os.path.exists(os.path.join(source_path, "sparse")):
+            scene_info = sceneLoadTypeCallbacks["Colmap"](source_path, args.images, args.eval)
+        elif os.path.exists(os.path.join(source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
-            scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
-        elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and args.extra_mark is None:
-            scene_info = sceneLoadTypeCallbacks["dynerf"](args.source_path, args.white_background, args.eval)
-        elif os.path.exists(os.path.join(args.source_path,"dataset.json")):
-            scene_info = sceneLoadTypeCallbacks["nerfies"](args.source_path, False, args.eval)
-        elif os.path.exists(os.path.join(args.source_path, "poses_bounds.npy")) and args.extra_mark == 'endonerf':
-            scene_info = sceneLoadTypeCallbacks["endonerf"](args.source_path, args.white_background, args.eval, scene_mode=self.mode)
-            print("Found poses_bounds.py and extra marks with EndoNeRf")
-        elif os.path.exists(os.path.join(args.source_path, "point_cloud.obj")) or os.path.exists(os.path.join(args.source_path, "left_point_cloud.obj")):
-            scene_info = sceneLoadTypeCallbacks["scared"](args.source_path, args.white_background, args.eval, scene_mode=self.mode)
+            scene_info = sceneLoadTypeCallbacks["Blender"](source_path, args.white_background, args.eval)
+        elif os.path.exists(poses_bounds_path):
+            scene_info = sceneLoadTypeCallbacks["dynerf"](source_path, args.white_background, args.eval)
+        elif os.path.exists(os.path.join(source_path,"dataset.json")):
+            scene_info = sceneLoadTypeCallbacks["nerfies"](source_path, False, args.eval)
+        elif os.path.exists(os.path.join(source_path, "point_cloud.obj")) or os.path.exists(os.path.join(source_path, "left_point_cloud.obj")):
+            scene_info = sceneLoadTypeCallbacks["scared"](source_path, args.white_background, args.eval, scene_mode=self.mode)
             print("Found point_cloud.obj, assuming SCARED data!")
         else:
-            assert False, "Could not recognize scene type!"
+            raise AssertionError(
+                "Could not recognize scene type. "
+                f"source_path={source_path}, extra_mark={extra_mark!r}, "
+                f"expected EndoNeRF file={poses_bounds_path}"
+            )
                 
         self.maxtime = scene_info.maxtime
         # self.cameras_extent = scene_info.nerf_normalization["radius"]

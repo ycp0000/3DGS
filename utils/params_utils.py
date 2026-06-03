@@ -1,3 +1,6 @@
+from collections.abc import Mapping
+
+
 LEGACY_KEY_ALIASES = {
     "max_disp_shared_ratio": "max_disp_hexplane_ratio",
     "prune_interval": "pruning_interval",
@@ -18,7 +21,7 @@ def merge_hparams(args, config):
     params = ["OptimizationParams", "ModelHiddenParams", "ModelParams", "PipelineParams"]
     for param in params:
         section = config.get(param)
-        if not isinstance(section, dict):
+        if not isinstance(section, Mapping):
             continue
         for key, value in normalize_legacy_config_keys(section).items():
             if hasattr(args, key):

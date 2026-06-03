@@ -1,6 +1,7 @@
 import importlib.util
 import sys
 from argparse import ArgumentParser
+from collections import UserDict
 from pathlib import Path
 
 import torch
@@ -122,6 +123,21 @@ def test_endonerf_presets_only_use_known_parser_keys():
             assert not unknown_keys, (
                 f"{preset_path.name} contains unsupported {section_name} keys: {unknown_keys}"
             )
+
+
+
+def test_merge_hparams_accepts_mapping_config_sections():
+    args = _build_default_args()
+    config = {
+        "ModelParams": UserDict({"extra_mark": "endonerf", "camera_extent": 10}),
+        "ModelHiddenParams": UserDict({"tracking_type": "cams_gs"}),
+    }
+
+    merged = merge_hparams(args, config)
+
+    assert merged.extra_mark == "endonerf"
+    assert merged.camera_extent == 10
+    assert merged.tracking_type == "cams_gs"
 
 
 
