@@ -185,6 +185,13 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         vis_expert_visibility_alpha = deformation_aux.get("vis_expert_visibility_alpha")
         lifecycle_expert_alpha = deformation_aux.get("lifecycle_expert_alpha")
         active_expert_prior = gaussian_pi_geo_prior[deformation_point].amax(dim=0) > 1e-8
+        fallback_prior = gaussian_pi_geo_prior[deformation_point].mean(dim=0).clamp_min(0.0)
+        fallback_prior = fallback_prior * active_expert_prior.to(dtype=fallback_prior.dtype)
+        if fallback_prior.sum() <= 1e-8:
+            fallback_prior = active_expert_prior.to(dtype=fallback_prior.dtype)
+        if fallback_prior.sum() <= 1e-8:
+            fallback_prior = torch.ones_like(fallback_prior)
+        fallback_pi_geo_weights = (fallback_prior / fallback_prior.sum().clamp_min(1e-8)).view(num_experts, 1, 1)
         weight_raster_settings = GaussianRasterizationSettings(
             image_height=H,
             image_width=W,
@@ -306,7 +313,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         pi_geo_weights = torch.where(
             coverage_present.expand_as(pi_geo_weights),
             pi_geo_weights,
-            torch.zeros_like(pi_geo_weights),
+            fallback_pi_geo_weights.expand_as(pi_geo_weights),
         )
 
         rendered_image = (expert_renders_stacked * pi_geo_weights.unsqueeze(1)).sum(dim=0)

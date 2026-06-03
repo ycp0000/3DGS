@@ -64,6 +64,15 @@ def validate_training_source_args(args):
 
     return args
 
+
+def should_reset_opacity(stage, iteration, opt, dataset):
+    if stage != "coarse":
+        return False
+    return iteration % opt.opacity_reset_interval == 0 or (
+        dataset.white_background and iteration == opt.densify_from_iter
+    )
+
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter, timer):
@@ -469,7 +478,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     size_threshold = 40 if iteration > opt.opacity_reset_interval else None
                     gaussians.prune(densify_threshold, opacity_threshold, scene.cameras_extent, size_threshold)
 
-                if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
+                if should_reset_opacity(stage, iteration, opt, dataset):
                     print("reset opacity")
                     gaussians.reset_opacity()
 
