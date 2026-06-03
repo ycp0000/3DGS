@@ -1073,6 +1073,12 @@ def test_cams_local_motion_depends_on_spatial_position():
 
 def test_motion_decomposition_global_only_masks_non_global_mixes():
     motion = MotionDecomposition(time_feature_dim=8)
+    with torch.no_grad():
+        for head in (motion.rotation_head, motion.scale_head, motion.opacity_head):
+            last_linear = next(layer for layer in reversed(head) if isinstance(layer, nn.Linear))
+            last_linear.weight.zero_()
+            last_linear.bias.fill_(0.5)
+
     means = torch.zeros(2, 3)
     scales = torch.zeros(2, 3)
     rotations = torch.tensor([[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32)
@@ -1103,6 +1109,15 @@ def test_motion_decomposition_global_only_masks_non_global_mixes():
     assert torch.allclose(outputs["local_motion"], torch.zeros_like(outputs["local_motion"]), atol=1e-6)
     assert torch.allclose(outputs["cut_graph_motion"], torch.zeros_like(outputs["cut_graph_motion"]), atol=1e-6)
     assert torch.allclose(outputs["d_mu"], outputs["global_motion"], atol=1e-6)
+    assert torch.allclose(outputs["d_rot"], torch.zeros_like(outputs["d_rot"]), atol=1e-6)
+    assert torch.allclose(outputs["d_scale"], torch.zeros_like(outputs["d_scale"]), atol=1e-6)
+    assert torch.allclose(outputs["d_opacity_logit"], torch.zeros_like(outputs["d_opacity_logit"]), atol=1e-6)
+    assert torch.allclose(outputs["scales"], scales, atol=1e-6)
+    assert torch.allclose(outputs["rotations"], rotations, atol=1e-6)
+    assert torch.allclose(outputs["opacity_logits"], opacity, atol=1e-6)
+    assert torch.allclose(outputs["geo_expert_scales"][:, 0], scales, atol=1e-6)
+    assert torch.allclose(outputs["geo_expert_rotations"][:, 0], rotations, atol=1e-6)
+    assert torch.allclose(outputs["geo_expert_opacity_logits"][:, 0], opacity, atol=1e-6)
 
 
 def test_cams_cut_graph_route_changes_rendered_geometry():

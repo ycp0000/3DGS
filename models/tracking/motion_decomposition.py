@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Optional
 
 import torch
 import torch.nn as nn
@@ -109,8 +109,15 @@ class MotionDecomposition(nn.Module):
         cut_gate_values = gating_state["cut_gate_values"]
         return torch.cat((time_features, xyz_norm, scaffold_weights, cut_gate_values), dim=-1)
 
-    def _apply_quaternion_delta(self, rotations: torch.Tensor, d_rot: torch.Tensor) -> torch.Tensor:
+    def _apply_quaternion_delta(
+        self,
+        rotations: torch.Tensor,
+        d_rot: torch.Tensor,
+        delta_gate: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         delta_xyz = torch.tanh(d_rot) * self.max_rot_delta * 0.5
+        if delta_gate is not None:
+            delta_xyz = delta_xyz * delta_gate
         delta_w = torch.sqrt(torch.clamp(1.0 - (delta_xyz ** 2).sum(dim=-1, keepdim=True), min=1e-8))
         delta_quat = torch.cat((delta_w, delta_xyz), dim=-1)
         rw, rx, ry, rz = rotations.unbind(dim=-1)
@@ -165,6 +172,7 @@ class MotionDecomposition(nn.Module):
         global_mix = mixes[:, 0:1]
         local_mix = mixes[:, 1:2]
         cut_graph_mix = mixes[:, 2:3]
+        local_refine_mix = (local_mix + cut_graph_mix).clamp(0.0, 1.0)
 
         blended_global = global_delta * global_mix
         blended_local = local_delta * local_mix
@@ -177,26 +185,35 @@ class MotionDecomposition(nn.Module):
         cut_graph_motion_norm = blended_cut_graph.norm(dim=-1, keepdim=True)
 
         raw_d_rot = self.rotation_head(local_features)
-        d_rot = torch.tanh(raw_d_rot) * self.max_rot_delta
         if self.enable_rotation:
-            rotations_out = self._apply_quaternion_delta(rotations, raw_d_rot)
+            raw_rot_delta = torch.tanh(raw_d_rot) * self.max_rot_delta
+            d_rot = raw_rot_delta * local_refine_mix
+            rotations_out = self._apply_quaternion_delta(rotations, raw_d_rot, local_refine_mix)
+            local_rotations_out = self._apply_quaternion_delta(rotations, raw_d_rot)
         else:
             d_rot = torch.zeros((means3d.shape[0], 3), device=means3d.device, dtype=means3d.dtype)
             rotations_out = rotations
+            local_rotations_out = rotations
 
         if self.enable_scale:
-            d_scale = torch.tanh(self.scale_head(local_features)) * self.max_scale_delta
+            raw_d_scale = torch.tanh(self.scale_head(local_features)) * self.max_scale_delta
+            d_scale = raw_d_scale * local_refine_mix
             scales_out = scales + d_scale
+            local_scales_out = scales + raw_d_scale
         else:
             d_scale = torch.zeros_like(scales)
             scales_out = scales
+            local_scales_out = scales
 
         if self.enable_opacity:
-            d_opacity_logit = torch.tanh(self.opacity_head(local_features)) * self.max_opacity_delta
+            raw_d_opacity_logit = torch.tanh(self.opacity_head(local_features)) * self.max_opacity_delta
+            d_opacity_logit = raw_d_opacity_logit * local_refine_mix
             opacity_out = opacity_logits + d_opacity_logit
+            local_opacity_out = opacity_logits + raw_d_opacity_logit
         else:
             d_opacity_logit = torch.zeros_like(opacity_logits)
             opacity_out = opacity_logits
+            local_opacity_out = opacity_logits
 
         geo_expert_means3d = torch.stack(
             (
@@ -206,9 +223,9 @@ class MotionDecomposition(nn.Module):
             ),
             dim=1,
         )
-        geo_expert_scales = scales_out.unsqueeze(1).expand(-1, 3, -1)
-        geo_expert_rotations = rotations_out.unsqueeze(1).expand(-1, 3, -1)
-        geo_expert_opacity_logits = opacity_out.unsqueeze(1).expand(-1, 3, -1)
+        geo_expert_scales = torch.stack((scales, local_scales_out, local_scales_out), dim=1)
+        geo_expert_rotations = torch.stack((rotations, local_rotations_out, local_rotations_out), dim=1)
+        geo_expert_opacity_logits = torch.stack((opacity_logits, local_opacity_out, local_opacity_out), dim=1)
 
         return {
             "means3d": means3d + d_mu,
