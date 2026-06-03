@@ -184,6 +184,22 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         vis_expert_rgb_delta = deformation_aux.get("vis_expert_rgb_delta")
         vis_expert_visibility_alpha = deformation_aux.get("vis_expert_visibility_alpha")
         lifecycle_expert_alpha = deformation_aux.get("lifecycle_expert_alpha")
+        active_expert_prior = gaussian_pi_geo_prior[deformation_point].amax(dim=0) > 1e-8
+        weight_raster_settings = GaussianRasterizationSettings(
+            image_height=H,
+            image_width=W,
+            tanfovx=tanfovx,
+            tanfovy=tanfovy,
+            bg=torch.zeros_like(bg_color),
+            scale_modifier=scaling_modifier,
+            viewmatrix=viewpoint_camera.world_view_transform.to(device),
+            projmatrix=viewpoint_camera.full_proj_transform.to(device),
+            sh_degree=pc.active_sh_degree,
+            campos=viewpoint_camera.camera_center.to(device),
+            prefiltered=False,
+            debug=pipe.debug
+        )
+        weight_rasterizer = GaussianRasterizer(raster_settings=weight_raster_settings)
 
         if colors_precomp is None and shs is None:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
@@ -256,7 +272,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
             weight_map = torch.zeros((means3D.shape[0],), device=means3D.device, dtype=expert_render.dtype)
             weight_map[deformation_point] = gaussian_pi_geo_prior[deformation_point, expert_idx]
-            weight_render, _, _ = rasterizer(
+            weight_render, _, _ = weight_rasterizer(
                 means3D=expert_means3D,
                 means2D=means2D,
                 shs=None,
@@ -270,7 +286,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             expert_renders.append(expert_render)
             expert_depths.append(expert_depth)
             expert_radii_list.append(expert_radii)
-            pi_geo_weight_logits.append(weight_render.mean(dim=0))
+            weight_signal = weight_render.mean(dim=0)
+            if not bool(active_expert_prior[expert_idx].item()):
+                weight_signal = torch.zeros_like(weight_signal)
+            pi_geo_weight_logits.append(weight_signal)
 
         expert_renders_stacked = torch.stack(expert_renders, dim=0)
         expert_depths_stacked = torch.stack(expert_depths, dim=0)
@@ -315,4 +334,3 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             "visibility_filter" : radii > 0,
             "radii": radii,
             "deformation_aux": deformation_aux if stage != "coarse" and deformation_point.any() else {},}
-
