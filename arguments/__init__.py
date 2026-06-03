@@ -116,6 +116,7 @@ class ModelHiddenParams(ParamGroup):
 
         self.use_soft_routing = True
         self.use_topk = False
+        self.use_pixel_routing = False
         self.topk = 2
         self.topk_geo = 2
         self.topk_vis = 1

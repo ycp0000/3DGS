@@ -1708,6 +1708,74 @@ def test_renderer_applies_appearance_delta_and_opacity_gate_to_rasterizer_inputs
     assert torch.allclose(outputs["deformation_aux"]["appearance_rgb_delta"], torch.tensor([[0.3, -0.1, 0.2]]))
 
 
+def test_renderer_defaults_to_gaussian_moe_blend_when_pixel_routing_disabled(monkeypatch):
+    class _FakeRasterizer:
+        calls = []
+
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            type(self).calls.append(kwargs)
+            count = kwargs["means3D"].shape[0]
+            return torch.zeros(3, 1, 1), torch.ones(count), torch.zeros(1, 1)
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+
+    class _FakeDeformation:
+        deformation_net = SimpleNamespace(args=SimpleNamespace(use_pixel_routing=False))
+
+        def __call__(self, means3d, scales, rotations, opacity, time):
+            return means3d + 1.0, scales + 2.0, rotations + 3.0, opacity + 4.0
+
+        def get_aux_outputs(self):
+            return {
+                "geo_expert_means3d": torch.tensor([[[10.0, 0.0, 0.0], [20.0, 0.0, 0.0]]]),
+                "geo_expert_scales": torch.tensor([[[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]]),
+                "geo_expert_rotations": torch.tensor([[[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]]),
+                "geo_expert_opacity_logits": torch.tensor([[[1.0], [1.0]]]),
+                "gaussian_pi_geo_prior": torch.tensor([[0.5, 0.5]]),
+            }
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.get_xyz = torch.tensor([[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]])
+            self._opacity = torch.tensor([[0.1], [0.2]])
+            self._scaling = torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]])
+            self._rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.8, 0.1, 0.2, 0.3]])
+            self._deformation_table = torch.tensor([True, False])
+            self._deformation_accum = torch.zeros(2, 3)
+            self._deformation = _FakeDeformation()
+            self.active_sh_degree = 0
+            self.max_sh_degree = 0
+            self.scaling_activation = lambda value: value
+            self.rotation_activation = lambda value: value
+            self.opacity_activation = lambda value: value
+            self.get_features = torch.zeros(2, 1, 3)
+
+    point_cloud = _FakePointCloud()
+    camera = SimpleNamespace(
+        FoVx=0.5,
+        FoVy=0.5,
+        image_height=1,
+        image_width=1,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+        time=0.25,
+    )
+    pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
+
+    outputs = renderer.render(camera, point_cloud, pipe, torch.zeros(3), override_color=torch.zeros(2, 3), stage="fine")
+
+    assert len(_FakeRasterizer.calls) == 1
+    assert torch.allclose(
+        _FakeRasterizer.calls[0]["means3D"],
+        torch.tensor([[1.0, 1.0, 1.0], [2.0, 2.0, 2.0]]),
+    )
+    assert "pixel_routing_weights" not in outputs["deformation_aux"]
+
+
 def test_renderer_pixel_routing_preserves_expert_appearance_and_opacity_controls(monkeypatch):
     class _FakeRasterizer:
         calls = []

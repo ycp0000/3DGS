@@ -23,6 +23,19 @@ from scene.gaussian_model import GaussianModel
 from utils.device_utils import get_device
 from utils.sh_utils import eval_sh
 
+def _use_pixel_routing(pc: GaussianModel, pipe) -> bool:
+    pipe_value = getattr(pipe, "use_pixel_routing", None)
+    if pipe_value is not None:
+        return bool(pipe_value)
+
+    deformation_wrapper = getattr(pc, "_deformation", None)
+    deformation_net = getattr(deformation_wrapper, "deformation_net", None)
+    deformation_args = getattr(deformation_net, "args", None)
+    if deformation_args is not None and hasattr(deformation_args, "use_pixel_routing"):
+        return bool(getattr(deformation_args, "use_pixel_routing"))
+
+    return True
+
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine"):
     """
     Render the scene.
@@ -172,7 +185,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         colors_precomp[deformation_point] = torch.clamp(colors_precomp[deformation_point] + appearance_rgb_delta, 0.0, 1.0)
 
     geo_expert_means3d = deformation_aux.get("geo_expert_means3d") if stage != "coarse" else None
-    use_pixel_routing = geo_expert_means3d is not None and deformation_point.any()
+    use_pixel_routing = (
+        geo_expert_means3d is not None
+        and deformation_point.any()
+        and _use_pixel_routing(pc, pipe)
+    )
 
     if use_pixel_routing:
         num_experts = geo_expert_means3d.shape[1]
