@@ -248,6 +248,7 @@ class GaussianModel:
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
+        self.lr_schedule_max_steps = max(int(training_args.position_lr_max_steps), 1)
 
         param_groups = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz", "schedule": "xyz", "phase_lr_scale": 1.0},
@@ -286,13 +287,19 @@ class GaussianModel:
         for param_group in self.optimizer.param_groups:
             schedule = param_group.get("schedule", "none")
             base_lr = param_group["lr"]
+            schedule_iteration = iteration
+
+            if phase is not None and schedule in {"grid", "deformation"}:
+                local_progress = phase.schedule_progress_for_group(param_group["name"])
+                if local_progress is not None:
+                    schedule_iteration = local_progress * self.lr_schedule_max_steps
 
             if schedule == "xyz":
                 base_lr = self.xyz_scheduler_args(iteration)
             elif schedule == "grid":
-                base_lr = self.grid_scheduler_args(iteration)
+                base_lr = self.grid_scheduler_args(schedule_iteration)
             elif schedule == "deformation":
-                base_lr = self.deformation_scheduler_args(iteration)
+                base_lr = self.deformation_scheduler_args(schedule_iteration)
 
             phase_scale = 1.0
             if phase is not None:

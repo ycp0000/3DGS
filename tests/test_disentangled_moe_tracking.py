@@ -6,6 +6,7 @@ from types import MethodType, ModuleType, SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -16,14 +17,22 @@ from models.tracking import (
     CAMSGSTracking,
     EndoMoEGaussianScheduler,
     DisentangledMoETracking,
+    GlobalSmoothExpert,
     HeterogeneousMoEScheduler,
+    PixelSpaceRouter,
+    TissueLocalExpert,
+    ToolContactExpert,
     TrackingPhase,
     shape_debug_check,
 )
 from models.tracking.cut_graph_gating import CutGraphGating
+from models.tracking.cams_gs_moe_tracking import required_endomoeg_components
 from models.tracking.motion_decomposition import MotionDecomposition
 
 from utils.device_utils import _CPUEventStub, get_device, get_device_str, safe_cuda_event
+from utils.eval_utils import select_fixed_views
+from utils.optimizer_utils import collect_optimizer_group_metrics
+from utils.temporal_utils import nearest_adjacent_time, sorted_unique_times
 
 _TRACKING_LOSSES_SPEC = importlib.util.spec_from_file_location(
     "tracking_losses_module",
@@ -79,6 +88,84 @@ def test_device_utils_force_cpu_overrides_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     assert get_device(force_cpu=True).type == "cpu"
     assert get_device_str(force_cpu=True) == "cpu"
+
+
+def test_nearest_adjacent_time_uses_real_dataset_timestamps():
+    times = sorted_unique_times((0.0, 0.1, 0.1, 0.35, 1.0))
+    assert times == (0.0, 0.1, 0.35, 1.0)
+    assert nearest_adjacent_time(0.0, times) == pytest.approx(0.1)
+    assert nearest_adjacent_time(0.1, times) == pytest.approx(0.0)
+    assert nearest_adjacent_time(0.35, times) == pytest.approx(0.1)
+    assert nearest_adjacent_time(1.0, times) == pytest.approx(0.35)
+    assert nearest_adjacent_time(0.0, (0.0,)) is None
+
+
+def test_select_fixed_views_is_deterministic_and_spans_sequence():
+    cameras = tuple(range(10))
+    assert select_fixed_views(cameras, count=4) == (0, 3, 6, 9)
+    assert select_fixed_views(cameras[:3], count=4) == (0, 1, 2)
+    assert select_fixed_views((), count=4) == ()
+
+
+def test_optimizer_group_metrics_report_lr_norm_and_gradient_coverage():
+    active = nn.Parameter(torch.tensor([3.0, 4.0]))
+    inactive = nn.Parameter(torch.tensor([1.0, 2.0, 3.0]))
+    active.grad = torch.tensor([3.0, 4.0])
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {
+                "name": "tracking_expert_local",
+                "lr": 1e-4,
+                "params": [active, inactive],
+            }
+        ]
+    )
+
+    metrics = collect_optimizer_group_metrics(optimizer)
+
+    assert metrics["lr_group_tracking_expert_local"].item() == pytest.approx(1e-4)
+    assert metrics["grad_norm_group_tracking_expert_local"].item() == pytest.approx(5.0)
+    assert metrics["grad_coverage_group_tracking_expert_local"].item() == pytest.approx(2.0 / 5.0)
+
+
+def test_deform_network_forwards_camera_conditioning():
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs_moe"
+    network = deform_network(args)
+    captured = {}
+
+    def _capture_forward(
+        self,
+        points,
+        scales,
+        rotations,
+        opacity,
+        times,
+        time_features=None,
+        camera=None,
+    ):
+        captured["camera"] = camera
+        captured["time_features"] = time_features
+        return points, scales, rotations, opacity
+
+    network.deformation_net.forward = MethodType(
+        _capture_forward,
+        network.deformation_net,
+    )
+    camera = SimpleNamespace(name="camera-conditioning-sentinel")
+    points = torch.randn(3, 3)
+    times = torch.rand(3, 1)
+    network(
+        points,
+        torch.zeros(3, 3),
+        torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(3, 1),
+        torch.zeros(3, 1),
+        times,
+        camera=camera,
+    )
+
+    assert captured["camera"] is camera
+    assert captured["time_features"].shape == (3, args.timenet_output)
 
 
 def test_safe_cuda_event_returns_cpu_stub_when_cuda_unavailable(monkeypatch):
@@ -510,7 +597,8 @@ def test_deformation_accepts_tracking_type_cams_gs_moe():
     assert model.tracking_mode == "cams_gs_moe"
     assert model.scheduler is not None
     assert model.cams_moe_head is not None
-    assert model.get_tracking_arch_version() == "endomoeg_v1"
+    assert model.use_backbone
+    assert model.get_tracking_arch_version() == "endomoeg_v4"
 
 
 def test_endomoeg_scheduler_builds_expert_router_and_joint_phases():
@@ -532,11 +620,76 @@ def test_endomoeg_scheduler_builds_expert_router_and_joint_phases():
     assert full_phase.name == "moe_expert_full"
     assert router_phase.name == "moe_router_only"
     assert joint_phase.name == "moe_joint_finetune"
-    assert global_phase.is_group_trainable("tracking_time_encoder")
-    assert local_phase.is_group_trainable("tracking_time_encoder")
-    assert full_phase.is_group_trainable("tracking_time_encoder")
-    assert not router_phase.is_group_trainable("tracking_time_encoder")
+    assert not global_phase.is_group_trainable("tracking_time_encoder")
+    assert not local_phase.is_group_trainable("tracking_time_encoder")
+    assert not full_phase.is_group_trainable("tracking_time_encoder")
+    assert router_phase.is_group_trainable("tracking_time_encoder")
     assert joint_phase.is_group_trainable("tracking_time_encoder")
+    assert global_phase.schedule_progress_for_group("tracking_expert_global_tracking_motion_global") == pytest.approx(0.1)
+    assert local_phase.schedule_progress_for_group("tracking_expert_local_tracking_motion_local") == pytest.approx(0.0)
+    assert full_phase.schedule_progress_for_group("tracking_expert_full_tracking_visibility") == pytest.approx(0.0)
+    assert router_phase.schedule_progress_for_group("tracking_moe_router") == pytest.approx(0.0)
+    assert joint_phase.schedule_progress_for_group("tracking_expert_global_tracking_motion_global") == pytest.approx(0.0)
+    assert joint_phase.lr_scale_for_group("tracking_time_encoder") == pytest.approx(0.1)
+
+
+def test_endomoeg_default_stage_boundaries_do_not_stretch_with_total_iterations():
+    args = _build_deformation_args()
+    args.endomoeg_expert_global_end = -1
+    args.endomoeg_expert_local_end = -1
+    args.endomoeg_expert_full_end = -1
+    args.endomoeg_router_only_end = -1
+    scheduler = EndoMoEGaussianScheduler(args)
+
+    assert scheduler.build(1999, 15000).name == "moe_expert_global"
+    assert scheduler.build(2000, 15000).name == "moe_expert_local"
+    assert scheduler.build(4500, 15000).name == "moe_expert_full"
+    assert scheduler.build(7500, 15000).name == "moe_router_only"
+    assert scheduler.build(11000, 15000).name == "moe_joint_finetune"
+    assert scheduler.build(2000, 30000).name == "moe_expert_local"
+
+
+def test_gaussian_model_uses_group_local_schedule_progress():
+    model = object.__new__(GaussianModel)
+    model.lr_schedule_max_steps = 100
+    model.deformation_scheduler_args = lambda step: 1.0 - 0.009 * step
+    model.grid_scheduler_args = lambda step: 2.0 - 0.018 * step
+    model.xyz_scheduler_args = lambda step: 3.0
+    model.optimizer = SimpleNamespace(
+        param_groups=[
+            {
+                "params": [],
+                "lr": 0.0,
+                "name": "tracking_expert_local_tracking_motion_local",
+                "schedule": "deformation",
+            },
+            {
+                "params": [],
+                "lr": 0.0,
+                "name": "tracking_moe_router",
+                "schedule": "deformation",
+            },
+        ]
+    )
+    phase = TrackingPhase(
+        name="moe_expert_local",
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+        trainable_group_prefixes=("tracking_expert_local",),
+        group_schedule_progress={"tracking_expert_local": 0.25},
+    )
+
+    model.update_learning_rate(iteration=5000, phase=phase)
+
+    assert model.optimizer.param_groups[0]["lr"] == pytest.approx(0.775)
+    assert model.optimizer.param_groups[1]["lr"] == 0.0
 
 
 def test_cams_gs_moe_emits_independent_expert_proposals_and_router_weights():
@@ -582,6 +735,535 @@ def test_cams_gs_moe_emits_independent_expert_proposals_and_router_weights():
     assert aux["geo_expert_opacity_logits"].shape == (5, 3, 1)
     assert torch.allclose(aux["pi_geo"].sum(dim=-1), torch.ones(5), atol=1e-6)
     assert aux["vis_expert_rgb_delta"].shape == (5, 3, 3)
+
+
+def test_endomoeg_router_schedule_warms_up_dense_then_uses_soft_top2():
+    args = _build_deformation_args()
+    args.endomoeg_expert_global_end = 2000
+    args.endomoeg_expert_local_end = 5000
+    args.endomoeg_expert_full_end = 8000
+    args.endomoeg_router_only_end = 12000
+    args.endomoeg_router_sparse_start = 0.25
+    scheduler = EndoMoEGaussianScheduler(args)
+
+    dense_phase = scheduler.build(8999, 15000)
+    sparse_phase = scheduler.build(9000, 15000)
+    late_router_phase = scheduler.build(11000, 15000)
+    joint_phase = scheduler.build(12000, 15000)
+
+    assert dense_phase.name == "moe_router_only"
+    assert dense_phase.use_sparse_geo is False
+    assert dense_phase.topk_geo == 2
+    assert sparse_phase.use_sparse_geo is True
+    assert sparse_phase.topk_geo == 2
+    assert dense_phase.temperature_geo > sparse_phase.temperature_geo
+    assert dense_phase.route_confidence_scale == 0.0
+    assert late_router_phase.route_confidence_scale > 0.0
+    assert late_router_phase.route_balance_scale < dense_phase.route_balance_scale
+    assert joint_phase.name == "moe_joint_finetune"
+    assert joint_phase.use_sparse_geo is True
+    assert joint_phase.topk_geo == 2
+    assert joint_phase.temperature_geo == pytest.approx(args.temperature_geo_final)
+    assert joint_phase.route_balance_scale == pytest.approx(0.05)
+    assert joint_phase.route_confidence_scale == 1.0
+
+
+def test_endomoeg_gaussian_router_soft_top2_is_normalized_and_sparse():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_router_only",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=True,
+        use_sparse_vis=False,
+        topk_geo=2,
+        topk_vis=1,
+    )
+    count = 7
+    _, _, _, _, aux = model(
+        means3d=torch.randn(count, 3),
+        scales=torch.randn(count, 3),
+        rotations=F.normalize(torch.randn(count, 4), dim=-1),
+        opacity_logits=torch.randn(count, 1),
+        time_values=torch.rand(count, 1),
+        time_features=torch.randn(count, 8),
+        scene_scale=torch.tensor(2.0),
+        phase=phase,
+    )
+
+    assert torch.allclose(aux["pi_geo"].sum(dim=-1), torch.ones(count), atol=1e-6)
+    assert torch.equal((aux["pi_geo"] == 0).sum(dim=-1), torch.ones(count, dtype=torch.long))
+    assert torch.all(aux["gaussian_pi_geo_dense"] > 0)
+    assert aux["router_sparse_active"].item() == 1.0
+    assert aux["router_topk_geo"].item() == 2.0
+
+
+def test_endomoeg_gaussian_router_motion_features_are_scene_scale_invariant():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_router_only",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=2,
+        topk_vis=1,
+    )
+    canonical = torch.randn(6, 3)
+    shared_motion = torch.randn(6, 3) * 0.1
+    expert_motion = torch.randn(6, 3, 3) * 0.1
+    opacity = torch.randn(6, 1)
+    time_features = torch.randn(6, 8)
+
+    reference = model.router(
+        canonical,
+        shared_motion,
+        opacity,
+        time_features,
+        expert_motion,
+        torch.tensor(1.0),
+        phase,
+    )
+    scaled = model.router(
+        canonical,
+        shared_motion * 10.0,
+        opacity,
+        time_features,
+        expert_motion * 10.0,
+        torch.tensor(10.0),
+        phase,
+    )
+
+    assert torch.allclose(reference[0], scaled[0], atol=1e-6)
+    assert torch.allclose(reference[2], scaled[2], atol=1e-6)
+
+
+def test_endomoeg_total_motion_includes_shared_base_deformation():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_router_only",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=2,
+        topk_vis=1,
+    )
+    canonical = torch.zeros(4, 3)
+    shared_base = canonical + torch.tensor([0.2, 0.0, 0.0])
+    _, _, _, _, aux = model(
+        means3d=shared_base,
+        canonical_means3d=canonical,
+        scales=torch.zeros(4, 3),
+        rotations=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(4, 1),
+        opacity_logits=torch.zeros(4, 1),
+        time_values=torch.rand(4, 1),
+        time_features=torch.randn(4, 8),
+        scene_scale=torch.tensor(1.0),
+        phase=phase,
+    )
+
+    assert torch.allclose(aux["shared_base_d_mu"], shared_base - canonical, atol=1e-6)
+    assert torch.allclose(aux["d_mu_residual"], torch.zeros_like(shared_base), atol=1e-6)
+    assert torch.allclose(aux["d_mu"], shared_base - canonical, atol=1e-6)
+
+
+def test_endomoeg_expert_opacity_declares_embedded_visibility_controls():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_joint_finetune",
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=True,
+        use_sparse_vis=False,
+        topk_geo=2,
+        topk_vis=1,
+    )
+    _, _, _, _, aux = model(
+        means3d=torch.randn(4, 3),
+        scales=torch.randn(4, 3),
+        rotations=F.normalize(torch.randn(4, 4), dim=-1),
+        opacity_logits=torch.randn(4, 1),
+        time_values=torch.rand(4, 1),
+        time_features=torch.randn(4, 8),
+        scene_scale=torch.tensor(1.0),
+        phase=phase,
+    )
+
+    assert aux["expert_opacity_includes_visibility"] is True
+
+
+def test_tool_contact_transient_appearance_does_not_force_invisibility():
+    expert = ToolContactExpert(time_feature_dim=8)
+    with torch.no_grad():
+        expert.visibility_head.bias.fill_(12.0)
+        expert.transient_head.bias.fill_(12.0)
+        expert.appearance_head.bias.fill_(1.0)
+
+    opacity = torch.zeros(3, 1)
+    output = expert(
+        means3d=torch.randn(3, 3),
+        scales=torch.zeros(3, 3),
+        rotations=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(3, 1),
+        opacity_logits=opacity,
+        time_values=torch.rand(3, 1),
+        scene_scale=torch.tensor(1.0),
+    )
+
+    assert torch.all(output["visibility_alpha"] > 0.99)
+    assert torch.all(output["transient_probability"] > 0.99)
+    assert torch.allclose(output["pi_vis"].sum(dim=-1), torch.ones(3), atol=1e-6)
+    assert torch.all(output["pi_vis"][:, 1] > 0.99)
+    assert torch.count_nonzero(output["appearance_rgb_delta"]).item() > 0
+    assert torch.allclose(output["opacity_logits"], opacity, atol=1e-4)
+
+
+def test_tool_contact_visibility_can_suppress_opacity_independently():
+    expert = ToolContactExpert(time_feature_dim=8)
+    with torch.no_grad():
+        expert.visibility_head.bias.fill_(-12.0)
+        expert.transient_head.bias.fill_(-12.0)
+
+    output = expert(
+        means3d=torch.randn(3, 3),
+        scales=torch.zeros(3, 3),
+        rotations=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(3, 1),
+        opacity_logits=torch.zeros(3, 1),
+        time_values=torch.rand(3, 1),
+        scene_scale=torch.tensor(1.0),
+    )
+
+    assert torch.all(output["visibility_alpha"] < 1e-4)
+    assert torch.all(output["transient_probability"] < 1e-4)
+    assert torch.allclose(output["pi_vis"].sum(dim=-1), torch.ones(3), atol=1e-6)
+    assert torch.all(output["pi_vis"][:, 0] > 0.99)
+    assert torch.all(torch.sigmoid(output["opacity_logits"]) < 1e-3)
+
+
+def test_endomoeg_pixel_router_initializes_to_gaussian_prior():
+    router = PixelSpaceRouter(hidden_dim=8)
+    expert_rgb = torch.rand(3, 3, 4, 5)
+    expert_depth = torch.rand(3, 4, 5) + 0.5
+    gaussian_prior = torch.rand(3, 4, 5)
+    projected_motion = torch.rand(3, 4, 5)
+    coverage = torch.ones(3, 4, 5, dtype=torch.bool)
+    fallback = torch.tensor([0.4, 0.35, 0.25]).view(3, 1, 1)
+
+    weights, residual_logits = router(
+        expert_rgb,
+        expert_depth,
+        gaussian_prior,
+        projected_motion,
+        coverage,
+        fallback,
+    )
+    expected = gaussian_prior / gaussian_prior.sum(dim=0, keepdim=True)
+
+    assert torch.allclose(residual_logits, torch.zeros_like(residual_logits), atol=1e-7)
+    assert torch.allclose(weights, expected, atol=1e-6)
+
+
+def test_endomoeg_pixel_router_fallback_is_finite_and_normalized():
+    router = PixelSpaceRouter(hidden_dim=8)
+    fallback = torch.tensor([0.5, 0.3, 0.2]).view(3, 1, 1)
+    weights, _ = router(
+        expert_rgb=torch.rand(3, 3, 2, 2),
+        expert_depth=torch.rand(3, 2, 2),
+        gaussian_prior=torch.zeros(3, 2, 2),
+        projected_motion=torch.zeros(3, 2, 2),
+        coverage=torch.zeros(3, 2, 2, dtype=torch.bool),
+        fallback_prior=fallback,
+    )
+
+    assert torch.isfinite(weights).all()
+    assert torch.allclose(weights.sum(dim=0), torch.ones(2, 2), atol=1e-6)
+    assert torch.allclose(weights, fallback.expand_as(weights), atol=1e-6)
+
+
+def test_endomoeg_pixel_router_receives_photometric_gradient():
+    router = PixelSpaceRouter(hidden_dim=8)
+    expert_rgb = torch.rand(3, 3, 3, 3)
+    weights, _ = router(
+        expert_rgb=expert_rgb,
+        expert_depth=torch.rand(3, 3, 3) + 0.5,
+        gaussian_prior=torch.full((3, 3, 3), 1.0 / 3.0),
+        projected_motion=torch.rand(3, 3, 3),
+        coverage=torch.ones(3, 3, 3, dtype=torch.bool),
+        fallback_prior=torch.full((3, 1, 1), 1.0 / 3.0),
+    )
+    rendered = (expert_rgb * weights.unsqueeze(1)).sum(dim=0)
+    rendered.square().mean().backward()
+
+    final_layer = [
+        module for module in router.score_network if isinstance(module, nn.Conv2d)
+    ][-1]
+    assert final_layer.weight.grad is not None
+    assert torch.count_nonzero(final_layer.weight.grad).item() > 0
+
+
+def test_endomoeg_router_regularization_uses_phase_scales():
+    args = _build_loss_args()
+    args.lambda_balance_geo = 2.0
+    args.lambda_route_conf_geo = 3.0
+    args.target_usage_geo_global = 0.35
+    args.target_usage_geo_local = 0.35
+    args.target_usage_geo_full = 0.30
+    aux = {
+        "pi_geo": torch.tensor([[0.5, 0.3, 0.2]]),
+        "pi_vis": torch.tensor([[1.0, 0.0]]),
+        "d_mu": torch.zeros(1, 3),
+        "route_max_prob_geo": torch.tensor([0.6]),
+        "route_margin_geo": torch.tensor([0.2]),
+        "route_balance_scale": torch.tensor(0.1),
+        "route_confidence_scale": torch.tensor(0.25),
+    }
+
+    losses = compute_tracking_losses(
+        aux=aux,
+        iteration=1,
+        args=args,
+        prev_d_mu=None,
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        geo_expert_names=("global", "local", "full"),
+        vis_expert_names=("stable", "transient"),
+    )
+
+    target = torch.tensor([0.35, 0.35, 0.30])
+    expected_balance = ((aux["pi_geo"][0] - target) ** 2).sum() * 2.0 * 0.1
+    expected_confidence = (1.0 - 0.6) * 3.0 * 0.25
+    assert torch.allclose(losses["L_balance_geo"], expected_balance, atol=1e-6)
+    assert torch.allclose(losses["L_route_conf_geo"], torch.tensor(expected_confidence), atol=1e-6)
+    assert losses["route_balance_scale"].item() == pytest.approx(0.1)
+    assert losses["route_confidence_scale"].item() == pytest.approx(0.25)
+
+
+def test_endomoeg_router_diagnostics_expose_dense_and_sparse_starvation():
+    args = _build_loss_args()
+    sparse_weights = torch.tensor(
+        [
+            [0.7, 0.3, 0.0],
+            [0.0, 0.6, 0.4],
+        ]
+    )
+    dense_weights = torch.tensor(
+        [
+            [0.6, 0.3, 0.1],
+            [0.2, 0.5, 0.3],
+        ]
+    )
+    losses = compute_tracking_losses(
+        aux={
+            "pi_geo": sparse_weights,
+            "gaussian_pi_geo_dense": dense_weights,
+            "pi_vis": torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+            "d_mu": torch.zeros(2, 3),
+        },
+        iteration=1,
+        args=args,
+        prev_d_mu=None,
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        geo_expert_names=("global", "local", "full"),
+        vis_expert_names=("stable", "transient"),
+    )
+
+    assert losses["dense_usage_geo_global"].item() == pytest.approx(0.4)
+    assert losses["dense_usage_geo_local"].item() == pytest.approx(0.4)
+    assert losses["dense_usage_geo_full"].item() == pytest.approx(0.2)
+    assert losses["route_coverage_geo_global"].item() == pytest.approx(0.5)
+    assert losses["route_coverage_geo_local"].item() == pytest.approx(1.0)
+    assert losses["route_coverage_geo_full"].item() == pytest.approx(0.5)
+    assert losses["route_zero_fraction_geo"].item() == pytest.approx(1.0 / 3.0)
+    expected_effective = torch.mean(
+        1.0 / sparse_weights.square().sum(dim=-1)
+    )
+    assert torch.allclose(losses["route_effective_experts_geo"], expected_effective)
+    assert losses["route_sparse_dense_l1_geo"].item() > 0.0
+
+
+def test_cams_gs_moe_uses_heterogeneous_identity_safe_experts():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+
+    assert isinstance(model.expert_global, GlobalSmoothExpert)
+    assert isinstance(model.expert_local, TissueLocalExpert)
+    assert isinstance(model.expert_full, ToolContactExpert)
+    parameter_sets = [
+        {id(parameter) for parameter in expert.parameters()}
+        for expert in (model.expert_global, model.expert_local, model.expert_full)
+    ]
+    assert not parameter_sets[0].intersection(parameter_sets[1])
+    assert not parameter_sets[0].intersection(parameter_sets[2])
+    assert not parameter_sets[1].intersection(parameter_sets[2])
+
+    means3d = torch.randn(5, 3)
+    scales = torch.randn(5, 3)
+    rotations = F.normalize(torch.randn(5, 4), dim=-1)
+    opacity = torch.randn(5, 1)
+    time_values = torch.rand(5, 1)
+    camera = SimpleNamespace(
+        camera_center=torch.zeros(3),
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+    )
+
+    for expert in (model.expert_global, model.expert_local, model.expert_full):
+        output = expert(
+            means3d=means3d,
+            scales=scales,
+            rotations=rotations,
+            opacity_logits=opacity,
+            time_values=time_values,
+            scene_scale=torch.tensor(1.0),
+            camera=camera,
+        )
+        assert torch.allclose(output["means3d"], means3d, atol=1e-6)
+        assert torch.allclose(output["scales"], scales, atol=1e-6)
+        assert torch.allclose(output["rotations"], rotations, atol=1e-6)
+        assert torch.allclose(output["opacity_logits"], opacity, atol=1e-4)
+        assert torch.allclose(output["appearance_rgb_delta"], torch.zeros_like(means3d), atol=1e-6)
+
+
+def test_cams_gs_moe_forced_local_route_only_backpropagates_to_local_expert():
+    model = CAMSGSMoETracking(time_feature_dim=8)
+    phase = TrackingPhase(
+        name="moe_expert_local",
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        temperature_geo=1.0,
+        temperature_vis=1.0,
+        use_sparse_geo=False,
+        use_sparse_vis=False,
+        topk_geo=1,
+        topk_vis=1,
+        force_geo_expert="local",
+    )
+    means3d = torch.randn(5, 3)
+    scales = torch.randn(5, 3)
+    rotations = F.normalize(torch.randn(5, 4), dim=-1)
+    opacity = torch.randn(5, 1)
+
+    output = model(
+        means3d=means3d,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=torch.rand(5, 1),
+        time_features=torch.randn(5, 8),
+        scene_scale=torch.tensor(1.0),
+        phase=phase,
+    )
+    target = means3d + 0.1
+    loss = (output[0] - target).square().mean()
+    loss.backward()
+
+    def _grad_total(module):
+        return sum(
+            float(parameter.grad.abs().sum())
+            for parameter in module.parameters()
+            if parameter.grad is not None
+        )
+
+    assert _grad_total(model.expert_local) > 0.0
+    assert _grad_total(model.expert_global) == 0.0
+    assert _grad_total(model.expert_full) == 0.0
+    assert _grad_total(model.router) == 0.0
+
+
+def test_endomoeg_component_checkpoints_round_trip_independently(tmp_path):
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs_moe"
+    source = deform_network(args)
+    restored = deform_network(args)
+
+    def _assert_nested_equal(expected, actual):
+        assert expected.keys() == actual.keys()
+        for key in expected:
+            expected_value = expected[key]
+            actual_value = actual[key]
+            if isinstance(expected_value, dict):
+                _assert_nested_equal(expected_value, actual_value)
+            elif torch.is_tensor(expected_value):
+                assert torch.equal(expected_value, actual_value)
+            else:
+                assert expected_value == actual_value
+
+    for component in ("shared_base", "global", "local", "full", "router"):
+        path = source.save_endomoeg_component(str(tmp_path), component)
+        restored.load_endomoeg_component(path)
+        expected = source.endomoeg_component_state_dict(component)
+        actual = restored.endomoeg_component_state_dict(component)
+        _assert_nested_equal(expected, actual)
+
+
+def test_endomoeg_component_checkpoint_rejects_wrong_architecture():
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs_moe"
+    network = deform_network(args)
+    payload = network.endomoeg_component_state_dict("local")
+    payload["tracking_arch_version"] = "obsolete_architecture"
+
+    with pytest.raises(ValueError, match="does not match"):
+        network.load_endomoeg_component_state_dict(payload)
+
+
+def test_endomoeg_component_directory_loading_supports_strict_and_partial_modes(tmp_path):
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs_moe"
+    source = deform_network(args)
+    restored = deform_network(args)
+    source.save_endomoeg_component(str(tmp_path), "shared_base")
+    source.save_endomoeg_component(str(tmp_path), "global")
+
+    loaded = restored.load_endomoeg_components(
+        str(tmp_path),
+        ("shared_base", "global", "local"),
+        strict=False,
+    )
+    assert loaded == ("shared_base", "global")
+
+    with pytest.raises(FileNotFoundError, match="local.pth"):
+        restored.load_endomoeg_components(
+            str(tmp_path),
+            ("shared_base", "local"),
+            strict=True,
+        )
+
+
+def test_endomoeg_stage_component_dependencies_are_explicit():
+    assert required_endomoeg_components("global") == ()
+    assert required_endomoeg_components("local") == ("shared_base",)
+    assert required_endomoeg_components("full") == ("shared_base",)
+    assert required_endomoeg_components("router") == (
+        "shared_base",
+        "global",
+        "local",
+        "full",
+    )
+    assert required_endomoeg_components("joint") == (
+        "shared_base",
+        "global",
+        "local",
+        "full",
+        "router",
+    )
+    with pytest.raises(ValueError, match="Unsupported EndoMoe stage"):
+        required_endomoeg_components("typo_stage")
 
 
 def test_cams_gs_moe_expert_stage_forces_single_expert_route():
@@ -1645,6 +2327,80 @@ def test_renderer_recomputes_covariance_after_cams_deformation(monkeypatch):
     )
 
 
+def test_validation_render_does_not_update_deformation_statistics(monkeypatch):
+    class _FakeRasterizer:
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            count = kwargs["means3D"].shape[0]
+            return torch.zeros(3, 1, 1), torch.ones(count), torch.zeros(1, 1)
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+
+    class _FakeDeformation:
+        def __call__(self, means3d, scales, rotations, opacity, time, camera=None):
+            return means3d + 1.0, scales, rotations, opacity
+
+        def get_aux_outputs(self):
+            return {}
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.get_xyz = torch.zeros(1, 3)
+            self._opacity = torch.zeros(1, 1)
+            self._scaling = torch.ones(1, 3)
+            self._rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+            self._deformation_table = torch.tensor([True])
+            self._deformation_accum = torch.zeros(1, 3)
+            self._deformation = _FakeDeformation()
+            self.active_sh_degree = 0
+            self.max_sh_degree = 0
+            self.scaling_activation = lambda value: value
+            self.rotation_activation = lambda value: value
+            self.opacity_activation = lambda value: value
+            self.get_features = torch.zeros(1, 1, 3)
+
+    point_cloud = _FakePointCloud()
+    camera = SimpleNamespace(
+        FoVx=0.5,
+        FoVy=0.5,
+        image_height=1,
+        image_width=1,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+        time=0.0,
+    )
+    pipe = SimpleNamespace(
+        compute_cov3D_python=False,
+        convert_SHs_python=False,
+        debug=False,
+    )
+
+    renderer.render(
+        camera,
+        point_cloud,
+        pipe,
+        torch.zeros(3),
+        override_color=torch.zeros(1, 3),
+        stage="fine",
+        update_deformation_stats=False,
+    )
+    assert torch.equal(point_cloud._deformation_accum, torch.zeros(1, 3))
+
+    renderer.render(
+        camera,
+        point_cloud,
+        pipe,
+        torch.zeros(3),
+        override_color=torch.zeros(1, 3),
+        stage="fine",
+        update_deformation_stats=True,
+    )
+    assert torch.equal(point_cloud._deformation_accum, torch.ones(1, 3))
+
+
 def test_renderer_applies_appearance_delta_and_opacity_gate_to_rasterizer_inputs(monkeypatch):
     class _FakeRasterizer:
         last_kwargs = None
@@ -1794,10 +2550,23 @@ def test_renderer_pixel_routing_preserves_expert_appearance_and_opacity_controls
             return render_value, torch.ones(count), torch.zeros(1, 1)
 
     renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+    route_call = {}
 
     class _FakeDeformation:
         def __call__(self, means3d, scales, rotations, opacity, time):
             return means3d + 1.0, scales + 2.0, rotations + 3.0, opacity + 4.0
+
+        def route_endomoeg_pixels(self, **kwargs):
+            route_call.update(kwargs)
+            prior = kwargs["gaussian_prior"].clamp_min(0.0)
+            prior_sum = prior.sum(dim=0, keepdim=True)
+            weights = prior / prior_sum.clamp_min(1e-8)
+            weights = torch.where(
+                (prior_sum > 1e-8).expand_as(weights),
+                weights,
+                kwargs["fallback_prior"].expand_as(weights),
+            )
+            return weights, torch.zeros_like(weights)
 
         def get_aux_outputs(self):
             return {
@@ -1858,6 +2627,94 @@ def test_renderer_pixel_routing_preserves_expert_appearance_and_opacity_controls
     assert torch.allclose(expert_render_calls[0]["opacities"], torch.tensor([[4.1]]))
     assert torch.allclose(expert_render_calls[1]["opacities"], torch.tensor([[0.0]]))
     assert outputs["deformation_aux"]["pixel_routing_weights"].shape == (2, 1, 1)
+    assert route_call["expert_rgb"].shape == (2, 3, 1, 1)
+    assert route_call["expert_depth"].shape == (2, 1, 1)
+    assert route_call["gaussian_prior"].shape == (2, 1, 1)
+    assert route_call["projected_motion"].shape == (2, 1, 1)
+    assert route_call["coverage"].shape == (2, 1, 1)
+    assert outputs["deformation_aux"]["pixel_router_residual_logits"].shape == (2, 1, 1)
+
+
+def test_renderer_does_not_apply_endomoeg_visibility_gate_twice(monkeypatch):
+    class _FakeRasterizer:
+        calls = []
+
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            type(self).calls.append(kwargs)
+            count = kwargs["means3D"].shape[0]
+            return torch.zeros(3, 1, 1), torch.ones(count), torch.ones(1, 1)
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+
+    class _FakeDeformation:
+        def __call__(self, means3d, scales, rotations, opacity, time):
+            return means3d, scales, rotations, opacity
+
+        def route_endomoeg_pixels(self, **kwargs):
+            return torch.ones(1, 1, 1), torch.zeros(1, 1, 1)
+
+        def get_aux_outputs(self):
+            return {
+                "geo_expert_means3d": torch.zeros(1, 1, 3),
+                "geo_expert_scales": torch.ones(1, 1, 3),
+                "geo_expert_rotations": torch.tensor([[[1.0, 0.0, 0.0, 0.0]]]),
+                "geo_expert_opacity_logits": torch.tensor([[[0.8]]]),
+                "gaussian_pi_geo_prior": torch.ones(1, 1),
+                "vis_expert_visibility_alpha": torch.tensor([[[0.25]]]),
+                "lifecycle_expert_alpha": torch.tensor([[[0.4]]]),
+                "expert_opacity_includes_visibility": True,
+            }
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.get_xyz = torch.zeros(1, 3)
+            self._opacity = torch.tensor([[0.8]])
+            self._scaling = torch.ones(1, 3)
+            self._rotation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+            self._deformation_table = torch.tensor([True])
+            self._deformation_accum = torch.zeros(1, 3)
+            self._deformation = _FakeDeformation()
+            self.active_sh_degree = 0
+            self.max_sh_degree = 0
+            self.scaling_activation = lambda value: value
+            self.rotation_activation = lambda value: value
+            self.opacity_activation = lambda value: value
+            self.get_features = torch.zeros(1, 1, 3)
+
+    renderer.render(
+        SimpleNamespace(
+            FoVx=0.5,
+            FoVy=0.5,
+            image_height=1,
+            image_width=1,
+            world_view_transform=torch.eye(4),
+            full_proj_transform=torch.eye(4),
+            camera_center=torch.zeros(3),
+            time=0.0,
+        ),
+        _FakePointCloud(),
+        SimpleNamespace(
+            compute_cov3D_python=False,
+            convert_SHs_python=False,
+            debug=False,
+            use_pixel_routing=True,
+        ),
+        torch.zeros(3),
+        override_color=torch.zeros(1, 3),
+        stage="fine",
+    )
+
+    expert_calls = [
+        call
+        for call in _FakeRasterizer.calls
+        if call.get("opacities") is not None
+        and call.get("colors_precomp") is not None
+        and call["colors_precomp"].shape == (1, 3)
+    ]
+    assert torch.allclose(expert_calls[0]["opacities"], torch.tensor([[0.8]]))
 
 
 def test_tracking_losses_use_covered_pixel_routing_weights_only():
@@ -1867,6 +2724,18 @@ def test_tracking_losses_use_covered_pixel_routing_weights_only():
             [
                 [[0.9, 0.0], [0.0, 0.0]],
                 [[0.1, 0.0], [0.0, 0.0]],
+            ]
+        ),
+        "pixel_expert_coverage": torch.tensor(
+            [
+                [[1.0, 0.0], [0.0, 0.0]],
+                [[1.0, 0.0], [0.0, 0.0]],
+            ]
+        ),
+        "pixel_router_residual_logits": torch.tensor(
+            [
+                [[0.2, 0.0], [0.0, 0.0]],
+                [[-0.1, 0.0], [0.0, 0.0]],
             ]
         ),
         "pi_vis": torch.tensor([[1.0, 0.0]]),
@@ -1887,6 +2756,11 @@ def test_tracking_losses_use_covered_pixel_routing_weights_only():
 
     assert torch.allclose(losses["usage_geo_global"], torch.tensor(0.9))
     assert torch.allclose(losses["usage_geo_local"], torch.tensor(0.1))
+    assert losses["pixel_route_covered_fraction"].item() == pytest.approx(0.25)
+    assert losses["pixel_coverage_geo_global"].item() == pytest.approx(0.25)
+    assert losses["pixel_coverage_geo_local"].item() == pytest.approx(0.25)
+    assert losses["pixel_route_entropy_geo"].item() > 0.0
+    assert losses["pixel_router_residual_abs_max"].item() == pytest.approx(0.2)
 
 
 def test_tracking_losses_balance_uses_gaussian_route_prior_when_pixel_usage_collapses():
@@ -2333,6 +3207,77 @@ def test_cams_gs_uses_identity_base_instead_of_original_backbone_deformation():
     assert torch.allclose(opacity_t, opacity)
 
 
+def test_cams_gs_moe_backbone_is_identity_initialized_and_used_as_shared_base():
+    args = _build_deformation_args()
+    args.tracking_type = "cams_gs_moe"
+    args.no_ds = True
+    args.no_do = True
+    args.no_dr = True
+    network = deform_network(args)
+    model = network.deformation_net
+
+    for head in (model.pos_deform, model.scales_deform, model.rotations_deform, model.opacity_deform):
+        linear_layers = [module for module in head.modules() if isinstance(module, nn.Linear)]
+        assert torch.count_nonzero(linear_layers[-1].weight) == 0
+        assert torch.count_nonzero(linear_layers[-1].bias) == 0
+
+    captured = {}
+
+    def _capture_shared_base(self, **kwargs):
+        captured["means3d"] = kwargs["means3d"].detach().clone()
+        return (
+            kwargs["means3d"],
+            kwargs["scales"],
+            kwargs["rotations"],
+            kwargs["opacity_logits"],
+            {
+                "d_mu": torch.zeros_like(kwargs["means3d"]),
+                "d_scale": torch.zeros_like(kwargs["scales"]),
+                "d_rot": torch.zeros_like(kwargs["means3d"]),
+                "d_opacity_logit": torch.zeros_like(kwargs["opacity_logits"]),
+            },
+        )
+
+    model.cams_moe_head.forward = MethodType(_capture_shared_base, model.cams_moe_head)
+    model.set_tracking_phase(
+        TrackingPhase(
+            name="moe_expert_global",
+            active_geo=1,
+            active_vis=1,
+            enable_visibility=False,
+            temperature_geo=1.0,
+            temperature_vis=1.0,
+            use_sparse_geo=False,
+            use_sparse_vis=False,
+            topk_geo=1,
+            topk_vis=1,
+            force_geo_expert="global",
+        )
+    )
+
+    points = torch.randn(4, 3)
+    scales = torch.randn(4, 3)
+    rotations = torch.randn(4, 4)
+    rotations[:, 0] = 1.0
+    opacity = torch.randn(4, 1)
+    times = torch.rand(4, 1)
+    time_features = network._encode_time(times)
+
+    model.forward_dynamic(points, scales, rotations, opacity, times, time_features)
+    assert torch.allclose(captured["means3d"], points, atol=1e-6)
+
+    with torch.no_grad():
+        final_layer = [module for module in model.pos_deform.modules() if isinstance(module, nn.Linear)][-1]
+        final_layer.bias.fill_(0.5)
+
+    model.forward_dynamic(points, scales, rotations, opacity, times, time_features)
+    assert not torch.allclose(captured["means3d"], points)
+
+    tracking_groups = model.get_tracking_parameter_groups()
+    assert "tracking_shared_base_deformation" in tracking_groups
+    assert "tracking_shared_base_grid" in tracking_groups
+
+
 def test_cams_lifecycle_class_semantics_match_balance_target():
     head = CAMSGSTracking(time_feature_dim=8).lifecycle
     phase = TrackingPhase(
@@ -2507,6 +3452,45 @@ def test_cams_patch_c_losses_are_phase_gated():
     assert "L_appearance_reg" not in losses
     assert "L_lifecycle_balance" not in losses
     assert "L_lifecycle_reg" not in losses
+
+
+def test_endomoeg_visibility_lifecycle_losses_preserve_identity_priors():
+    args = _build_loss_args()
+    args.lambda_appearance_reg = 1e-3
+    args.lambda_visibility_occlusion = 2e-3
+    args.lambda_transient_sparse = 3e-3
+    args.lambda_lifecycle_balance = 4e-3
+    args.lambda_lifecycle_reg = 5e-3
+    args.target_lifecycle_persistent = 0.98
+    aux = {
+        "pi_geo": torch.tensor([[0.0, 0.0, 1.0]]),
+        "pi_vis": torch.tensor([[0.9, 0.1]]),
+        "d_mu": torch.zeros(1, 3),
+        "appearance_offsets": torch.ones(1, 3) * 0.2,
+        "visibility_alpha": torch.tensor([[0.95]]),
+        "transient_probability": torch.tensor([[0.1]]),
+        "lifecycle_logits": torch.tensor([[12.0, -12.0]]),
+        "lifecycle_probs": torch.tensor([[0.99, 0.01]]),
+        "tracking_phase_name": "moe_joint_finetune",
+    }
+
+    losses = compute_tracking_losses(
+        aux=aux,
+        iteration=10,
+        args=args,
+        prev_d_mu=None,
+        active_geo=3,
+        active_vis=2,
+        enable_visibility=True,
+        geo_expert_names=("global", "local", "full"),
+        vis_expert_names=("stable", "transient"),
+    )
+
+    assert losses["L_visibility_occlusion"].item() == pytest.approx(0.05 * 2e-3)
+    assert losses["L_transient_sparse"].item() == pytest.approx(0.1 * 3e-3)
+    assert losses["L_lifecycle_balance"].item() == pytest.approx((0.99 - 0.98) ** 2 * 4e-3)
+    assert losses["L_lifecycle_reg"].item() == pytest.approx(0.01 * 5e-3)
+    assert "lifecycle_logit_energy" not in losses
 
 
 @pytest.mark.parametrize(
@@ -2692,3 +3676,65 @@ def test_tracking_losses_use_adjacent_time_sequence_not_prev_step_state():
     expected = torch.tensor((0.2 / 0.5) ** 2 / 3.0)
     assert torch.allclose(losses["L_geo_temp"], expected, atol=1e-6)
     assert torch.equal(losses["temporal_pair_count"], torch.tensor(1.0))
+
+
+def test_tracking_spatial_knn_regularization_is_robust_and_differentiable():
+    args = _build_loss_args()
+    args.lambda_geo_spatial = 2.0
+    args.geo_spatial_sample_size = 32
+    args.geo_spatial_k = 3
+    args.geo_spatial_chunk_size = 4
+    coordinates = torch.tensor(
+        [
+            [float(x), float(y), 0.0]
+            for y in range(3)
+            for x in range(4)
+        ]
+    )
+
+    coherent_motion = torch.full((12, 3), 0.2, requires_grad=True)
+    coherent_losses = compute_tracking_losses(
+        aux={
+            "pi_geo": torch.tensor([[1.0, 0.0, 0.0]]).repeat(12, 1),
+            "pi_vis": torch.tensor([[1.0, 0.0]]).repeat(12, 1),
+            "d_mu": coherent_motion,
+            "means3d_canonical": coordinates,
+            "scene_scale": torch.tensor(2.0),
+        },
+        iteration=10,
+        args=args,
+        prev_d_mu=None,
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        geo_expert_names=("global", "local", "full"),
+        vis_expert_names=("stable", "transient"),
+    )
+    assert coherent_losses["geo_spatial_roughness"].item() < 2e-4
+
+    outlier_motion = torch.full((12, 3), 0.2)
+    outlier_motion[5, 0] = 1.2
+    outlier_motion.requires_grad_()
+    outlier_losses = compute_tracking_losses(
+        aux={
+            "pi_geo": torch.tensor([[1.0, 0.0, 0.0]]).repeat(12, 1),
+            "pi_vis": torch.tensor([[1.0, 0.0]]).repeat(12, 1),
+            "d_mu": outlier_motion,
+            "means3d_canonical": coordinates,
+            "scene_scale": torch.tensor(2.0),
+        },
+        iteration=10,
+        args=args,
+        prev_d_mu=None,
+        active_geo=3,
+        active_vis=1,
+        enable_visibility=False,
+        geo_expert_names=("global", "local", "full"),
+        vis_expert_names=("stable", "transient"),
+    )
+    assert outlier_losses["geo_spatial_roughness"].item() > 0.01
+    assert outlier_losses["geo_spatial_sample_count"].item() == 12
+    assert outlier_losses["geo_spatial_neighbor_count"].item() == 3
+    outlier_losses["L_geo_spatial"].backward()
+    assert outlier_motion.grad is not None
+    assert torch.count_nonzero(outlier_motion.grad).item() > 0

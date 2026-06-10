@@ -22,6 +22,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.optimizer_utils import collect_optimizer_group_metrics
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams, ModelHiddenParams
 from torch.utils.data import DataLoader
@@ -34,8 +35,11 @@ try:
 except ImportError:
     external_lpips = None
 from utils.device_utils import get_device, safe_cuda_event
+from utils.eval_utils import select_fixed_views
 from utils.scene_utils import render_training_image
+from utils.temporal_utils import nearest_adjacent_time, sorted_unique_times
 from time import time
+from models.tracking.cams_gs_moe_tracking import required_endomoeg_components
 from scene.tracking_losses import compute_tracking_losses
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
@@ -73,6 +77,55 @@ def should_reset_opacity(stage, iteration, opt, dataset):
     )
 
 
+def save_completed_endomoeg_phase(
+    gaussians,
+    model_path,
+    phase_name,
+    component_output_dir="",
+):
+    component_map = {
+        "moe_expert_global": ("shared_base", "global"),
+        "moe_expert_local": ("local",),
+        "moe_expert_full": ("full",),
+        "moe_router_only": ("router",),
+    }
+    components = component_map.get(phase_name, ())
+    if not components:
+        return
+    component_dir = (
+        os.path.abspath(component_output_dir)
+        if component_output_dir
+        else os.path.join(model_path, "endomoeg_components")
+    )
+    for component in components:
+        path = gaussians._deformation.save_endomoeg_component(component_dir, component)
+        print(f"[EndoMoe] Saved {component} component to {path}")
+
+
+def load_requested_endomoeg_components(gaussians, hyper):
+    if getattr(hyper, "tracking_type", "") != "cams_gs_moe":
+        return ()
+    stage = str(
+        getattr(hyper, "endomoeg_stage", "")
+        or getattr(hyper, "cams_moe_stage", "")
+    ).lower()
+    components = required_endomoeg_components(stage)
+    if not components:
+        return ()
+    component_dir = str(getattr(hyper, "endomoeg_component_dir", "") or "")
+    if not component_dir:
+        raise ValueError(
+            f"endomoeg_component_dir is required for explicit EndoMoe stage '{stage}'"
+        )
+    loaded = gaussians._deformation.load_endomoeg_components(
+        component_dir,
+        components,
+        strict=bool(getattr(hyper, "endomoeg_strict_component_loading", True)),
+    )
+    print(f"[EndoMoe] Loaded components for stage {stage}: {', '.join(loaded)}")
+    return loaded
+
+
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
                          gaussians, scene, stage, tb_writer, train_iter, timer):
@@ -102,6 +155,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     else:
         lpips_model = LocalLPIPS(net_type="vgg").to(device)
     video_cams = scene.getVideoCameras()
+    temporal_times = sorted_unique_times(
+        camera.time for camera in scene.getTrainCameras()
+    )
+    previous_tracking_phase_name = None
+    final_tracking_phase_name = None
     
     for iteration in range(first_iter, final_iter+1):
         hyper.current_iteration = iteration
@@ -123,6 +181,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         iter_start.record()
         tracking_phase = gaussians._deformation.get_tracking_phase() if stage == "fine" else None
+        if tracking_phase is not None:
+            final_tracking_phase_name = tracking_phase.name
+            if (
+                previous_tracking_phase_name is not None
+                and tracking_phase.name != previous_tracking_phase_name
+            ):
+                save_completed_endomoeg_phase(
+                    gaussians,
+                    scene.model_path,
+                    previous_tracking_phase_name,
+                    getattr(hyper, "endomoeg_component_output_dir", ""),
+                )
+            previous_tracking_phase_name = tracking_phase.name
         gaussians.update_learning_rate(iteration, phase=tracking_phase)
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 500 == 0:
@@ -159,6 +230,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         visibility_filter_list = []
         viewspace_point_tensor_list = []
         deformation_aux_list = []
+        temporal_aux_pair = None
         merged_d_mu_for_commit = None
         
         for viewpoint_cam in viewpoint_cams:
@@ -189,6 +261,47 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             viewspace_point_tensor_list.append(viewspace_point_tensor)
             if stage != "coarse" and render_pkg.get("deformation_aux"):
                 deformation_aux_list.append(render_pkg["deformation_aux"])
+
+        if (
+            stage == "fine"
+            and deformation_aux_list
+            and float(getattr(hyper, "lambda_geo_temp", 0.0) or 0.0) > 0.0
+            and gaussians._deformation_table.any()
+        ):
+            reference_camera = viewpoint_cams[0]
+            adjacent_time = nearest_adjacent_time(
+                float(reference_camera.time),
+                temporal_times,
+            )
+            if adjacent_time is not None:
+                deformation_mask = gaussians._deformation_table
+                adjacent_times = torch.full(
+                    (int(deformation_mask.sum().item()), 1),
+                    float(adjacent_time),
+                    device=gaussians.get_xyz.device,
+                    dtype=gaussians.get_xyz.dtype,
+                )
+                gaussians._deformation(
+                    gaussians.get_xyz[deformation_mask],
+                    gaussians._scaling[deformation_mask],
+                    gaussians._rotation[deformation_mask],
+                    gaussians._opacity[deformation_mask],
+                    adjacent_times,
+                    camera=reference_camera,
+                )
+                adjacent_aux = gaussians._deformation.get_aux_outputs()
+                current_aux = deformation_aux_list[0]
+                if (
+                    "d_mu" in current_aux
+                    and "d_mu" in adjacent_aux
+                    and current_aux["d_mu"].shape == adjacent_aux["d_mu"].shape
+                ):
+                    temporal_aux_pair = (
+                        torch.stack((current_aux["d_mu"], adjacent_aux["d_mu"]), dim=0),
+                        current_aux["d_mu"].new_tensor(
+                            (float(reference_camera.time), float(adjacent_time))
+                        ),
+                    )
             
         radii = torch.cat(radii_list,0).max(dim=0).values
         visibility_filter = torch.cat(visibility_filter_list).any(dim=0)
@@ -261,15 +374,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 else:
                     merged_aux[key] = torch.cat(values, dim=0)
 
-            if "d_mu" in deformation_aux_list[0] and len(deformation_aux_list) > 1:
-                d_mu_sequence = [aux["d_mu"] for aux in deformation_aux_list if "d_mu" in aux]
-                if d_mu_sequence and all(entry.shape == d_mu_sequence[0].shape for entry in d_mu_sequence):
-                    merged_aux["d_mu_sequence"] = torch.stack(d_mu_sequence, dim=0)
-                    merged_aux["time_sequence"] = torch.tensor(
-                        [float(viewpoint_cam.time) for viewpoint_cam in viewpoint_cams[: len(d_mu_sequence)]],
-                        device=d_mu_sequence[0].device,
-                        dtype=d_mu_sequence[0].dtype,
-                    )
+            if temporal_aux_pair is not None:
+                merged_aux["d_mu_sequence"], merged_aux["time_sequence"] = temporal_aux_pair
 
             if stage == "fine" and iteration % 500 == 0 and deformation_aux_list and tb_writer is not None:
                 for k, v in merged_aux.items():
@@ -332,12 +438,28 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     "route_max_prob_vis",
                     "route_margin_geo",
                     "route_margin_vis",
+                    "route_zero_fraction_geo",
+                    "route_effective_experts_geo",
+                    "route_dense_effective_experts_geo",
+                    "route_sparse_dense_l1_geo",
+                    "route_balance_scale",
+                    "route_confidence_scale",
+                    "pixel_route_entropy_geo",
+                    "pixel_route_max_prob_geo",
+                    "pixel_route_covered_fraction",
+                    "pixel_router_residual_abs_mean",
+                    "pixel_router_residual_abs_max",
                     "expert_diversity_geo",
                     "L_balance_geo",
                     "L_balance_vis",
                     "L_entropy",
                     "L_geo_temp",
                     "geo_temp_velocity",
+                    "temporal_pair_count",
+                    "L_geo_spatial",
+                    "geo_spatial_roughness",
+                    "geo_spatial_sample_count",
+                    "geo_spatial_neighbor_count",
                     "L_vis_sparse",
                     "L_decouple",
                 ]
@@ -346,6 +468,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     print_keys.extend(
                         [
                             f"usage_geo_{expert_name}",
+                            f"dense_usage_geo_{expert_name}",
+                            f"route_coverage_geo_{expert_name}",
+                            f"pixel_coverage_geo_{expert_name}",
                             f"target_usage_geo_{expert_name}",
                             f"geo_disp_ratio_{expert_name}",
                             f"geo_saturation_{expert_name}",
@@ -375,6 +500,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             loss += opt.lambda_lpips * lpipsloss
         
         loss.backward()
+        if stage == "fine" and iteration % 10 == 0:
+            tracking_metrics.update(
+                collect_optimizer_group_metrics(gaussians.optimizer)
+            )
         viewspace_point_tensor_grad = torch.zeros_like(viewspace_point_tensor)
         for idx in range(0, len(viewspace_point_tensor_list)):
             viewspace_point_tensor_grad = viewspace_point_tensor_grad + viewspace_point_tensor_list[idx].grad
@@ -443,6 +572,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 [pipe, background],
                 stage,
                 tracking_metrics,
+                lpips_model,
             )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -491,6 +621,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+    if stage == "fine" and final_tracking_phase_name is not None:
+        save_completed_endomoeg_phase(
+            gaussians,
+            scene.model_path,
+            final_tracking_phase_name,
+            getattr(hyper, "endomoeg_component_output_dir", ""),
+        )
+
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, extra_mark):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
@@ -515,6 +653,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
     print(f"[ITER {opt.coarse_iterations}] Loading coarse checkpoint for fine stage")
     (model_params, _) = torch.load(coarse_checkpoint_path)
     gaussians.restore(model_params, opt)
+    load_requested_endomoeg_components(gaussians, hyper)
 
     # Fine stage: dynamic optimization
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
@@ -554,6 +693,7 @@ def training_report(
     renderArgs,
     stage,
     tracking_metrics=None,
+    lpips_model=None,
 ):
     if tb_writer:
         tb_writer.add_scalar(
@@ -603,46 +743,99 @@ def training_report(
                     iteration,
                 )
 
-    # Report test and samples of training set
-    '''
-    if iteration in testing_iterations:
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : [scene.getTestCameras()[idx % len(scene.getTestCameras())] for idx in range(10, 5000, 299)]},
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(10, 5000, 299)]})
+    if iteration not in testing_iterations:
+        return
 
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                for idx, viewpoint in enumerate(config['cameras']):
-                    image = torch.clamp(renderFunc(viewpoint, scene.gaussians,stage=stage, *renderArgs)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    mask = viewpoint.mask.to("cuda")
-                    
-                    image, gt_image, mask = image.unsqueeze(0), gt_image.unsqueeze(0), mask.unsqueeze(0)
-                    
-                    if tb_writer and (idx < 5):
-                        tb_writer.add_images(stage + "/"+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(stage + "/"+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                    l1_test += l1_loss(image, gt_image, mask).mean().double()
-                    psnr_test += psnr(image, gt_image, mask).mean().double()
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                if tb_writer:
-                    tb_writer.add_scalar(stage + "/"+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(stage+"/"+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+    validation_configs = (
+        ("test", select_fixed_views(scene.getTestCameras(), count=4)),
+        ("train", select_fixed_views(scene.getTrainCameras(), count=4)),
+    )
+    device = scene.gaussians.get_xyz.device
+    with torch.no_grad():
+        for split_name, cameras in validation_configs:
+            if not cameras:
+                continue
+            metric_totals = {
+                "l1": 0.0,
+                "psnr": 0.0,
+                "ssim": 0.0,
+                "lpips": 0.0,
+            }
+            for view_index, viewpoint in enumerate(cameras):
+                render_output = renderFunc(
+                    viewpoint,
+                    scene.gaussians,
+                    *renderArgs,
+                    stage=stage,
+                    update_deformation_stats=False,
+                )
+                image = torch.clamp(render_output["render"], 0.0, 1.0).unsqueeze(0)
+                gt_image = torch.clamp(
+                    viewpoint.original_image.to(device).float(),
+                    0.0,
+                    1.0,
+                ).unsqueeze(0)
+                mask = viewpoint.mask.to(device).unsqueeze(0)
+                masked_image = image * mask
+                masked_gt = gt_image * mask
+
+                metric_totals["l1"] += float(l1_loss(image, gt_image, mask).item())
+                metric_totals["psnr"] += float(psnr(image, gt_image, mask).mean().item())
+                metric_totals["ssim"] += float(ssim(masked_image, masked_gt).item())
+                if lpips_model is not None:
+                    metric_totals["lpips"] += float(
+                        lpips_loss(masked_image, masked_gt, lpips_model).item()
+                    )
+
+                if tb_writer and view_index < 2:
+                    image_name = getattr(viewpoint, "image_name", str(view_index))
+                    tb_writer.add_image(
+                        f"{stage}/validation/{split_name}/{image_name}/render",
+                        image[0],
+                        global_step=iteration,
+                    )
+                    if iteration == testing_iterations[0]:
+                        tb_writer.add_image(
+                            f"{stage}/validation/{split_name}/{image_name}/ground_truth",
+                            gt_image[0],
+                            global_step=iteration,
+                        )
+
+            view_count = float(len(cameras))
+            averaged_metrics = {
+                name: value / view_count
+                for name, value in metric_totals.items()
+            }
+            print(
+                f"\n[ITER {iteration}] Evaluating {split_name}: "
+                f"L1 {averaged_metrics['l1']:.6f} "
+                f"PSNR {averaged_metrics['psnr']:.3f} "
+                f"SSIM {averaged_metrics['ssim']:.4f} "
+                f"LPIPS {averaged_metrics['lpips']:.4f}"
+            )
+            if tb_writer:
+                for metric_name, metric_value in averaged_metrics.items():
+                    tb_writer.add_scalar(
+                        f"{stage}/validation/{split_name}/{metric_name}",
+                        metric_value,
+                        iteration,
+                    )
 
         if tb_writer:
-            tb_writer.add_histogram(f"{stage}/scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            
-            tb_writer.add_scalar(f'{stage}/total_points', scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_scalar(f'{stage}/deformation_rate', scene.gaussians._deformation_table.sum()/scene.gaussians.get_xyz.shape[0], iteration)
-            tb_writer.add_histogram(f"{stage}/scene/motion_histogram", scene.gaussians._deformation_accum.mean(dim=-1)/100, iteration,max_bins=500)
-        
-        torch.cuda.empty_cache()
-    '''
+            tb_writer.add_scalar(
+                f"{stage}/scene/total_points",
+                scene.gaussians.get_xyz.shape[0],
+                iteration,
+            )
+            deformation_count = scene.gaussians._deformation_table.sum()
+            tb_writer.add_scalar(
+                f"{stage}/scene/deformation_rate",
+                float(
+                    deformation_count
+                    / max(scene.gaussians.get_xyz.shape[0], 1)
+                ),
+                iteration,
+            )
 
 def setup_seed(seed):
      torch.manual_seed(seed)
@@ -681,6 +874,9 @@ if __name__ == "__main__":
         from utils.params_utils import merge_hparams
         config = mmcv.Config.fromfile(args.configs)
         args = merge_hparams(args, config)
+    if int(getattr(args, "endomoeg_stage_iterations", -1)) > 0:
+        args.iterations = int(args.endomoeg_stage_iterations)
+        args.position_lr_max_steps = int(args.endomoeg_stage_iterations)
     args = validate_training_source_args(args)
     print(f"Training source_path: {args.source_path}")
     print(f"Training extra_mark: {getattr(args, 'extra_mark', None)}")

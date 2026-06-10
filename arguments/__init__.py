@@ -149,6 +149,9 @@ class ModelHiddenParams(ParamGroup):
         self.lambda_entropy_vis = 0.0005
         self.lambda_geo_temp = 0.01
         self.lambda_geo_spatial = 0.01
+        self.geo_spatial_sample_size = 2048
+        self.geo_spatial_k = 8
+        self.geo_spatial_chunk_size = 256
         self.lambda_vis_sparse = 0.005
         self.lambda_decouple = 0.05
         self.target_geo_static = 0.30
@@ -164,6 +167,7 @@ class ModelHiddenParams(ParamGroup):
         self.target_usage_geo_global = 0.45
         self.target_usage_geo_local = 0.10
         self.target_usage_geo_cut_graph = 0.45
+        self.target_usage_geo_full = 0.30
         self.target_usage_vis_stable = 0.85
         self.target_usage_vis_transient = 0.15
         self.sat_threshold = 0.8
@@ -197,16 +201,25 @@ class ModelHiddenParams(ParamGroup):
         self.stage_visibility_enable_iter = -1
         self.stage_lifecycle_enable_iter = -1
         self.lambda_appearance_reg = 1e-4
+        self.lambda_visibility_occlusion = 1e-4
+        self.lambda_transient_sparse = 1e-4
         self.lambda_lifecycle_balance = 1e-4
         self.lambda_lifecycle_reg = 1e-4
         self.target_lifecycle_persistent = 0.8
         self.endomoeg_stage = ""
         self.cams_moe_stage = ""
+        self.endomoeg_component_dir = ""
+        self.endomoeg_component_output_dir = ""
+        self.endomoeg_strict_component_loading = True
         self.endomoeg_expert_global_end = -1
         self.endomoeg_expert_local_end = -1
         self.endomoeg_expert_full_end = -1
         self.endomoeg_router_only_end = -1
+        self.endomoeg_router_sparse_start = 0.25
+        self.endomoeg_router_balance_final_scale = 0.10
+        self.endomoeg_joint_balance_scale = 0.05
         self.moe_router_hidden_dim = 64
+        self.moe_pixel_router_hidden_dim = 32
 
         self.current_iteration = 0
         super().__init__(parser, "ModelHiddenParams")
@@ -215,6 +228,7 @@ class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.dataloader=False
         self.iterations = 30_000
+        self.endomoeg_stage_iterations = -1
         self.coarse_iterations = 3000
         self.position_lr_init = 0.00016
         self.position_lr_final = 0.0000016

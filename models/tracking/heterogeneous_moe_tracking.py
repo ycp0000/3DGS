@@ -83,6 +83,9 @@ class TrackingPhase:
     force_vis_expert: Optional[str] = None
     trainable_group_prefixes: Tuple[str, ...] = ()
     group_lr_scales: Dict[str, float] = field(default_factory=dict)
+    group_schedule_progress: Dict[str, float] = field(default_factory=dict)
+    route_balance_scale: float = 1.0
+    route_confidence_scale: float = 1.0
 
     def is_group_trainable(self, group_name: str) -> bool:
         if group_name in {
@@ -116,6 +119,12 @@ class TrackingPhase:
             if group_name.startswith(prefix):
                 return float(scale)
         return 1.0 if self.is_group_trainable(group_name) else 0.0
+
+    def schedule_progress_for_group(self, group_name: str) -> Optional[float]:
+        for prefix, progress in self.group_schedule_progress.items():
+            if group_name.startswith(prefix):
+                return min(max(float(progress), 0.0), 1.0)
+        return None
 
 
 class HeterogeneousMoEScheduler:

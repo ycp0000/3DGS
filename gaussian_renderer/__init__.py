@@ -36,7 +36,16 @@ def _use_pixel_routing(pc: GaussianModel, pipe) -> bool:
 
     return True
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, stage="fine"):
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    scaling_modifier=1.0,
+    override_color=None,
+    stage="fine",
+    update_deformation_stats=True,
+):
     """
     Render the scene.
 
@@ -132,7 +141,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             deformation_aux = {}
     # print(time.max())
     with torch.no_grad():
-        if deformation_point.any():
+        if update_deformation_stats and deformation_point.any():
             pc._deformation_accum[deformation_point] += torch.abs(means3D_deform - means3D[deformation_point])
 
     means3D_final = torch.zeros_like(means3D)
@@ -197,10 +206,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         geo_expert_scales = deformation_aux["geo_expert_scales"]
         geo_expert_rotations = deformation_aux["geo_expert_rotations"]
         geo_expert_opacity_logits = deformation_aux["geo_expert_opacity_logits"]
+        geo_expert_d_mu = deformation_aux.get("geo_expert_d_mu")
         gaussian_pi_geo_prior = deformation_aux["gaussian_pi_geo_prior"]
         vis_expert_rgb_delta = deformation_aux.get("vis_expert_rgb_delta")
         vis_expert_visibility_alpha = deformation_aux.get("vis_expert_visibility_alpha")
         lifecycle_expert_alpha = deformation_aux.get("lifecycle_expert_alpha")
+        opacity_includes_visibility = bool(
+            deformation_aux.get("expert_opacity_includes_visibility", False)
+        )
         active_expert_prior = gaussian_pi_geo_prior[deformation_point].amax(dim=0) > 1e-8
         fallback_prior = gaussian_pi_geo_prior[deformation_point].mean(dim=0).clamp_min(0.0)
         fallback_prior = fallback_prior * active_expert_prior.to(dtype=fallback_prior.dtype)
@@ -236,6 +249,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         expert_depths = []
         expert_radii_list = []
         pi_geo_weight_logits = []
+        projected_motion_maps = []
+        coverage_maps = []
 
         for expert_idx in range(num_experts):
             expert_means3D = torch.zeros_like(means3D)
@@ -254,10 +269,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             expert_opacity_logits[~deformation_point] = opacity[~deformation_point]
 
             expert_opacity_final = pc.opacity_activation(expert_opacity_logits)
-            if vis_expert_visibility_alpha is not None:
+            if vis_expert_visibility_alpha is not None and not opacity_includes_visibility:
                 vis_index = min(expert_idx, vis_expert_visibility_alpha.shape[1] - 1)
                 expert_opacity_final = expert_opacity_final * vis_expert_visibility_alpha[:, vis_index]
-            if lifecycle_expert_alpha is not None:
+            if lifecycle_expert_alpha is not None and not opacity_includes_visibility:
                 life_index = min(expert_idx, lifecycle_expert_alpha.shape[1] - 1)
                 expert_opacity_final = expert_opacity_final * lifecycle_expert_alpha[:, life_index]
 
@@ -294,13 +309,23 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 cov3D_precomp=expert_cov3D,
             )
 
-            weight_map = torch.zeros((means3D.shape[0],), device=means3D.device, dtype=expert_render.dtype)
-            weight_map[deformation_point] = gaussian_pi_geo_prior[deformation_point, expert_idx]
+            routing_features = torch.zeros(
+                (means3D.shape[0], 3),
+                device=means3D.device,
+                dtype=expert_render.dtype,
+            )
+            routing_features[deformation_point, 0] = gaussian_pi_geo_prior[deformation_point, expert_idx]
+            if geo_expert_d_mu is not None:
+                routing_features[deformation_point, 1] = geo_expert_d_mu[
+                    deformation_point,
+                    expert_idx,
+                ].norm(dim=-1)
+            routing_features[deformation_point, 2] = 1.0
             weight_render, _, _ = weight_rasterizer(
                 means3D=expert_means3D,
                 means2D=means2D,
                 shs=None,
-                colors_precomp=weight_map.unsqueeze(-1).expand(-1, 3),
+                colors_precomp=routing_features,
                 opacities=expert_opacity_final,
                 scales=expert_scales_raster,
                 rotations=expert_rotations_raster,
@@ -310,34 +335,57 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             expert_renders.append(expert_render)
             expert_depths.append(expert_depth)
             expert_radii_list.append(expert_radii)
-            weight_signal = weight_render.mean(dim=0)
+            weight_signal = weight_render[0]
+            projected_motion = weight_render[1]
+            coverage_signal = weight_render[2]
             if not bool(active_expert_prior[expert_idx].item()):
                 weight_signal = torch.zeros_like(weight_signal)
+                projected_motion = torch.zeros_like(projected_motion)
+                coverage_signal = torch.zeros_like(coverage_signal)
             pi_geo_weight_logits.append(weight_signal)
+            projected_motion_maps.append(projected_motion)
+            coverage_maps.append(coverage_signal)
 
         expert_renders_stacked = torch.stack(expert_renders, dim=0)
         expert_depths_stacked = torch.stack(expert_depths, dim=0)
         expert_radii_stacked = torch.stack(expert_radii_list, dim=0)
         pi_geo_weight_logits = torch.stack(pi_geo_weight_logits, dim=0)
+        projected_motion_maps = torch.stack(projected_motion_maps, dim=0)
+        coverage_maps = torch.stack(coverage_maps, dim=0)
         expert_pixel_covered = pi_geo_weight_logits > 0
-        coverage_present = expert_pixel_covered.any(dim=0, keepdim=True)
-        masked_weight_logits = torch.where(
-            expert_pixel_covered,
-            pi_geo_weight_logits,
-            torch.full_like(pi_geo_weight_logits, -1e9),
-        )
-        pi_geo_weights = torch.softmax(masked_weight_logits, dim=0)
-        pi_geo_weights = torch.where(
-            coverage_present.expand_as(pi_geo_weights),
-            pi_geo_weights,
-            fallback_pi_geo_weights.expand_as(pi_geo_weights),
-        )
+        deformation_wrapper = getattr(pc, "_deformation", None)
+        if hasattr(deformation_wrapper, "route_endomoeg_pixels"):
+            pi_geo_weights, pixel_router_residual_logits = deformation_wrapper.route_endomoeg_pixels(
+                expert_rgb=expert_renders_stacked,
+                expert_depth=expert_depths_stacked,
+                gaussian_prior=pi_geo_weight_logits,
+                projected_motion=projected_motion_maps,
+                coverage=coverage_maps > 1e-8,
+                fallback_prior=fallback_pi_geo_weights,
+            )
+            deformation_aux["pixel_router_residual_logits"] = pixel_router_residual_logits
+        else:
+            coverage_present = expert_pixel_covered.any(dim=0, keepdim=True)
+            masked_weight_logits = torch.where(
+                expert_pixel_covered,
+                pi_geo_weight_logits,
+                torch.full_like(pi_geo_weight_logits, -1e9),
+            )
+            pi_geo_weights = torch.softmax(masked_weight_logits, dim=0)
+            pi_geo_weights = torch.where(
+                coverage_present.expand_as(pi_geo_weights),
+                pi_geo_weights,
+                fallback_pi_geo_weights.expand_as(pi_geo_weights),
+            )
 
         rendered_image = (expert_renders_stacked * pi_geo_weights.unsqueeze(1)).sum(dim=0)
         depth = (expert_depths_stacked * pi_geo_weights).sum(dim=0)
         radii = expert_radii_stacked.max(dim=0).values
 
         deformation_aux["expert_renders"] = expert_renders_stacked
+        deformation_aux["pixel_gaussian_prior"] = pi_geo_weight_logits
+        deformation_aux["pixel_projected_motion"] = projected_motion_maps
+        deformation_aux["pixel_expert_coverage"] = coverage_maps
         deformation_aux["pixel_routing_weights"] = pi_geo_weights
     else:
         rendered_image, radii, depth = rasterizer(

@@ -33,6 +33,19 @@ def _get_aux_tensor(aux: Dict[str, torch.Tensor], name: str) -> Optional[torch.T
     return None
 
 
+def _get_aux_scale(
+    aux: Dict[str, torch.Tensor],
+    name: str,
+    reference: torch.Tensor,
+) -> torch.Tensor:
+    value = aux.get(name, 1.0)
+    if isinstance(value, torch.Tensor):
+        value = _safe_mean(value).to(device=reference.device, dtype=reference.dtype)
+    else:
+        value = reference.new_tensor(float(value))
+    return value.clamp(0.0, 1.0)
+
+
 def _resolve_expert_names(
     names: Sequence[str],
     count: int,
@@ -148,25 +161,80 @@ def _add_geo_spatial_loss(losses: Dict[str, torch.Tensor], aux: Dict[str, torch.
     if d_mu is None or means3d_canonical is None:
         return
 
-    if d_mu.numel() == 0 or means3d_canonical.shape[0] < 9:
+    if d_mu.numel() == 0 or means3d_canonical.shape[0] < 2:
         return
 
-    k = 8
-    try:
-        from simple_knn._C import distCUDA2
+    point_count = means3d_canonical.shape[0]
+    sample_size = max(2, int(getattr(args, "geo_spatial_sample_size", 2048)))
+    sample_count = min(point_count, sample_size)
+    if sample_count < point_count:
+        sample_indices = torch.randperm(
+            point_count,
+            device=means3d_canonical.device,
+        )[:sample_count]
+        sample_points = means3d_canonical[sample_indices]
+        sample_motion = d_mu[sample_indices]
+    else:
+        sample_points = means3d_canonical
+        sample_motion = d_mu
+
+    scene_scale = _get_aux_tensor(aux, "scene_scale")
+    if scene_scale is None:
+        scale = sample_motion.new_tensor(1.0)
+    else:
+        scale = scene_scale.abs().reshape(()).clamp_min(1e-6)
+    normalized_motion = sample_motion / scale
+
+    neighbor_count = min(
+        max(1, int(getattr(args, "geo_spatial_k", 8))),
+        sample_count - 1,
+    )
+    chunk_size = max(1, int(getattr(args, "geo_spatial_chunk_size", 256)))
+    weighted_roughness = normalized_motion.new_zeros(())
+    total_weight = normalized_motion.new_zeros(())
+
+    for start in range(0, sample_count, chunk_size):
+        end = min(start + chunk_size, sample_count)
         with torch.no_grad():
-            neighbor_sq_dists = distCUDA2(means3d_canonical.float().contiguous())
-            neighbor_indices_all = neighbor_sq_dists.argsort(dim=-1)
-            neighbor_indices = neighbor_indices_all[:, 1:k+1].long()
-    except Exception:
-        return
+            squared_distances = torch.cdist(
+                sample_points[start:end].detach().float(),
+                sample_points.detach().float(),
+            ).square()
+            row_indices = torch.arange(end - start, device=squared_distances.device)
+            squared_distances[row_indices, start + row_indices] = float("inf")
+            neighbor_sq_distances, neighbor_indices = torch.topk(
+                squared_distances,
+                k=neighbor_count,
+                dim=-1,
+                largest=False,
+                sorted=False,
+            )
+            finite_distances = neighbor_sq_distances[
+                torch.isfinite(neighbor_sq_distances)
+            ]
+            bandwidth = finite_distances.median().clamp_min(1e-8)
+            spatial_weights = torch.exp(
+                -neighbor_sq_distances / bandwidth
+            ).to(dtype=normalized_motion.dtype)
 
-    neighbor_d_mu = d_mu[neighbor_indices]
-    d_mu_expanded = d_mu.unsqueeze(1)
-    motion_diff_sq = (neighbor_d_mu - d_mu_expanded).square().sum(dim=-1)
+        neighbor_motion = normalized_motion[neighbor_indices]
+        query_motion = normalized_motion[start:end].unsqueeze(1)
+        robust_motion_difference = torch.sqrt(
+            (neighbor_motion - query_motion).square().sum(dim=-1) + 1e-8
+        )
+        weighted_roughness = weighted_roughness + (
+            spatial_weights * robust_motion_difference
+        ).sum()
+        total_weight = total_weight + spatial_weights.sum()
 
-    spatial_roughness = motion_diff_sq.mean()
-    losses["geo_spatial_roughness"] = _safe_mean(spatial_roughness).detach()
+    spatial_roughness = weighted_roughness / total_weight.clamp_min(1e-8)
+    losses["geo_spatial_roughness"] = spatial_roughness.detach()
+    losses["geo_spatial_sample_count"] = spatial_roughness.new_tensor(
+        float(sample_count)
+    )
+    losses["geo_spatial_neighbor_count"] = spatial_roughness.new_tensor(
+        float(neighbor_count)
+    )
     losses["L_geo_spatial"] = spatial_roughness * lambda_geo_spatial
 
 
@@ -318,15 +386,46 @@ def _add_cams_patch_c_losses(
     phase: str | None,
 ) -> None:
     appearance_offsets = _get_aux_tensor(aux, "appearance_offsets")
+    visibility_alpha = _get_aux_tensor(aux, "visibility_alpha")
+    transient_probability = _get_aux_tensor(aux, "transient_probability")
     lifecycle_probs = _get_aux_tensor(aux, "lifecycle_probs")
     lifecycle_logits = _get_aux_tensor(aux, "lifecycle_logits")
+    appearance_phases = {
+        "visibility_refine",
+        "joint_finetune",
+        "moe_expert_full",
+        "moe_joint_finetune",
+    }
+    lifecycle_phases = {
+        "joint_finetune",
+        "moe_expert_full",
+        "moe_joint_finetune",
+    }
 
-    if appearance_offsets is not None and phase in {"visibility_refine", "joint_finetune"}:
+    if appearance_offsets is not None and phase in appearance_phases:
         appearance_energy = appearance_offsets.square().mean()
         losses["appearance_offset_energy"] = appearance_energy.detach()
         losses["L_appearance_reg"] = appearance_energy * _get_float_arg(args, "lambda_appearance_reg", 1e-4)
 
-    if lifecycle_probs is not None and phase == "joint_finetune":
+    if visibility_alpha is not None and phase in lifecycle_phases:
+        occlusion_probability = 1.0 - visibility_alpha.clamp(0.0, 1.0)
+        mean_occlusion = occlusion_probability.mean()
+        losses["mean_visibility_alpha"] = visibility_alpha.mean().detach()
+        losses["mean_occlusion_probability"] = mean_occlusion.detach()
+        losses["L_visibility_occlusion"] = (
+            mean_occlusion
+            * _get_float_arg(args, "lambda_visibility_occlusion", 1e-4)
+        )
+
+    if transient_probability is not None and phase in lifecycle_phases:
+        mean_transient = transient_probability.clamp(0.0, 1.0).mean()
+        losses["mean_transient_probability"] = mean_transient.detach()
+        losses["L_transient_sparse"] = (
+            mean_transient
+            * _get_float_arg(args, "lambda_transient_sparse", 1e-4)
+        )
+
+    if lifecycle_probs is not None and phase in lifecycle_phases:
         persistent_prob = lifecycle_probs[:, :1]
         transient_prob = lifecycle_probs[:, 1:2] if lifecycle_probs.shape[-1] > 1 else 1.0 - persistent_prob
         lifecycle_balance = (persistent_prob.mean() - _get_float_arg(args, "target_lifecycle_persistent", 0.8)) ** 2
@@ -334,10 +433,14 @@ def _add_cams_patch_c_losses(
         losses["mean_lifecycle_transient"] = transient_prob.mean().detach()
         losses["L_lifecycle_balance"] = lifecycle_balance * _get_float_arg(args, "lambda_lifecycle_balance", 1e-4)
 
-    if lifecycle_logits is not None and phase == "joint_finetune":
-        lifecycle_energy = lifecycle_logits.square().mean()
-        losses["lifecycle_logit_energy"] = lifecycle_energy.detach()
-        losses["L_lifecycle_reg"] = lifecycle_energy * _get_float_arg(args, "lambda_lifecycle_reg", 1e-4)
+    if lifecycle_logits is not None and lifecycle_probs is not None and phase in lifecycle_phases:
+        transient_prob = lifecycle_probs[:, 1:2] if lifecycle_probs.shape[-1] > 1 else 1.0 - lifecycle_probs[:, :1]
+        lifecycle_transient = transient_prob.mean()
+        losses["lifecycle_transient_probability"] = lifecycle_transient.detach()
+        losses["L_lifecycle_reg"] = (
+            lifecycle_transient
+            * _get_float_arg(args, "lambda_lifecycle_reg", 1e-4)
+        )
 
 
 def compute_tracking_losses(
@@ -356,6 +459,8 @@ def compute_tracking_losses(
     del prev_d_mu
 
     pixel_routing_weights = aux.get("pixel_routing_weights")
+    pixel_expert_coverage = aux.get("pixel_expert_coverage")
+    pixel_router_residual_logits = aux.get("pixel_router_residual_logits")
     pi_geo = aux.get("pi_geo")
     pi_vis = aux.get("pi_vis")
 
@@ -367,18 +472,45 @@ def compute_tracking_losses(
     entropy_vis = aux.get("entropy_vis")
 
     losses: Dict[str, torch.Tensor] = {}
+    if isinstance(pixel_router_residual_logits, torch.Tensor):
+        losses["pixel_router_residual_abs_mean"] = (
+            pixel_router_residual_logits.abs().mean().detach()
+        )
+        losses["pixel_router_residual_abs_max"] = (
+            pixel_router_residual_logits.abs().amax().detach()
+        )
 
     pixel_usage_geo = None
     if pixel_routing_weights is not None:
-        covered_pixels = pixel_routing_weights.sum(dim=0) > 0
+        if (
+            isinstance(pixel_expert_coverage, torch.Tensor)
+            and pixel_expert_coverage.shape == pixel_routing_weights.shape
+        ):
+            covered_pixels = pixel_expert_coverage.sum(dim=0) > 1e-8
+        else:
+            covered_pixels = pixel_routing_weights.sum(dim=0) > 0
         if covered_pixels.any():
-            pixel_usage_geo = pixel_routing_weights[:, covered_pixels].mean(dim=1)
+            covered_weights = pixel_routing_weights[:, covered_pixels]
+            pixel_usage_geo = covered_weights.mean(dim=1)
+            losses["pixel_route_entropy_geo"] = -(
+                covered_weights.clamp_min(1e-8)
+                * covered_weights.clamp_min(1e-8).log()
+            ).sum(dim=0).mean().detach()
+            losses["pixel_route_max_prob_geo"] = (
+                covered_weights.max(dim=0).values.mean().detach()
+            )
+            losses["pixel_route_covered_fraction"] = covered_pixels.to(
+                dtype=pixel_routing_weights.dtype
+            ).mean().detach()
         else:
             pixel_usage_geo = torch.zeros(
                 (pixel_routing_weights.shape[0],),
                 device=pixel_routing_weights.device,
                 dtype=pixel_routing_weights.dtype,
             )
+            losses["pixel_route_entropy_geo"] = pixel_routing_weights.new_zeros(())
+            losses["pixel_route_max_prob_geo"] = pixel_routing_weights.new_zeros(())
+            losses["pixel_route_covered_fraction"] = pixel_routing_weights.new_zeros(())
 
     if pi_geo is not None:
         usage_geo = pi_geo.mean(dim=0)
@@ -395,6 +527,33 @@ def compute_tracking_losses(
         for index, expert_name in enumerate(resolved_geo_names):
             losses[f"usage_geo_{expert_name}"] = usage_geo[index]
 
+        dense_pi_geo = aux.get("gaussian_pi_geo_dense")
+        if (
+            isinstance(pi_geo, torch.Tensor)
+            and pi_geo.ndim == 2
+            and isinstance(dense_pi_geo, torch.Tensor)
+            and dense_pi_geo.shape == pi_geo.shape
+        ):
+            dense_usage_geo = dense_pi_geo.mean(dim=0)
+            for index, expert_name in enumerate(resolved_geo_names):
+                losses[f"dense_usage_geo_{expert_name}"] = dense_usage_geo[index].detach()
+                losses[f"route_coverage_geo_{expert_name}"] = (
+                    pi_geo[:, index] > 1e-8
+                ).to(dtype=pi_geo.dtype).mean().detach()
+
+            sparse_probability = pi_geo.clamp_min(0.0)
+            dense_probability = dense_pi_geo.clamp_min(0.0)
+            losses["route_zero_fraction_geo"] = (pi_geo <= 1e-8).to(dtype=pi_geo.dtype).mean().detach()
+            losses["route_effective_experts_geo"] = (
+                1.0 / sparse_probability.square().sum(dim=-1).clamp_min(1e-8)
+            ).mean().detach()
+            losses["route_dense_effective_experts_geo"] = (
+                1.0 / dense_probability.square().sum(dim=-1).clamp_min(1e-8)
+            ).mean().detach()
+            losses["route_sparse_dense_l1_geo"] = (
+                sparse_probability - dense_probability
+            ).abs().mean().detach()
+
         if pixel_usage_geo is not None:
             pixel_geo_names = _resolve_expert_names(
                 geo_expert_names,
@@ -404,6 +563,13 @@ def compute_tracking_losses(
             )
             for index, expert_name in enumerate(pixel_geo_names):
                 losses[f"pixel_usage_geo_{expert_name}"] = pixel_usage_geo[index].detach()
+                if (
+                    isinstance(pixel_expert_coverage, torch.Tensor)
+                    and pixel_expert_coverage.shape[0] > index
+                ):
+                    losses[f"pixel_coverage_geo_{expert_name}"] = (
+                        pixel_expert_coverage[index] > 1e-8
+                    ).to(dtype=pixel_expert_coverage.dtype).mean().detach()
 
         if force_geo_expert is None:
             active_geo = max(1, min(int(active_geo), usage_geo.numel()))
@@ -414,7 +580,15 @@ def compute_tracking_losses(
             for expert_name, target_value in zip(active_geo_names, target_geo):
                 losses[f"target_usage_geo_{expert_name}"] = target_value.detach()
 
-            losses["L_balance_geo"] = ((active_usage_geo - target_geo) ** 2).sum() * _get_float_arg(args, "lambda_balance_geo", 0.0)
+            route_balance_scale = _get_aux_scale(aux, "route_balance_scale", usage_geo)
+            route_confidence_scale = _get_aux_scale(aux, "route_confidence_scale", usage_geo)
+            losses["route_balance_scale"] = route_balance_scale.detach()
+            losses["route_confidence_scale"] = route_confidence_scale.detach()
+            losses["L_balance_geo"] = (
+                ((active_usage_geo - target_geo) ** 2).sum()
+                * _get_float_arg(args, "lambda_balance_geo", 0.0)
+                * route_balance_scale
+            )
 
             route_max_prob_geo = aux.get("route_max_prob_geo")
             route_margin_geo = aux.get("route_margin_geo")
@@ -422,7 +596,11 @@ def compute_tracking_losses(
                 route_max_prob_geo = _safe_mean(route_max_prob_geo)
                 losses["route_max_prob_geo"] = route_max_prob_geo.detach()
                 if active_geo > 1:
-                    losses["L_route_conf_geo"] = (1.0 - route_max_prob_geo) * _get_float_arg(args, "lambda_route_conf_geo", 0.0)
+                    losses["L_route_conf_geo"] = (
+                        (1.0 - route_max_prob_geo)
+                        * _get_float_arg(args, "lambda_route_conf_geo", 0.0)
+                        * route_confidence_scale
+                    )
             if route_margin_geo is not None:
                 losses["route_margin_geo"] = _safe_mean(route_margin_geo).detach()
         else:

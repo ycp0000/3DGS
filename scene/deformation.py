@@ -1,5 +1,7 @@
 from typing import Dict, Iterable, Optional
 
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -37,7 +39,7 @@ class Deformation(nn.Module):
         if tracking_mode not in {"original", "split", "hetero_moe", "cams_gs", "cams_gs_moe"}:
             raise ValueError(f"Unsupported tracking_type: {tracking_mode}")
         self.tracking_mode = tracking_mode
-        self.use_backbone = self.tracking_mode in {"original", "split", "hetero_moe", "cams_gs"}
+        self.use_backbone = self.tracking_mode in {"original", "split", "hetero_moe", "cams_gs", "cams_gs_moe"}
         self.no_grid = bool(getattr(args, "no_grid", False) and self.use_backbone)
 
         self.grid: Optional[HexPlaneField] = None
@@ -141,6 +143,51 @@ class Deformation(nn.Module):
             nn.Sequential(nn.ReLU(), nn.Linear(self.W, self.W), nn.ReLU(), nn.Linear(self.W, 1)),
         )
 
+    def reset_backbone_to_identity(self) -> None:
+        if self.tracking_mode != "cams_gs_moe":
+            return
+        for head in (self.pos_deform, self.scales_deform, self.rotations_deform, self.opacity_deform):
+            if head is None:
+                continue
+            linear_layers = [module for module in head.modules() if isinstance(module, nn.Linear)]
+            if not linear_layers:
+                continue
+            nn.init.zeros_(linear_layers[-1].weight)
+            nn.init.zeros_(linear_layers[-1].bias)
+
+    def shared_base_state_dict(self):
+        if not self.use_backbone:
+            raise RuntimeError("Shared HexPlane base is unavailable")
+        modules = {
+            "grid": self.grid,
+            "feature_out": self.feature_out,
+            "pos_deform": self.pos_deform,
+            "scales_deform": self.scales_deform,
+            "rotations_deform": self.rotations_deform,
+            "opacity_deform": self.opacity_deform,
+        }
+        return {
+            name: module.state_dict()
+            for name, module in modules.items()
+            if module is not None
+        }
+
+    def load_shared_base_state_dict(self, state_dict) -> None:
+        modules = {
+            "grid": self.grid,
+            "feature_out": self.feature_out,
+            "pos_deform": self.pos_deform,
+            "scales_deform": self.scales_deform,
+            "rotations_deform": self.rotations_deform,
+            "opacity_deform": self.opacity_deform,
+        }
+        for name, module in modules.items():
+            if module is None:
+                continue
+            if name not in state_dict:
+                raise ValueError(f"Shared base checkpoint is missing module: {name}")
+            module.load_state_dict(state_dict[name])
+
     def query_time(self, rays_pts_emb, time_emb):
         if self.feature_out is None:
             raise RuntimeError("Backbone query requested when backbone is unavailable")
@@ -242,11 +289,20 @@ class Deformation(nn.Module):
         if time_features is None:
             raise RuntimeError(f"{self.tracking_mode} tracking requires time_features from the time encoder")
 
-        if self.tracking_mode in {"cams_gs", "cams_gs_moe"}:
+        if self.tracking_mode == "cams_gs":
             base_pts = rays_pts_emb[:, :3]
             base_scales = scales_emb[:, :3]
             base_rotations = rotations_emb[:, :4]
             base_opacity = opacity_emb[:, :1]
+        elif self.tracking_mode == "cams_gs_moe":
+            hidden = self.query_time(rays_pts_emb, time_emb).float()
+            base_pts, base_scales, base_rotations, base_opacity = self._forward_original(
+                hidden,
+                rays_pts_emb,
+                scales_emb,
+                rotations_emb,
+                opacity_emb,
+            )
         else:
             hidden = self.query_time(rays_pts_emb, time_emb).float()
             base_pts, base_scales, base_rotations, base_opacity = self._forward_original(
@@ -268,7 +324,7 @@ class Deformation(nn.Module):
         else:
             tracking_head = self.cams_head
         assert tracking_head is not None
-        pts, scales, rotations, opacity, aux = tracking_head(
+        tracking_kwargs = dict(
             means3d=base_pts,
             scales=base_scales,
             rotations=base_rotations,
@@ -279,6 +335,9 @@ class Deformation(nn.Module):
             phase=phase,
             camera=camera,
         )
+        if self.tracking_mode == "cams_gs_moe":
+            tracking_kwargs["canonical_means3d"] = rays_pts_emb[:, :3]
+        pts, scales, rotations, opacity, aux = tracking_head(**tracking_kwargs)
         self.latest_aux = aux
         self.latest_d_mu = aux["d_mu"].detach()
         return pts, scales, rotations, opacity
@@ -318,6 +377,13 @@ class Deformation(nn.Module):
             grid_parameters = self.get_grid_parameters()
             if grid_parameters:
                 groups["tracking_base_grid"] = grid_parameters
+        elif self.tracking_mode == "cams_gs_moe" and self.use_backbone:
+            backbone_parameters = self._get_backbone_mlp_parameters()
+            if backbone_parameters:
+                groups["tracking_shared_base_deformation"] = backbone_parameters
+            grid_parameters = self.get_grid_parameters()
+            if grid_parameters:
+                groups["tracking_shared_base_grid"] = grid_parameters
         if self.heterogeneous_head is not None:
             groups.update(self.heterogeneous_head.named_parameter_groups())
         if self.cams_head is not None:
@@ -388,13 +454,18 @@ class Deformation(nn.Module):
             return (self.cams_moe_head.GEO_EXPERT_NAMES, self.cams_moe_head.VIS_EXPERT_NAMES)
         return (("single",), ("single",))
 
+    def route_endomoeg_pixels(self, **kwargs):
+        if self.deformation_net.cams_moe_head is None:
+            raise RuntimeError("Pixel routing requires tracking_type='cams_gs_moe'")
+        return self.deformation_net.cams_moe_head.route_pixels(**kwargs)
+
     def get_tracking_arch_version(self) -> str:
         if self.tracking_mode == "hetero_moe":
             return "hetero_residual_v2"
         if self.tracking_mode == "cams_gs":
             return "cams_gs_v2"
         if self.tracking_mode == "cams_gs_moe":
-            return "endomoeg_v1"
+            return "endomoeg_v4"
         if self.tracking_mode == "split":
             return "split_v1"
         return "original_v1"
@@ -426,6 +497,7 @@ class deform_network(nn.Module):
 
         self.register_buffer("time_poc", torch.FloatTensor([(2**i) for i in range(timebase_pe)]))
         self.apply(initialize_weights)
+        self.deformation_net.reset_backbone_to_identity()
         self.deformation_net.reset_tracking_parameters()
 
     def _encode_time(self, times_sel: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -439,15 +511,15 @@ class deform_network(nn.Module):
             encoded = torch.cat([base, torch.sin(scaled), torch.cos(scaled)], dim=-1)
         return self.timenet(encoded)
 
-    def forward(self, point, scales=None, rotations=None, opacity=None, times_sel=None):
+    def forward(self, point, scales=None, rotations=None, opacity=None, times_sel=None, camera=None):
         if times_sel is not None:
-            return self.forward_dynamic(point, scales, rotations, opacity, times_sel)
+            return self.forward_dynamic(point, scales, rotations, opacity, times_sel, camera=camera)
         return self.forward_static(point)
 
     def forward_static(self, points):
         return self.deformation_net(points)
 
-    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, times_sel=None):
+    def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, times_sel=None, camera=None):
         time_features = self._encode_time(times_sel)
         return self.deformation_net(
             point,
@@ -456,6 +528,7 @@ class deform_network(nn.Module):
             opacity,
             times_sel,
             time_features=time_features,
+            camera=camera,
         )
 
     def get_mlp_parameters(self):
@@ -470,6 +543,80 @@ class deform_network(nn.Module):
             groups = dict(groups)
             groups["tracking_time_encoder"] = self.timenet.parameters()
         return groups
+
+    def endomoeg_component_state_dict(self, component: str):
+        if self.deformation_net.tracking_mode != "cams_gs_moe":
+            raise RuntimeError("EndoMoe component checkpoints require tracking_type='cams_gs_moe'")
+        component = str(component).lower()
+        if component == "shared_base":
+            state = self.deformation_net.shared_base_state_dict()
+        elif component == "router":
+            assert self.deformation_net.cams_moe_head is not None
+            state = {
+                "time_encoder": self.timenet.state_dict(),
+                "router": self.deformation_net.cams_moe_head.component_state_dict("router"),
+            }
+        else:
+            assert self.deformation_net.cams_moe_head is not None
+            state = self.deformation_net.cams_moe_head.component_state_dict(component)
+        return {
+            "tracking_type": self.deformation_net.tracking_mode,
+            "tracking_arch_version": self.deformation_net.get_tracking_arch_version(),
+            "component": component,
+            "state_dict": state,
+        }
+
+    def load_endomoeg_component_state_dict(self, payload) -> None:
+        if self.deformation_net.tracking_mode != "cams_gs_moe":
+            raise RuntimeError("EndoMoe component checkpoints require tracking_type='cams_gs_moe'")
+        if payload.get("tracking_type") != "cams_gs_moe":
+            raise ValueError("Component checkpoint does not belong to cams_gs_moe")
+        expected_version = self.deformation_net.get_tracking_arch_version()
+        if payload.get("tracking_arch_version") != expected_version:
+            raise ValueError(
+                f"Component checkpoint architecture {payload.get('tracking_arch_version')} "
+                f"does not match {expected_version}"
+            )
+        component = str(payload.get("component", "")).lower()
+        state = payload.get("state_dict")
+        if component == "shared_base":
+            self.deformation_net.load_shared_base_state_dict(state)
+        elif component == "router":
+            assert self.deformation_net.cams_moe_head is not None
+            self.timenet.load_state_dict(state["time_encoder"])
+            self.deformation_net.cams_moe_head.load_component_state_dict("router", state["router"])
+        else:
+            assert self.deformation_net.cams_moe_head is not None
+            self.deformation_net.cams_moe_head.load_component_state_dict(component, state)
+
+    def save_endomoeg_component(self, directory: str, component: str) -> str:
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{component}.pth")
+        torch.save(self.endomoeg_component_state_dict(component), path)
+        return path
+
+    def load_endomoeg_component(self, path: str) -> None:
+        payload = torch.load(path, map_location="cpu")
+        self.load_endomoeg_component_state_dict(payload)
+
+    def load_endomoeg_components(
+        self,
+        directory: str,
+        components,
+        strict: bool = True,
+    ):
+        loaded = []
+        for component in components:
+            path = os.path.join(directory, f"{component}.pth")
+            if not os.path.isfile(path):
+                if strict:
+                    raise FileNotFoundError(
+                        f"Required EndoMoe component checkpoint is missing: {path}"
+                    )
+                continue
+            self.load_endomoeg_component(path)
+            loaded.append(component)
+        return tuple(loaded)
 
     def get_optimizer_param_groups(self, training_args, spatial_lr_scale: float):
         tracking_groups = self.get_tracking_parameter_groups()

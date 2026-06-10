@@ -5,6 +5,7 @@ from argparse import ArgumentParser
 from collections import UserDict
 from pathlib import Path
 
+import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -301,9 +302,34 @@ def test_endomoeg_presets_use_known_parser_keys_and_tracking_type():
         assert candidate.extra_mark == "endonerf"
         assert candidate.coarse_iterations == baseline.coarse_iterations
         assert candidate.pruning_interval == baseline.pruning_interval
-        assert candidate.iterations == baseline.iterations
-        assert candidate.endomoeg_expert_global_end == 1800
-        assert candidate.endomoeg_router_only_end == 7600
+        assert candidate.iterations == 15000
+        assert candidate.position_lr_max_steps == 15000
+        assert candidate.endomoeg_expert_global_end == 2000
+        assert candidate.endomoeg_expert_local_end == 5000
+        assert candidate.endomoeg_expert_full_end == 8000
+        assert candidate.endomoeg_router_only_end == 12000
+        assert candidate.use_pixel_routing is True
+        assert candidate.moe_pixel_router_hidden_dim == 32
+        assert candidate.target_usage_vis_stable == pytest.approx(0.98)
+        assert candidate.target_usage_vis_transient == pytest.approx(0.02)
+        assert candidate.target_lifecycle_persistent == pytest.approx(0.98)
+        assert candidate.lambda_visibility_occlusion == pytest.approx(0.0002)
+        assert candidate.lambda_transient_sparse == pytest.approx(0.0001)
+        target = _build_geo_target(
+            candidate,
+            ("global", "local", "full"),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert torch.allclose(target, torch.tensor([0.35, 0.35, 0.30]), atol=1e-6)
+
+
+def test_endomoeg_component_loading_arguments_have_safe_defaults():
+    args = _build_default_args()
+    assert args.endomoeg_component_dir == ""
+    assert args.endomoeg_component_output_dir == ""
+    assert args.endomoeg_strict_component_loading is True
+    assert args.endomoeg_stage_iterations == -1
 
 
 def test_cams_gs_early_phases_preset_has_explicit_stage_boundaries():
