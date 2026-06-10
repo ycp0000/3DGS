@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 
@@ -51,7 +51,7 @@ def _resolve_expert_names(
     count: int,
     defaults: Sequence[str],
     prefix: str,
-) -> tuple[str, ...]:
+) -> Tuple[str, ...]:
     if len(names) >= count:
         return tuple(names[:count])
 
@@ -383,7 +383,7 @@ def _add_cams_patch_c_losses(
     losses: Dict[str, torch.Tensor],
     aux: Dict[str, torch.Tensor],
     args,
-    phase: str | None,
+    phase: Optional[str],
 ) -> None:
     appearance_offsets = _get_aux_tensor(aux, "appearance_offsets")
     visibility_alpha = _get_aux_tensor(aux, "visibility_alpha")
@@ -447,14 +447,14 @@ def compute_tracking_losses(
     aux: Dict[str, torch.Tensor],
     iteration: int,
     args,
-    prev_d_mu: torch.Tensor | None,
+    prev_d_mu: Optional[torch.Tensor],
     active_geo: int,
     active_vis: int,
     enable_visibility: bool,
     geo_expert_names: Sequence[str],
     vis_expert_names: Sequence[str],
-    force_geo_expert: str | None = None,
-    force_vis_expert: str | None = None,
+    force_geo_expert: Optional[str] = None,
+    force_vis_expert: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     del prev_d_mu
 

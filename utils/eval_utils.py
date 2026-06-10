@@ -1,4 +1,4 @@
-from typing import Sequence, TypeVar
+from typing import Sequence, Tuple, TypeVar
 
 
 CameraT = TypeVar("CameraT")
@@ -7,7 +7,7 @@ CameraT = TypeVar("CameraT")
 def select_fixed_views(
     cameras: Sequence[CameraT],
     count: int = 4,
-) -> tuple[CameraT, ...]:
+) -> Tuple[CameraT, ...]:
     camera_count = len(cameras)
     if camera_count == 0 or count <= 0:
         return ()

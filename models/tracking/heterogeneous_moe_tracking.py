@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -62,7 +62,10 @@ def _init_router_mlp(mlp: nn.Sequential, final_bias: torch.Tensor) -> None:
         final_layer.bias.copy_(final_bias.to(final_layer.bias.device, final_layer.bias.dtype))
 
 
-def _scene_scale_tensor(scene_scale: torch.Tensor | float, reference: torch.Tensor) -> torch.Tensor:
+def _scene_scale_tensor(
+    scene_scale: Union[torch.Tensor, float],
+    reference: torch.Tensor,
+) -> torch.Tensor:
     scale = torch.as_tensor(scene_scale, device=reference.device, dtype=reference.dtype).reshape(())
     return scale.abs().clamp_min(1e-6)
 

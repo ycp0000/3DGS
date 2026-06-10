@@ -1,8 +1,8 @@
 from bisect import bisect_left
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Tuple
 
 
-def sorted_unique_times(values: Iterable[float]) -> tuple[float, ...]:
+def sorted_unique_times(values: Iterable[float]) -> Tuple[float, ...]:
     return tuple(sorted({float(value) for value in values}))
 
 
