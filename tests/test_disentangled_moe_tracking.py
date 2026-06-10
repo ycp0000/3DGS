@@ -2259,7 +2259,13 @@ def test_renderer_recomputes_covariance_after_cams_deformation(monkeypatch):
         def __call__(self, **kwargs):
             type(self).last_kwargs = kwargs
             count = kwargs["means3D"].shape[0]
-            return torch.zeros(1, 1, 1), torch.ones(count), torch.zeros(count)
+            height = self.raster_settings.kwargs["image_height"]
+            width = self.raster_settings.kwargs["image_width"]
+            return (
+                torch.zeros(3, height, width),
+                torch.ones(count),
+                torch.zeros(1, height, width),
+            )
 
     renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
     covariance_calls = {}
@@ -2411,7 +2417,13 @@ def test_renderer_applies_appearance_delta_and_opacity_gate_to_rasterizer_inputs
         def __call__(self, **kwargs):
             type(self).last_kwargs = kwargs
             count = kwargs["means3D"].shape[0]
-            return torch.zeros(1, 1, 1), torch.ones(count), torch.zeros(count)
+            height = self.raster_settings.kwargs["image_height"]
+            width = self.raster_settings.kwargs["image_width"]
+            return (
+                torch.zeros(3, height, width),
+                torch.ones(count),
+                torch.zeros(1, height, width),
+            )
 
     renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
 
@@ -2547,7 +2559,7 @@ def test_renderer_pixel_routing_preserves_expert_appearance_and_opacity_controls
                 color_value = float(kwargs["colors_precomp"][0, 0].item())
             opacity_value = float(kwargs["opacities"][0, 0].item()) if kwargs.get("opacities") is not None else 0.0
             render_value = torch.full((3, 1, 1), color_value + opacity_value)
-            return render_value, torch.ones(count), torch.zeros(1, 1)
+            return render_value, torch.ones(count), torch.zeros(1, 1, 1)
 
     renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
     route_call = {}
@@ -2633,6 +2645,7 @@ def test_renderer_pixel_routing_preserves_expert_appearance_and_opacity_controls
     assert route_call["projected_motion"].shape == (2, 1, 1)
     assert route_call["coverage"].shape == (2, 1, 1)
     assert outputs["deformation_aux"]["pixel_router_residual_logits"].shape == (2, 1, 1)
+    assert outputs["depth"].shape == (1, 1, 1)
 
 
 def test_renderer_does_not_apply_endomoeg_visibility_gate_twice(monkeypatch):
@@ -3038,6 +3051,20 @@ def test_render_reconstruction_accepts_hw_and_channel_first_depth_shapes(monkeyp
 
     with pytest.raises(ValueError, match="depth must have shape"):
         render_module._tensor_to_hw_numpy(torch.randn(3, 4, 5), "depth")
+
+
+def test_renderer_canonicalizes_legacy_replicated_depth(monkeypatch):
+    renderer = _load_gaussian_renderer_module(monkeypatch, object)
+    depth = torch.arange(20, dtype=torch.float32).reshape(1, 4, 5)
+
+    canonical = renderer._canonicalize_rasterized_depth(
+        depth.expand(3, -1, -1),
+        image_height=4,
+        image_width=5,
+    )
+
+    assert canonical.shape == (1, 4, 5)
+    assert torch.allclose(canonical, depth)
 
 
 def test_cams_visibility_head_exposes_render_affecting_controls():

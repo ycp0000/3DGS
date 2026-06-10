@@ -36,6 +36,26 @@ def _use_pixel_routing(pc: GaussianModel, pipe) -> bool:
 
     return True
 
+
+def _canonicalize_rasterized_depth(
+    depth: torch.Tensor,
+    image_height: int,
+    image_width: int,
+) -> torch.Tensor:
+    expected_hw = (int(image_height), int(image_width))
+    if depth.ndim == 2 and tuple(depth.shape) == expected_hw:
+        return depth.unsqueeze(0)
+    if depth.ndim == 3 and tuple(depth.shape[1:]) == expected_hw:
+        if depth.shape[0] == 1:
+            return depth
+        if depth.shape[0] == 3:
+            return depth.mean(dim=0, keepdim=True)
+    raise ValueError(
+        "Rasterizer depth must have shape [H, W], [1, H, W], "
+        "or legacy replicated [3, H, W], got {}".format(tuple(depth.shape))
+    )
+
+
 def render(
     viewpoint_camera,
     pc: GaussianModel,
@@ -308,6 +328,7 @@ def render(
                 rotations=expert_rotations_raster,
                 cov3D_precomp=expert_cov3D,
             )
+            expert_depth = _canonicalize_rasterized_depth(expert_depth, H, W)
 
             routing_features = torch.zeros(
                 (means3D.shape[0], 3),
@@ -347,7 +368,7 @@ def render(
             coverage_maps.append(coverage_signal)
 
         expert_renders_stacked = torch.stack(expert_renders, dim=0)
-        expert_depths_stacked = torch.stack(expert_depths, dim=0)
+        expert_depths_stacked = torch.stack(expert_depths, dim=0).squeeze(1)
         expert_radii_stacked = torch.stack(expert_radii_list, dim=0)
         pi_geo_weight_logits = torch.stack(pi_geo_weight_logits, dim=0)
         projected_motion_maps = torch.stack(projected_motion_maps, dim=0)
@@ -379,7 +400,7 @@ def render(
             )
 
         rendered_image = (expert_renders_stacked * pi_geo_weights.unsqueeze(1)).sum(dim=0)
-        depth = (expert_depths_stacked * pi_geo_weights).sum(dim=0)
+        depth = (expert_depths_stacked * pi_geo_weights).sum(dim=0, keepdim=True)
         radii = expert_radii_stacked.max(dim=0).values
 
         deformation_aux["expert_renders"] = expert_renders_stacked
@@ -397,6 +418,11 @@ def render(
             scales = scales_final,
             rotations = rotations_final,
             cov3D_precomp = cov3D_precomp)
+        depth = _canonicalize_rasterized_depth(
+            depth,
+            viewpoint_camera.image_height,
+            viewpoint_camera.image_width,
+        )
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
