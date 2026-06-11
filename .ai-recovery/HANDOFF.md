@@ -2610,3 +2610,27 @@ Claude must verify with:
 
 ### 下一步最小任务
 - 用户确认后 commit 并 push，随后在服务器运行 README 的 Stage 1 canonical 命令。
+
+## Update 2026-06-11 Router spatial-mask normalization
+
+### 已完成
+- 定位 Stage 3 Router 首轮崩溃的根因：EndoNeRF mask 为 `[1,H,W]`，但 oracle cross-entropy map 为 `[H,W]`，旧 `_masked_mean()` 直接 `expand_as()` 导致维度不兼容。
+- 新增统一空间 mask canonicalizer，将 `[H,W]`、`[1,H,W]`、`[H,W,1]` 规范化为 `[H,W]`。
+- reconstruction、oracle、usage、entropy 与 oracle usage 现共享同一 mask 契约。
+- 新增三种受支持布局的 Router loss 回归测试。
+
+### 当前设计决策
+- Router loss 边界统一采用二维空间 mask `[H,W]`；通道广播只在 loss helper 内完成。
+- 不允许依赖 `squeeze(0)` 的隐式行为，非法维度或空间尺寸必须 fail-fast。
+- singleton 通道布局按完整期望形状匹配，避免 `H=1` 时 `[1,H,W]` 与 `[H,W,1]` 发生轴歧义。
+
+### 仍需做什么
+- 完成 diff 检查、提交并 push 到 `origin/main`。
+
+### 运行过哪些测试
+- Router 定向回归：`15 passed`。
+- 完整测试集：`155 passed, 2 warnings`。
+- `H=1` 无歧义布局修正后重跑：Router `15 passed`；完整测试 `155 passed, 2 warnings`。
+
+### 下一步最小任务
+- 执行最终检查并提交推送。

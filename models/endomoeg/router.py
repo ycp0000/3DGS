@@ -16,10 +16,35 @@ DEFAULT_MINIMUM_USAGE = {
 }
 
 
+def _canonicalize_spatial_mask(mask, spatial_shape, device, dtype):
+    mask_value = mask.to(device=device, dtype=dtype)
+    expected_shape = tuple(spatial_shape)
+    if tuple(mask_value.shape) == (1,) + expected_shape:
+        mask_value = mask_value[0]
+    elif tuple(mask_value.shape) == expected_shape + (1,):
+        mask_value = mask_value[..., 0]
+    if mask_value.ndim != 2 or tuple(mask_value.shape) != expected_shape:
+        raise ValueError(
+            "mask must have shape [H, W], [1, H, W], or [H, W, 1]; "
+            "expected spatial shape {}, got {}".format(
+                expected_shape,
+                tuple(mask.shape),
+            )
+        )
+    return mask_value
+
+
 def _masked_mean(value, mask):
     if mask is None:
         return value.mean()
-    mask_value = mask.to(device=value.device, dtype=value.dtype)
+    if value.ndim < 2:
+        raise ValueError("masked values must include spatial dimensions [H, W]")
+    mask_value = _canonicalize_spatial_mask(
+        mask,
+        value.shape[-2:],
+        value.device,
+        value.dtype,
+    )
     while mask_value.ndim < value.ndim:
         mask_value = mask_value.unsqueeze(0)
     expanded = mask_value.expand_as(value)
@@ -44,11 +69,12 @@ def oracle_routing_targets(
         dim=0,
     )
     if mask is not None:
-        valid = mask.to(device=targets.device, dtype=torch.bool)
-        if valid.ndim == 3:
-            valid = valid.squeeze(0)
-        if valid.shape != targets.shape[1:]:
-            raise ValueError("mask shape does not match expert images")
+        valid = _canonicalize_spatial_mask(
+            mask,
+            targets.shape[1:],
+            targets.device,
+            torch.bool,
+        )
         uniform = torch.full_like(targets, 1.0 / targets.shape[0])
         targets = torch.where(valid.unsqueeze(0), targets, uniform)
     return targets
@@ -92,11 +118,8 @@ def compute_router_losses(
         mask,
     )
 
-    usage_mask = None
-    if mask is not None:
-        usage_mask = mask.squeeze(0) if mask.ndim == 3 else mask
     usage = torch.stack(
-        [_masked_mean(weights[index], usage_mask) for index in range(weights.shape[0])]
+        [_masked_mean(weights[index], mask) for index in range(weights.shape[0])]
     )
     floors = minimum_usage or DEFAULT_MINIMUM_USAGE
     floor_tensor = weights.new_tensor(
@@ -105,7 +128,7 @@ def compute_router_losses(
     starvation = F.relu(floor_tensor - usage).square().sum()
     entropy = _masked_mean(
         -(weights.clamp_min(1e-8) * weights.clamp_min(1e-8).log()).sum(dim=0),
-        usage_mask,
+        mask,
     )
     losses = {
         "L_router_reconstruction": reconstruction,
@@ -116,14 +139,14 @@ def compute_router_losses(
             -(targets.clamp_min(1e-8) * targets.clamp_min(1e-8).log()).sum(
                 dim=0
             ),
-            usage_mask,
+            mask,
         ).detach(),
     }
     for index, role in enumerate(EXPERT_ROLES):
         losses["router_usage_{}".format(role)] = usage[index].detach()
         losses["oracle_usage_{}".format(role)] = _masked_mean(
             targets[index],
-            usage_mask,
+            mask,
         ).detach()
     losses["L_router_total"] = (
         losses["L_router_reconstruction"]

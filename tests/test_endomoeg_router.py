@@ -145,6 +145,45 @@ def test_router_losses_penalize_starvation_without_uniform_target():
     assert losses["router_usage_contact"].item() == 0.0
 
 
+@pytest.mark.parametrize(
+    "mask_transform",
+    (
+        lambda mask: mask,
+        lambda mask: mask.unsqueeze(0),
+        lambda mask: mask.unsqueeze(-1),
+    ),
+)
+def test_router_losses_accept_supported_spatial_mask_layouts(mask_transform):
+    ground_truth = torch.zeros(3, 1, 2)
+    expert_rgb = torch.stack(
+        (
+            torch.zeros_like(ground_truth),
+            torch.full_like(ground_truth, 0.2),
+            torch.full_like(ground_truth, 0.4),
+        ),
+        dim=0,
+    )
+    weights = torch.full((3, 1, 2), 1.0 / 3.0)
+    mask = mask_transform(
+        torch.tensor(
+            (
+                (1.0, 0.0),
+            )
+        )
+    )
+
+    blended, targets, losses = compute_router_losses(
+        weights,
+        expert_rgb,
+        ground_truth,
+        mask=mask,
+    )
+
+    assert blended.shape == ground_truth.shape
+    assert targets.shape == weights.shape
+    assert all(torch.isfinite(value) for value in losses.values())
+
+
 def test_sparsify_router_weights_preserves_dense_mode():
     weights = torch.softmax(torch.randn(3, 2, 2), dim=0)
 
