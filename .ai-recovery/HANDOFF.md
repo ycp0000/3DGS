@@ -3708,3 +3708,21 @@ Claude must verify with:
 
 ### 下一步最小任务
 - Conventional Commit 提交全部目标文件并推送 `origin/main`，随后服务器按 README 的六阶段命令重新训练。
+## Update 2026-06-11 GitHub delivery
+
+### 已完成
+- 主实现提交：`592d16f feat(model): add heterogeneous residual experts`。
+- 已推送到 `origin/main`。
+- 本地与远端 `refs/heads/main` 均指向 `592d16f2f61d92e04c9757b487208d2b67172e2b`。
+
+### 当前设计决策
+- 服务器端不得复用旧 v2/v3 expert 或旧 Router bundle；必须基于当前 `main` 从 canonical stage 重新生成全套 v4/v5 bundles。
+
+### 仍需做什么
+- 用户在服务器执行 README 的 Stage 1–5（Stage 6 Joint 可选）并回传 TensorBoard 与 full-sequence metrics。
+
+### 运行过哪些测试
+- push 前最终质量门：`172 passed, 2 warnings`，compileall/diff/security 均通过。
+
+### 下一步最小任务
+- 在服务器 `git pull origin main`，删除或更换旧 bundle 输出目录，然后启动 canonical stage。
