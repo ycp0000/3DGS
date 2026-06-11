@@ -56,6 +56,85 @@ def _canonicalize_rasterized_depth(
     )
 
 
+def rasterize_endomoeg_routing_features(
+    viewpoint_camera,
+    pc,
+    pipe,
+    routing_state,
+    gaussian_logits,
+):
+    if GaussianRasterizer is None or GaussianRasterizationSettings is None:
+        raise ImportError(
+            "diff_gaussian_rasterization is required for EndoMoe routing"
+        ) from _RASTERIZER_IMPORT_ERROR
+
+    means3d = routing_state["means3d"]
+    means2d = routing_state["means2d"]
+    opacity = routing_state["opacity"]
+    scales = routing_state["scales"]
+    rotations = routing_state["rotations"]
+    covariance = routing_state["covariance"]
+    motion = routing_state["motion"]
+    if gaussian_logits.ndim == 2 and gaussian_logits.shape[1] == 1:
+        gaussian_logits = gaussian_logits[:, 0]
+    if gaussian_logits.ndim != 1:
+        raise ValueError("gaussian_logits must have shape [N] or [N, 1]")
+    if gaussian_logits.shape[0] != means3d.shape[0]:
+        raise ValueError(
+            "gaussian_logits point count does not match routing geometry"
+        )
+
+    device = means3d.device
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=torch.zeros(3, dtype=means3d.dtype, device=device),
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform.to(device),
+        projmatrix=viewpoint_camera.full_proj_transform.to(device),
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center.to(device),
+        prefiltered=False,
+        debug=pipe.debug,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=settings)
+    scene_scale = float(routing_state.get("scene_scale", 1.0) or 1.0)
+    motion_signal = motion.norm(dim=-1) / max(abs(scene_scale), 1e-6)
+    routing_features = torch.stack(
+        (
+            torch.sigmoid(gaussian_logits),
+            motion_signal.clamp(0.0, 1.0),
+            torch.ones_like(motion_signal),
+        ),
+        dim=-1,
+    )
+    feature_render, _, feature_depth = rasterizer(
+        means3D=means3d,
+        means2D=means2d,
+        shs=None,
+        colors_precomp=routing_features,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp=covariance,
+    )
+    feature_depth = _canonicalize_rasterized_depth(
+        feature_depth,
+        viewpoint_camera.image_height,
+        viewpoint_camera.image_width,
+    )
+    return {
+        "gaussian_prior": feature_render[0].clamp_min(0.0),
+        "projected_motion": feature_render[1].clamp_min(0.0),
+        "coverage": feature_render[2].clamp_min(0.0),
+        "depth": feature_depth,
+    }
+
+
 def render(
     viewpoint_camera,
     pc: GaussianModel,
@@ -65,6 +144,7 @@ def render(
     override_color=None,
     stage="fine",
     update_deformation_stats=True,
+    return_routing_state=False,
 ):
     """
     Render the scene.
@@ -180,6 +260,8 @@ def render(
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
     opacity_final = pc.opacity_activation(opacity_final)
+    routing_scales = scales_final
+    routing_rotations = rotations_final
     if pipe.compute_cov3D_python:
         cov3D_precomp = pc.covariance_activation(scales_final, scaling_modifier, rotations_final)
         scales_final = None
@@ -426,9 +508,33 @@ def render(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
-            "depth": depth,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii,
-            "deformation_aux": deformation_aux if stage != "coarse" and deformation_point.any() else {},}
+    result = {
+        "render": rendered_image,
+        "depth": depth,
+        "viewspace_points": screenspace_points,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "deformation_aux": (
+            deformation_aux
+            if stage != "coarse" and deformation_point.any()
+            else {}
+        ),
+    }
+    if return_routing_state:
+        scene_scale = getattr(
+            pc._deformation.deformation_net,
+            "scene_scale",
+            1.0,
+        )
+        result["routing_state"] = {
+            "canonical_xyz": means3D,
+            "means3d": means3D_final,
+            "means2d": screenspace_points,
+            "opacity": opacity_final,
+            "scales": None if cov3D_precomp is not None else routing_scales,
+            "rotations": None if cov3D_precomp is not None else routing_rotations,
+            "covariance": cov3D_precomp,
+            "motion": means3D_final - means3D,
+            "scene_scale": float(torch.as_tensor(scene_scale).reshape(()).item()),
+        }
+    return result

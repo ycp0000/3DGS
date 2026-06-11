@@ -220,6 +220,32 @@ class ModelHiddenParams(ParamGroup):
         self.endomoeg_joint_balance_scale = 0.05
         self.moe_router_hidden_dim = 64
         self.moe_pixel_router_hidden_dim = 32
+        self.endomoeg_pipeline_stage = ""
+        self.endomoeg_expert_role = ""
+        self.endomoeg_expert_hidden_dim = 64
+        self.endomoeg_bundle_dir = ""
+        self.endomoeg_canonical_bundle = ""
+        self.endomoeg_router_bundle = ""
+        self.endomoeg_min_expert_psnr = 0.0
+        self.endomoeg_router_gaussian_lr = 0.05
+        self.endomoeg_router_feature_lr = 0.005
+        self.endomoeg_router_pixel_lr = 0.005
+        self.endomoeg_router_oracle_temperature = 0.05
+        self.endomoeg_router_lambda_oracle = 1.0
+        self.endomoeg_router_lambda_starvation = 0.01
+        self.endomoeg_router_lambda_dssim = 0.2
+        self.endomoeg_router_sparse_start = 0.5
+        self.endomoeg_router_gradient_warmup = 20
+        self.endomoeg_joint_output_dir = ""
+        self.endomoeg_joint_router_gaussian_lr = 5e-4
+        self.endomoeg_joint_router_feature_lr = 1e-4
+        self.endomoeg_joint_router_pixel_lr = 1e-4
+        self.endomoeg_joint_global_deformation_lr = 1e-6
+        self.endomoeg_joint_refinement_lr = 5e-6
+        self.endomoeg_joint_anchor_lambda = 1e-3
+        self.endomoeg_joint_gradient_clip = 1.0
+        self.endomoeg_joint_sparse_start = 0.25
+        self.endomoeg_joint_max_psnr_drop = 0.05
 
         self.current_iteration = 0
         super().__init__(parser, "ModelHiddenParams")

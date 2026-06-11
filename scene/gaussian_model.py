@@ -11,6 +11,7 @@
 
 import torch
 import numpy as np
+from collections import OrderedDict
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
@@ -89,6 +90,221 @@ class GaussianModel:
                 "tracking_arch_version": self._deformation.deformation_net.get_tracking_arch_version(),
             },
         )
+
+    @staticmethod
+    def _cpu_tensor_copy(value):
+        if not torch.is_tensor(value):
+            return value
+        return value.detach().cpu().clone()
+
+    @classmethod
+    def _cpu_state_dict_copy(cls, state_dict):
+        return OrderedDict(
+            (name, cls._cpu_tensor_copy(value))
+            for name, value in state_dict.items()
+        )
+
+    def _state_device(self):
+        if torch.is_tensor(self._xyz) and self._xyz.numel() > 0:
+            return self._xyz.device
+        try:
+            return next(self._deformation.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def capture_canonical_state(self):
+        return {
+            "active_sh_degree": int(self.active_sh_degree),
+            "xyz": self._cpu_tensor_copy(self._xyz),
+            "features_dc": self._cpu_tensor_copy(self._features_dc),
+            "features_rest": self._cpu_tensor_copy(self._features_rest),
+            "scaling": self._cpu_tensor_copy(self._scaling),
+            "rotation": self._cpu_tensor_copy(self._rotation),
+            "opacity": self._cpu_tensor_copy(self._opacity),
+            "deformation_table": self._cpu_tensor_copy(self._deformation_table).bool(),
+            "percent_dense": float(self.percent_dense),
+            "spatial_lr_scale": float(self.spatial_lr_scale),
+        }
+
+    def restore_canonical_state(self, state, training_args=None):
+        required = (
+            "active_sh_degree",
+            "xyz",
+            "features_dc",
+            "features_rest",
+            "scaling",
+            "rotation",
+            "opacity",
+            "deformation_table",
+            "percent_dense",
+            "spatial_lr_scale",
+        )
+        missing = [name for name in required if name not in state]
+        if missing:
+            raise ValueError(
+                "Canonical Gaussian state is missing fields: {}".format(
+                    ", ".join(missing)
+                )
+            )
+
+        point_count = int(state["xyz"].shape[0])
+        point_fields = (
+            "features_dc",
+            "features_rest",
+            "scaling",
+            "rotation",
+            "opacity",
+            "deformation_table",
+        )
+        mismatched = [
+            name
+            for name in point_fields
+            if int(state[name].shape[0]) != point_count
+        ]
+        if mismatched:
+            raise ValueError(
+                "Canonical Gaussian point-count mismatch for fields: {}".format(
+                    ", ".join(mismatched)
+                )
+            )
+
+        device = self._state_device()
+
+        def parameter(name):
+            value = state[name].detach().to(device=device).clone()
+            return nn.Parameter(value.requires_grad_(True))
+
+        self.active_sh_degree = int(state["active_sh_degree"])
+        self._xyz = parameter("xyz")
+        self._features_dc = parameter("features_dc")
+        self._features_rest = parameter("features_rest")
+        self._scaling = parameter("scaling")
+        self._rotation = parameter("rotation")
+        self._opacity = parameter("opacity")
+        self._deformation_table = (
+            state["deformation_table"].detach().to(device=device).bool().clone()
+        )
+        self.percent_dense = float(state["percent_dense"])
+        self.spatial_lr_scale = float(state["spatial_lr_scale"])
+        self.max_radii2D = torch.zeros(point_count, device=device)
+        self.xyz_gradient_accum = torch.zeros((point_count, 1), device=device)
+        self.denom = torch.zeros((point_count, 1), device=device)
+        self._deformation_accum = torch.zeros((point_count, 3), device=device)
+        self.optimizer = None
+        if training_args is not None:
+            self.training_setup(training_args)
+
+    def capture_expert_state(self):
+        deformation_net = self._deformation.deformation_net
+        refinement = getattr(
+            getattr(deformation_net, "complete_expert_head", None),
+            "refinement",
+            None,
+        )
+        if refinement is not None:
+            xyz_max = refinement.xyz_max
+            xyz_min = refinement.xyz_min
+        else:
+            xyz_max = self._xyz.detach().amax(dim=0)
+            xyz_min = self._xyz.detach().amin(dim=0)
+        return {
+            "canonical": self.capture_canonical_state(),
+            "deformation": self._cpu_state_dict_copy(
+                self._deformation.state_dict()
+            ),
+            "deformation_accum": self._cpu_tensor_copy(
+                getattr(
+                    self,
+                    "_deformation_accum",
+                    torch.zeros((self._xyz.shape[0], 3)),
+                )
+            ),
+            "tracking_type": getattr(
+                deformation_net,
+                "tracking_mode",
+                "original",
+            ),
+            "tracking_arch_version": deformation_net.get_tracking_arch_version(),
+            "spatial_context": {
+                "scene_scale": float(
+                    torch.as_tensor(deformation_net.scene_scale)
+                    .detach()
+                    .cpu()
+                    .reshape(())
+                    .item()
+                ),
+                "xyz_max": self._cpu_tensor_copy(xyz_max),
+                "xyz_min": self._cpu_tensor_copy(xyz_min),
+            },
+        }
+
+    def restore_expert_state(self, state, training_args=None):
+        required = (
+            "canonical",
+            "deformation",
+            "tracking_type",
+            "tracking_arch_version",
+        )
+        missing = [name for name in required if name not in state]
+        if missing:
+            raise ValueError(
+                "Expert state is missing fields: {}".format(", ".join(missing))
+            )
+
+        deformation_net = self._deformation.deformation_net
+        current_tracking_type = getattr(
+            deformation_net,
+            "tracking_mode",
+            "original",
+        )
+        current_arch_version = deformation_net.get_tracking_arch_version()
+        if state["tracking_type"] != current_tracking_type:
+            raise ValueError(
+                "Expert state tracking_type '{}' does not match current '{}'".format(
+                    state["tracking_type"],
+                    current_tracking_type,
+                )
+            )
+        if state["tracking_arch_version"] != current_arch_version:
+            raise ValueError(
+                "Expert state architecture '{}' does not match current '{}'".format(
+                    state["tracking_arch_version"],
+                    current_arch_version,
+                )
+            )
+
+        self.restore_canonical_state(state["canonical"], training_args=None)
+        try:
+            self._deformation.load_state_dict(state["deformation"], strict=True)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Expert deformation state is incompatible with the current model"
+            ) from exc
+        deformation_accum = state.get("deformation_accum")
+        if deformation_accum is not None:
+            if int(deformation_accum.shape[0]) != int(self._xyz.shape[0]):
+                raise ValueError(
+                    "Expert deformation_accum point count does not match canonical state"
+                )
+            self._deformation_accum = deformation_accum.to(
+                device=self._xyz.device,
+                dtype=self._xyz.dtype,
+            ).clone()
+        spatial_context = state.get("spatial_context")
+        if not isinstance(spatial_context, dict):
+            raise ValueError("Expert state is missing spatial_context")
+        for field in ("scene_scale", "xyz_max", "xyz_min"):
+            if field not in spatial_context:
+                raise ValueError(
+                    "Expert spatial_context is missing field: {}".format(field)
+                )
+        self._deformation.set_scene_scale(spatial_context["scene_scale"])
+        self._deformation.set_aabb(
+            spatial_context["xyz_max"],
+            spatial_context["xyz_min"],
+        )
+        if training_args is not None:
+            self.training_setup(training_args)
 
     def restore(self, model_args, training_args):
         if isinstance(model_args[2], dict):

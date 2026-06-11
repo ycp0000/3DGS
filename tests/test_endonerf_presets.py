@@ -19,6 +19,10 @@ from arguments import (
     get_combined_args,
 )
 from models.tracking.cams_gs_tracking import CAMSGSScheduler
+from train import (
+    normalize_endomoeg_pipeline_stage,
+    validate_endomoeg_pipeline_args,
+)
 from utils.params_utils import merge_hparams
 
 ENDONERF_PRESET_DIR = ROOT / "arguments" / "endonerf"
@@ -294,34 +298,45 @@ def test_cams_gs_presets_use_known_parser_keys_and_tracking_type():
         assert candidate.max_disp_local_ratio == 0.03
 
 
-def test_endomoeg_presets_use_known_parser_keys_and_tracking_type():
+def test_endomoeg_presets_use_complete_expert_pipeline_defaults():
     for scene_name in ("cutting", "pulling"):
         baseline = _load_preset_args(f"{scene_name}_original.py")
         candidate = _load_preset_args(f"{scene_name}_endomoeg.py")
-        assert candidate.tracking_type == "cams_gs_moe"
+        assert candidate.tracking_type == "original"
+        assert candidate.endomoeg_pipeline_stage == ""
         assert candidate.extra_mark == "endonerf"
         assert candidate.coarse_iterations == baseline.coarse_iterations
         assert candidate.pruning_interval == baseline.pruning_interval
-        assert candidate.iterations == 15000
-        assert candidate.position_lr_max_steps == 15000
-        assert candidate.endomoeg_expert_global_end == 2000
-        assert candidate.endomoeg_expert_local_end == 5000
-        assert candidate.endomoeg_expert_full_end == 8000
-        assert candidate.endomoeg_router_only_end == 12000
-        assert candidate.use_pixel_routing is True
+        assert candidate.iterations == baseline.iterations
+        assert candidate.position_lr_max_steps == baseline.position_lr_max_steps
+        assert candidate.endomoeg_expert_hidden_dim == 64
         assert candidate.moe_pixel_router_hidden_dim == 32
-        assert candidate.target_usage_vis_stable == pytest.approx(0.98)
-        assert candidate.target_usage_vis_transient == pytest.approx(0.02)
-        assert candidate.target_lifecycle_persistent == pytest.approx(0.98)
-        assert candidate.lambda_visibility_occlusion == pytest.approx(0.0002)
-        assert candidate.lambda_transient_sparse == pytest.approx(0.0001)
-        target = _build_geo_target(
-            candidate,
-            ("global", "local", "full"),
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
-        assert torch.allclose(target, torch.tensor([0.35, 0.35, 0.30]), atol=1e-6)
+        assert candidate.endomoeg_router_sparse_start == pytest.approx(0.5)
+        assert candidate.endomoeg_router_gradient_warmup == 20
+        assert candidate.endomoeg_joint_anchor_lambda == pytest.approx(1e-3)
+        assert candidate.endomoeg_joint_max_psnr_drop == pytest.approx(0.05)
+
+
+def test_endomoeg_preset_preserves_cli_pipeline_stage_and_role(tmp_path):
+    args = _build_default_args()
+    args.endomoeg_pipeline_stage = "expert"
+    args.endomoeg_expert_role = "local"
+    args.endomoeg_bundle_dir = str((tmp_path / "bundles").resolve())
+    module = _load_module(ENDONERF_PRESET_DIR / "cutting_endomoeg.py")
+
+    merged = merge_hparams(
+        args,
+        {
+            "ModelParams": module.ModelParams,
+            "OptimizationParams": module.OptimizationParams,
+            "ModelHiddenParams": module.ModelHiddenParams,
+        },
+    )
+    validated = validate_endomoeg_pipeline_args(merged)
+
+    assert validated.endomoeg_pipeline_stage == "expert"
+    assert validated.endomoeg_expert_role == "local"
+    assert validated.tracking_type == "endomoeg_expert"
 
 
 def test_endomoeg_component_loading_arguments_have_safe_defaults():
@@ -330,6 +345,74 @@ def test_endomoeg_component_loading_arguments_have_safe_defaults():
     assert args.endomoeg_component_output_dir == ""
     assert args.endomoeg_strict_component_loading is True
     assert args.endomoeg_stage_iterations == -1
+
+
+def test_endomoeg_pipeline_requires_absolute_bundle_paths(tmp_path):
+    args = _build_default_args()
+    args.endomoeg_pipeline_stage = "expert"
+    args.endomoeg_expert_role = "local"
+    args.endomoeg_bundle_dir = "relative/bundles"
+
+    with pytest.raises(ValueError, match="absolute"):
+        validate_endomoeg_pipeline_args(args)
+
+    args.endomoeg_bundle_dir = str(tmp_path.resolve())
+    validated = validate_endomoeg_pipeline_args(args)
+
+    assert validated.tracking_type == "endomoeg_expert"
+    assert validated.endomoeg_expert_role == "local"
+    assert validated.endomoeg_canonical_bundle == str(
+        (tmp_path / "canonical.pth").resolve()
+    )
+
+
+def test_endomoeg_pipeline_rejects_unknown_stage_and_role(tmp_path):
+    with pytest.raises(ValueError, match="Unsupported"):
+        normalize_endomoeg_pipeline_stage("continuous")
+
+    args = _build_default_args()
+    args.endomoeg_pipeline_stage = "expert"
+    args.endomoeg_expert_role = "unknown"
+    args.endomoeg_bundle_dir = str(tmp_path.resolve())
+    with pytest.raises(ValueError, match="expert_role"):
+        validate_endomoeg_pipeline_args(args)
+
+
+def test_endomoeg_joint_uses_separate_absolute_output_directory(tmp_path):
+    bundle_dir = (tmp_path / "bundles").resolve()
+    args = _build_default_args()
+    args.endomoeg_pipeline_stage = "joint"
+    args.endomoeg_bundle_dir = str(bundle_dir)
+    args.endomoeg_min_expert_psnr = 35.0
+
+    validated = validate_endomoeg_pipeline_args(args)
+
+    assert validated.tracking_type == "original"
+    assert validated.endomoeg_joint_output_dir == str(
+        (bundle_dir / "joint").resolve()
+    )
+
+    overwrite_args = _build_default_args()
+    overwrite_args.endomoeg_pipeline_stage = "joint"
+    overwrite_args.endomoeg_bundle_dir = str(bundle_dir)
+    overwrite_args.endomoeg_joint_output_dir = str(bundle_dir)
+    overwrite_args.endomoeg_min_expert_psnr = 35.0
+    with pytest.raises(ValueError, match="must not overwrite"):
+        validate_endomoeg_pipeline_args(overwrite_args)
+
+    relative_router_args = _build_default_args()
+    relative_router_args.endomoeg_pipeline_stage = "joint"
+    relative_router_args.endomoeg_bundle_dir = str(bundle_dir)
+    relative_router_args.endomoeg_router_bundle = "relative/router.pth"
+    relative_router_args.endomoeg_min_expert_psnr = 35.0
+    with pytest.raises(ValueError, match="router_bundle"):
+        validate_endomoeg_pipeline_args(relative_router_args)
+
+    missing_gate_args = _build_default_args()
+    missing_gate_args.endomoeg_pipeline_stage = "router"
+    missing_gate_args.endomoeg_bundle_dir = str(bundle_dir)
+    with pytest.raises(ValueError, match="positive"):
+        validate_endomoeg_pipeline_args(missing_gate_args)
 
 
 def test_cams_gs_early_phases_preset_has_explicit_stage_boundaries():

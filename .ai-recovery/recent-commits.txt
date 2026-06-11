@@ -1,0 +1,5 @@
+fa57e61 fix(config): add missing tracking loss weights to CAMS-GS presets
+d8d0c3f docs(readme): add plan compliance and run commands
+96d412f feat(tracking): implement plan.md compliance
+c298928 feat(model): add CAMS pixel routing and CPU smoke path
+c8566e0 @ fix(model): use local motion caps for cams-gs and add short-budget phase preset

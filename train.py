@@ -39,6 +39,15 @@ from utils.eval_utils import select_fixed_views
 from utils.scene_utils import render_training_image
 from utils.temporal_utils import nearest_adjacent_time, sorted_unique_times
 from time import time
+from models.endomoeg import (
+    EXPERT_ROLES,
+    build_canonical_bundle,
+    build_expert_bundle,
+    load_canonical_bundle,
+    save_bundle,
+)
+from models.endomoeg.router_training import train_frozen_router
+from models.endomoeg.joint_training import train_controlled_joint
 from models.tracking.cams_gs_moe_tracking import required_endomoeg_components
 from scene.tracking_losses import compute_tracking_losses
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
@@ -67,6 +76,106 @@ def validate_training_source_args(args):
             )
 
     return args
+
+
+def normalize_endomoeg_pipeline_stage(value):
+    stage = str(value or "").strip().lower()
+    if stage not in {"", "canonical", "expert", "router", "joint"}:
+        raise ValueError("Unsupported EndoMoe pipeline stage: {}".format(value))
+    return stage
+
+
+def validate_endomoeg_pipeline_args(args):
+    stage = normalize_endomoeg_pipeline_stage(
+        getattr(args, "endomoeg_pipeline_stage", "")
+    )
+    args.endomoeg_pipeline_stage = stage
+    if not stage:
+        return args
+
+    bundle_dir = str(getattr(args, "endomoeg_bundle_dir", "") or "")
+    if not bundle_dir:
+        raise ValueError(
+            "endomoeg_bundle_dir is required for EndoMoe pipeline stages"
+        )
+    if not os.path.isabs(bundle_dir):
+        raise ValueError("endomoeg_bundle_dir must be an absolute path")
+    args.endomoeg_bundle_dir = os.path.abspath(bundle_dir)
+
+    if stage == "canonical":
+        args.tracking_type = "original"
+        return args
+
+    if stage == "expert":
+        role = str(getattr(args, "endomoeg_expert_role", "") or "").lower()
+        if role not in EXPERT_ROLES:
+            raise ValueError(
+                "endomoeg_expert_role must be one of: {}".format(
+                    ", ".join(EXPERT_ROLES)
+                )
+            )
+        canonical_path = str(
+            getattr(args, "endomoeg_canonical_bundle", "") or ""
+        )
+        if not canonical_path:
+            canonical_path = os.path.join(
+                args.endomoeg_bundle_dir,
+                "canonical.pth",
+            )
+        if not os.path.isabs(canonical_path):
+            raise ValueError("endomoeg_canonical_bundle must be an absolute path")
+        args.endomoeg_canonical_bundle = os.path.abspath(canonical_path)
+        args.endomoeg_expert_role = role
+        args.tracking_type = "endomoeg_expert"
+        return args
+
+    if stage in {"router", "joint"}:
+        minimum_expert_psnr = float(
+            getattr(args, "endomoeg_min_expert_psnr", 0.0)
+        )
+        if not np.isfinite(minimum_expert_psnr) or minimum_expert_psnr <= 0.0:
+            raise ValueError(
+                "Router/Joint stages require a positive "
+                "endomoeg_min_expert_psnr quality gate"
+            )
+        router_bundle = str(
+            getattr(args, "endomoeg_router_bundle", "") or ""
+        )
+        if router_bundle and not os.path.isabs(router_bundle):
+            raise ValueError("endomoeg_router_bundle must be an absolute path")
+        if router_bundle:
+            args.endomoeg_router_bundle = os.path.abspath(router_bundle)
+        if stage == "joint":
+            joint_output_dir = str(
+                getattr(args, "endomoeg_joint_output_dir", "") or ""
+            )
+            if not joint_output_dir:
+                joint_output_dir = os.path.join(
+                    args.endomoeg_bundle_dir,
+                    "joint",
+                )
+            if not os.path.isabs(joint_output_dir):
+                raise ValueError(
+                    "endomoeg_joint_output_dir must be an absolute path"
+                )
+            joint_output_dir = os.path.abspath(joint_output_dir)
+            if joint_output_dir == args.endomoeg_bundle_dir:
+                raise ValueError(
+                    "Joint output directory must not overwrite Stage 2/3 bundles"
+                )
+            args.endomoeg_joint_output_dir = joint_output_dir
+        args.tracking_type = "original"
+    return args
+
+
+def endomoeg_bundle_config(dataset, hyper, opt):
+    return {
+        "model_params": dict(vars(dataset)),
+        "hidden_params": dict(vars(hyper)),
+        "optimization_params": dict(vars(opt)),
+        "source_path": os.path.abspath(dataset.source_path),
+        "model_path": os.path.abspath(dataset.model_path),
+    }
 
 
 def should_reset_opacity(stage, iteration, opt, dataset):
@@ -160,6 +269,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     )
     previous_tracking_phase_name = None
     final_tracking_phase_name = None
+    latest_validation_metrics = {}
     
     for iteration in range(first_iter, final_iter+1):
         hyper.current_iteration = iteration
@@ -559,7 +669,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # Log and save
             timer.pause()
-            training_report(
+            validation_metrics = training_report(
                 tb_writer,
                 iteration,
                 Ll1,
@@ -574,6 +684,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 tracking_metrics,
                 lpips_model,
             )
+            if validation_metrics:
+                latest_validation_metrics = validation_metrics
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
@@ -628,16 +740,148 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             final_tracking_phase_name,
             getattr(hyper, "endomoeg_component_output_dir", ""),
         )
+    return latest_validation_metrics
 
 def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, expname, extra_mark):
     # first_iter = 0
     tb_writer = prepare_output_and_logger(expname)
 
-    gaussians = GaussianModel(dataset.sh_degree, hyper)
     dataset.model_path = args.model_path
+    pipeline_stage = normalize_endomoeg_pipeline_stage(
+        getattr(hyper, "endomoeg_pipeline_stage", "")
+    )
+    if pipeline_stage in {"router", "joint"}:
+        gaussians = None
+        scene = Scene(
+            dataset,
+            gaussians,
+            load_coarse=None,
+            initialize_gaussians=False,
+        )
+    else:
+        gaussians = GaussianModel(dataset.sh_degree, hyper)
+        scene = Scene(dataset, gaussians, load_coarse=None)
     timer = Timer()
-    scene = Scene(dataset, gaussians, load_coarse=None)
     timer.start()
+
+    bundle_dir = str(getattr(hyper, "endomoeg_bundle_dir", "") or "")
+
+    if pipeline_stage == "canonical":
+        scene_reconstruction(
+            dataset,
+            opt,
+            hyper,
+            pipe,
+            testing_iterations,
+            saving_iterations,
+            checkpoint_iterations,
+            checkpoint,
+            debug_from,
+            gaussians,
+            scene,
+            "coarse",
+            tb_writer,
+            opt.coarse_iterations,
+            timer,
+        )
+        canonical_payload = build_canonical_bundle(
+            gaussians,
+            iteration=opt.coarse_iterations,
+            config=endomoeg_bundle_config(dataset, hyper, opt),
+        )
+        canonical_path = save_bundle(
+            os.path.join(bundle_dir, "canonical.pth"),
+            canonical_payload,
+        )
+        print("[EndoMoe] Saved canonical bundle to {}".format(canonical_path))
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
+        return
+
+    if pipeline_stage == "expert":
+        canonical_payload = load_canonical_bundle(
+            getattr(hyper, "endomoeg_canonical_bundle"),
+            map_location="cpu",
+        )
+        gaussians.restore_canonical_state(
+            canonical_payload["canonical_state"],
+            training_args=None,
+        )
+        role = getattr(hyper, "endomoeg_expert_role")
+        validation_metrics = scene_reconstruction(
+            dataset,
+            opt,
+            hyper,
+            pipe,
+            testing_iterations,
+            saving_iterations,
+            checkpoint_iterations,
+            checkpoint,
+            debug_from,
+            gaussians,
+            scene,
+            "fine",
+            tb_writer,
+            opt.iterations,
+            timer,
+        )
+        test_metrics = validation_metrics.get("test", {})
+        if "psnr" not in test_metrics:
+            raise RuntimeError(
+                "Final fixed-view test PSNR is required before saving an expert bundle"
+            )
+        expert_payload = build_expert_bundle(
+            gaussians,
+            role=role,
+            source_canonical_fingerprint=canonical_payload[
+                "canonical_fingerprint"
+            ],
+            iteration=opt.iterations,
+            config=endomoeg_bundle_config(dataset, hyper, opt),
+            validation_metrics=test_metrics,
+        )
+        expert_path = save_bundle(
+            os.path.join(bundle_dir, "{}.pth".format(role)),
+            expert_payload,
+        )
+        print("[EndoMoe] Saved {} expert bundle to {}".format(role, expert_path))
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
+        return
+
+    if pipeline_stage == "router":
+        train_frozen_router(
+            dataset,
+            hyper,
+            opt,
+            pipe,
+            scene,
+            testing_iterations,
+            tb_writer,
+            config=endomoeg_bundle_config(dataset, hyper, opt),
+        )
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
+        return
+
+    if pipeline_stage == "joint":
+        train_controlled_joint(
+            dataset,
+            hyper,
+            opt,
+            pipe,
+            scene,
+            testing_iterations,
+            tb_writer,
+            config=endomoeg_bundle_config(dataset, hyper, opt),
+        )
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
+        return
 
     # Coarse stage: static reconstruction
     scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations,
@@ -744,12 +988,13 @@ def training_report(
                 )
 
     if iteration not in testing_iterations:
-        return
+        return None
 
     validation_configs = (
         ("test", select_fixed_views(scene.getTestCameras(), count=4)),
         ("train", select_fixed_views(scene.getTrainCameras(), count=4)),
     )
+    validation_results = {}
     device = scene.gaussians.get_xyz.device
     with torch.no_grad():
         for split_name, cameras in validation_configs:
@@ -806,6 +1051,7 @@ def training_report(
                 name: value / view_count
                 for name, value in metric_totals.items()
             }
+            validation_results[split_name] = averaged_metrics
             print(
                 f"\n[ITER {iteration}] Evaluating {split_name}: "
                 f"L1 {averaged_metrics['l1']:.6f} "
@@ -836,6 +1082,7 @@ def training_report(
                 ),
                 iteration,
             )
+    return validation_results
 
 def setup_seed(seed):
      torch.manual_seed(seed)
@@ -868,7 +1115,6 @@ if __name__ == "__main__":
     parser.add_argument("--expname", type=str, default = "")
     parser.add_argument("--configs", type=str, default = "")
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
     if args.configs:
         import mmcv
         from utils.params_utils import merge_hparams
@@ -877,7 +1123,10 @@ if __name__ == "__main__":
     if int(getattr(args, "endomoeg_stage_iterations", -1)) > 0:
         args.iterations = int(args.endomoeg_stage_iterations)
         args.position_lr_max_steps = int(args.endomoeg_stage_iterations)
+    args.test_iterations = sorted(set(args.test_iterations + [args.iterations]))
+    args.save_iterations = sorted(set(args.save_iterations + [args.iterations]))
     args = validate_training_source_args(args)
+    args = validate_endomoeg_pipeline_args(args)
     print(f"Training source_path: {args.source_path}")
     print(f"Training extra_mark: {getattr(args, 'extra_mark', None)}")
     print("Optimizing " + args.model_path)

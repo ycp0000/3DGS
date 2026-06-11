@@ -36,7 +36,16 @@ class Scene:
 
     gaussians: GaussianModel
 
-    def __init__(self, args: ModelParams, gaussians: GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], load_coarse=False):
+    def __init__(
+        self,
+        args: ModelParams,
+        gaussians: GaussianModel,
+        load_iteration=None,
+        shuffle=True,
+        resolution_scales=[1.0],
+        load_coarse=False,
+        initialize_gaussians=True,
+    ):
         from scene.dataset import FourDGSdataset
         from scene.dataset_readers import sceneLoadTypeCallbacks
         """b
@@ -133,7 +142,8 @@ class Scene:
         print("args.camera_extent is ", arg_extent)
         print("deformation_scale is ", deformation_scale)
 
-        self.gaussians._deformation.set_scene_scale(deformation_scale)
+        if self.gaussians is not None:
+            self.gaussians._deformation.set_scene_scale(deformation_scale)
 
 
 
@@ -152,8 +162,15 @@ class Scene:
             xyz_max = torch.from_numpy(xyz_max) if isinstance(xyz_max, np.ndarray) else torch.as_tensor(xyz_max)
         if not isinstance(xyz_min, torch.Tensor):
             xyz_min = torch.from_numpy(xyz_min) if isinstance(xyz_min, np.ndarray) else torch.as_tensor(xyz_min)
-        self.gaussians._deformation.set_aabb(xyz_max, xyz_min)
+        if self.gaussians is not None:
+            self.gaussians._deformation.set_aabb(xyz_max, xyz_min)
 
+        if initialize_gaussians and self.gaussians is None:
+            raise ValueError(
+                "Scene requires a GaussianModel when initialize_gaussians=True"
+            )
+        if not initialize_gaussians:
+            return
         if self.loaded_iter:
             self.gaussians.load_ply(os.path.join(self.model_path,
                                                            "point_cloud",

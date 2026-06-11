@@ -1,0 +1,11 @@
+.ai-recovery/HANDOFF.md
+.ai-recovery/branch.txt
+.ai-recovery/changed-files.txt
+.ai-recovery/diffstat.txt
+.ai-recovery/project-file-snapshot.txt
+.ai-recovery/recent-commits.txt
+.ai-recovery/status.txt
+.ai-recovery/untracked-files.txt
+.ai-recovery/wip.patch
+.claude/logs/session-20260602-f20cb3c6.md
+.claude/logs/session-20260602-f49f4358.md

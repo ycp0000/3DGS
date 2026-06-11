@@ -3067,6 +3067,60 @@ def test_renderer_canonicalizes_legacy_replicated_depth(monkeypatch):
     assert torch.allclose(canonical, depth)
 
 
+def test_endomoeg_routing_feature_splat_propagates_router_gradients(monkeypatch):
+    class _FakeRasterizer:
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            height = self.raster_settings.kwargs["image_height"]
+            width = self.raster_settings.kwargs["image_width"]
+            features = kwargs["colors_precomp"].mean(dim=0).view(3, 1, 1)
+            return (
+                features.expand(3, height, width),
+                torch.ones(kwargs["means3D"].shape[0]),
+                torch.ones(1, height, width),
+            )
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+    camera = SimpleNamespace(
+        FoVx=1.0,
+        FoVy=1.0,
+        image_height=2,
+        image_width=3,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+    )
+    routing_state = {
+        "means3d": torch.randn(4, 3),
+        "means2d": torch.zeros(4, 3),
+        "opacity": torch.ones(4, 1),
+        "scales": torch.ones(4, 3),
+        "rotations": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(4, 1),
+        "covariance": None,
+        "motion": torch.randn(4, 3) * 0.1,
+        "scene_scale": 10.0,
+    }
+    gaussian_logits = torch.zeros(4, requires_grad=True)
+    outputs = renderer.rasterize_endomoeg_routing_features(
+        camera,
+        SimpleNamespace(active_sh_degree=0),
+        SimpleNamespace(debug=False),
+        routing_state,
+        gaussian_logits,
+    )
+
+    assert outputs["gaussian_prior"].shape == (2, 3)
+    assert outputs["projected_motion"].shape == (2, 3)
+    assert outputs["coverage"].shape == (2, 3)
+    assert outputs["depth"].shape == (1, 2, 3)
+
+    outputs["gaussian_prior"].mean().backward()
+    assert gaussian_logits.grad is not None
+    assert torch.count_nonzero(gaussian_logits.grad).item() > 0
+
+
 def test_cams_visibility_head_exposes_render_affecting_controls():
     head = model = CAMSGSTracking(time_feature_dim=8).visibility
     phase = TrackingPhase(

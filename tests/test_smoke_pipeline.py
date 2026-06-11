@@ -37,7 +37,7 @@ def test_render_module_uses_cpu_background_when_cuda_unavailable(monkeypatch):
         def __call__(self, **kwargs):
             type(self).last_kwargs = kwargs
             count = kwargs["means3D"].shape[0]
-            return torch.zeros(1, 1, 1), torch.ones(count), torch.zeros(1, 1)
+            return torch.zeros(1, 2, 2), torch.ones(count), torch.zeros(2, 2)
 
     raster_module = ModuleType("diff_gaussian_rasterization")
 
@@ -94,7 +94,8 @@ def test_render_module_uses_cpu_background_when_cuda_unavailable(monkeypatch):
     pipe = SimpleNamespace(compute_cov3D_python=False, convert_SHs_python=False, debug=False)
     outputs = renderer.render(camera, point_cloud, pipe, torch.zeros(3), override_color=torch.zeros(1, 3), stage="fine")
 
-    assert outputs["render"].shape == (1, 1, 1)
+    assert outputs["render"].shape == (1, 2, 2)
+    assert outputs["depth"].shape == (1, 2, 2)
     assert _FakeRasterizer.last_kwargs["means3D"].device.type == "cpu"
 
 

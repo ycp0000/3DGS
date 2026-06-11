@@ -1,208 +1,89 @@
 # EndoMoeGaussian
 
-EndoMoeGaussian extends **EndoGaussian / CAMS-GS** with an endoscopy-adapted Mixture-of-Experts dynamic fitting stage. The current forward-looking experimental path is:
+EndoMoeGaussian is an endoscopy-adapted dynamic Gaussian Splatting system built on EndoGaussian. Its primary method follows the MoE-GS training principle that every expert must first become a complete scene reconstructor before a separate Router learns how to combine them.
 
-- `tracking_type='cams_gs_moe'`
+The old single-model `cams_gs_moe` continuous curriculum remains only as a historical ablation. The recommended implementation uses complete, independently optimized experts and versioned identity-safe bundles.
 
-The codebase still keeps earlier tracking paths for controlled comparison, especially `tracking_type='cams_gs'` as the direct non-MoE baseline.
+## Method
 
-## Current EndoMoeGaussian v4 architecture
+### Stage 1: static canonical reconstruction
 
-The current implementation was rebuilt on 2026-06-10 around the following contracts:
+- Runs the EndoGaussian coarse/static reconstruction.
+- Saves `canonical.pth`.
+- The canonical fingerprint is shared by all subsequent experts.
 
-1. **Identity-safe EndoGaussian shared base**
-   - restores the HexPlane dynamic function class
-   - zero-initialized output heads preserve the static coarse reconstruction at fine step 1
-2. **Three heterogeneous residual experts**
-   - `global`: low-frequency global motion
-   - `local`: spatial-temporal non-rigid tissue motion
-   - `full`: tool/contact geometry, appearance, visibility, and lifecycle
-3. **Dual routing**
-   - scene-scale-normalized Gaussian prior router with dense warm-up and soft top-2 routing
-   - trainable pixel-space router over expert RGB/depth/coverage/projected-motion maps
-4. **Independent component training**
-   - separate `shared_base`, `global`, `local`, `full`, and `router` checkpoints
-   - strict architecture metadata checks (`endomoeg_v4`)
-5. **Endoscopy-safe visibility**
-   - transient appearance, view-dependent visibility, and lifecycle persistence use separate probabilities
-   - opacity gates are applied once in the expert proposal, preventing black-frame double gating
-6. **Real temporal and spatial supervision**
-   - same-camera adjacent-timestamp deformation queries
-   - sampled chunked KNN motion coherence normalized by scene scale
-7. **Engineering diagnostics**
-   - fixed-view train/test PSNR, SSIM, LPIPS
-   - Gaussian/pixel routing coverage and entropy
-   - per-optimizer-group LR, gradient norm, and gradient coverage
+### Stage 2: three complete dynamic experts
 
-The main presets are:
+Every expert owns an independent:
 
-- `arguments/endonerf/cutting_endomoeg.py`
-- `arguments/endonerf/pulling_endomoeg.py`
+- `GaussianModel`
+- canonical Gaussian cloud and topology
+- appearance parameters
+- HexPlane deformation field
+- optimizer trajectory and densification history
 
-They use 1000 coarse iterations and 15000 fine iterations with absolute EndoMoe stage boundaries at 2000/5000/8000/12000.
+The roles are:
 
-**Historical Update (2026-06-03): EndoMoeGaussian Full Engineering Path**
+- `global`: complete EndoGaussian deformation backbone for stable full-scene motion.
+- `local`: complete backbone plus a tissue-local refinement field for non-rigid local deformation.
+- `contact`: complete backbone plus tool-contact, visibility, lifecycle, and appearance refinement.
 
-The dynamic stage now supports a complete EndoMoeGaussian path:
+All three experts start from the same Stage 1 canonical bundle, but they are trained and saved independently as `global.pth`, `local.pth`, and `contact.pth`.
 
-1. **Identity dynamic base for fine stage**: `cams_gs` and `cams_gs_moe` start dynamic fitting from the static canonical Gaussian state instead of the original random deformation backbone, preventing the fine-stage PSNR collapse observed when the old dynamic MLP disturbed the static reconstruction.
-2. **Three independent geometry experts**:
-   - `E_global`: global low-amplitude motion expert
-   - `E_local`: local / cut-aware motion expert
-   - `E_full`: full geometry + visibility / lifecycle expert
-3. **Gaussian-level MoE router**:
-   - routes each Gaussian using time features, normalized 3D position, opacity, and expert motion magnitudes
-   - supports expert-forced stages, router-only training, and joint finetuning
-4. **Endoscopy-specific stabilization**:
-   - absolute EndoNeRF paths
-   - `extra_mark='endonerf'`
-   - tensor-safe AABB handling
-   - active-geo masking and motion magnitude regularization
-   - view-dependent visibility features
+### Stage 3: frozen volume-aware Router
 
-The recommended EndoMoeGaussian presets are:
+All experts are frozen. The Router alone is optimized using:
 
-- `arguments/endonerf/cutting_endomoeg.py`
-- `arguments/endonerf/pulling_endomoeg.py`
+- per-Gaussian learnable logits for each independent expert topology
+- shared Gaussian features from position, motion, view direction, opacity, scale, time, and role embedding
+- differentiable volumetric feature splatting
+- a pixel-space residual Router
+- oracle-error distillation from detached per-expert reconstruction errors
+- anti-starvation minimum-usage regularization
+- dense routing followed by soft top-2 inference
 
-**Historical Update (2026-06-02): MoE Training Stability Fixes**
+The training loop fails immediately if Gaussian logits, Gaussian feature MLP, or pixel Router receive no gradient.
 
-Three critical fixes for MoE stage-wise training have been implemented:
+### Optional Stage 4: controlled joint fine-tuning
 
-1. **Active_geo masking** (fb12b44): Phase-aware expert activation control
-   - Enables three-stage MoE training (E_global → E_local → E_full)
-   - Dual-layer masking in router (`_build_geo_probabilities`) and motion blending
-   - Fallback to global-only when weights sum to zero
-   - Fixes training collapse where PSNR dropped from 24.97 to 9.47
+This is a conservative fourth stage, not a requirement of the main method:
 
-2. **Motion magnitude regularization** (0a5f77e): Prevents motion field saturation
-   - L_motion_mag loss with separate weights for global/local/cut_graph
-   - Default: `lambda_motion_mag_global=1e-4`, `lambda_motion_mag_local=2e-5`
-   - Exposed via tensorboard: `global_motion_magnitude`, `local_motion_magnitude`, `cut_graph_motion_magnitude`
+- canonical geometry, appearance, opacity, scale, rotation, and topology remain frozen
+- the Router uses small learning rates
+- the global expert may update its deformation field at a very low learning rate
+- local/contact experts may update only their role-specific refinement modules
+- parameter-anchor loss and gradient clipping constrain drift
+- the result is saved only if the Router and every individual expert pass fixed-view PSNR non-degradation gates
 
-3. **Norm calculation timing fix** (fbb200d): Critical correctness fix
-   - Moved norm computation AFTER masking (was before)
-   - Ensures loss reflects actual applied motion, not raw expert deltas
-   - When `active_geo=1`, inactive expert norms now correctly equal 0
+Stage 4 writes a new assembly directory and never overwrites Stage 2/3 bundles.
 
-These older fixes are retained for comparison, but the v4 architecture above is the current experimental path.
+## Identity and safety contracts
 
-**Previous Update (plan.md Strict Compliance)**: The implementation now strictly conforms to the original `plan.md` specification:
+Bundle format version 2 binds:
 
-- **View-dependent visibility routing**: visibility router receives view direction, camera depth, and screen projection coordinates from the camera, instead of only spatial/temporal features
-- **Geometry-visibility decoupling**: visibility router no longer depends on `scaffold_weights` or `cut_gate_values` from the geometry routing path
-- **kNN spatial smoothness loss** (`L_geo_spatial`): penalizes motion discrepancies between spatially nearby Gaussians using k-nearest-neighbor graph; activated via `--lambda_geo_spatial 0.01`
-- **Camera parameter propagation**: camera information flows from `gaussian_renderer` through `scene/deformation.py` to `models/tracking/cams_gs_tracking.py` and into the visibility module
+- absolute dataset path
+- source canonical fingerprint
+- complete expert-state fingerprint
+- canonical topology fingerprint
+- point count
+- tracking architecture version
+- fixed-view validation metrics
+- Router architecture and exact expert manifest
 
-Supported tracking modes in the codebase are:
+The complete expert-state fingerprint includes deformation weights and spatial context. A same-topology expert with different dynamic weights is rejected.
 
-- `tracking_type='original'`: original deformation path
-- `tracking_type='split'`: split-head intermediate path
-- `tracking_type='heterogeneous_moe'`: older residual heterogeneous MoE path
-- `tracking_type='cams_gs'`: current Cut-Aware Motion Scaffold Gaussian Splatting path
-- `tracking_type='cams_gs_moe'`: EndoMoeGaussian v4 with a shared HexPlane base, heterogeneous residual experts, Gaussian soft top-2 routing, and trainable pixel routing
+Other enforced contracts:
 
-A detailed implementation note for the current CAMS-GS path is in [CAMS_GS_ARCHITECTURE.md](CAMS_GS_ARCHITECTURE.md).
+- EndoNeRF paths must be absolute.
+- EndoNeRF scenes require `poses_bounds.npy`.
+- Presets set `extra_mark='endonerf'`.
+- NumPy/Torch AABB boundaries are converted explicitly.
+- Router and Joint use camera-only `Scene` objects; they never initialize a dummy Gaussian cloud.
+- Public depth remains single-channel `[1, H, W]`.
 
-## What CAMS-GS implements now
-
-The current CAMS-GS path replaces the old per-Gaussian MoE story with a structured tracking design built around:
-
-- a **staged curriculum** from global motion to joint refinement
-- a **cut-aware scaffold gate** over `global / local / cut_graph` geometry experts
-- a **real 3-branch geometry composition** for translation updates
-- a **visibility / appearance head** with view-dependent features (view direction, camera depth, screen projection) that affects opacity and rendered color
-- a **lifecycle head** that affects opacity persistence in late training
-- **kNN spatial smoothness regularization** (`L_geo_spatial`) to encourage coherent motion among nearby Gaussians
-- phase-aware optimizer gating through named tracking parameter groups
-- checkpoint metadata validation for architecture-safe restore/load
-- adjacent-time temporal regularization from the current batch
-
-The current CAMS-GS implementation is not just an aux-logging branch: the geometry routing, visibility gating, lifecycle gating, and appearance modulation now affect the actual forward/render path.
-
-## High-level CAMS-GS data flow
-
-At a high level, `tracking_type='cams_gs'` runs as follows:
-
-1. `scene/deformation.py` computes the original backbone dynamic deformation state.
-2. The CAMS head receives the **backbone-updated** Gaussian state, time features, and camera parameters.
-3. `CutGraphGating` predicts scaffold weights and cut-aware gate values.
-4. `CAMSGSTracking` converts those into a 3-way geometry routing distribution `pi_geo` over:
-   - `global`
-   - `local`
-   - `cut_graph`
-5. `MotionDecomposition` predicts three bounded motion branches and composes them with `pi_geo`.
-6. `VisibilityAppearanceHead` predicts:
-   - `pi_vis`
-   - `visibility_alpha`
-   - `appearance_rgb_delta`
-   - using **view-dependent features**: view direction, camera depth, screen projection
-   - without direct dependence on geometry routing logits/gates
-7. `GaussianLifecycleHead` predicts:
-   - `lifecycle_probs`
-   - `lifecycle_alpha`
-8. The CAMS head returns updated geometry / scale / rotation / opacity logits and aux statistics.
-9. `gaussian_renderer/__init__.py` uses CAMS outputs during rendering:
-   - opacity is already gated inside `models/tracking/cams_gs_tracking.py` through visibility and lifecycle
-   - precomputed RGB is modulated by `appearance_rgb_delta`
-
-## Current training curriculum
-
-`models/tracking/cams_gs_tracking.py` defines the staged curriculum through `CAMSGSScheduler`.
-
-The current schedule is:
-
-1. `global_only`
-   - train the backbone time path and global motion branch
-   - visibility off
-2. `graph_bootstrap`
-   - activate cut-graph scaffold learning
-   - visibility off
-3. `local_motion_only`
-   - activate local and cut-graph motion refinement
-   - visibility off
-4. `motion_warmup`
-   - continue motion refinement before visibility is enabled
-   - visibility off
-5. `visibility_refine`
-   - enable visibility and appearance learning
-   - lifecycle still off
-6. `joint_finetune`
-   - enable lifecycle together with full CAMS-GS refinement
-
-This schedule matters because it prevents early appearance/lifecycle noise from dominating before geometry routing has stabilized.
-
-## Current EndoNeRF presets
-
-The current EndoMoeGaussian EndoNeRF presets are:
-
-- `arguments/endonerf/cutting_endomoeg.py`
-- `arguments/endonerf/pulling_endomoeg.py`
-
-The CAMS-GS baseline EndoNeRF presets are:
-
-- `arguments/endonerf/cutting_cams_gs.py`
-- `arguments/endonerf/pulling_cams_gs.py`
-
-These currently use:
-
-- `tracking_type='cams_gs_moe'` for EndoMoeGaussian, or `tracking_type='cams_gs'` for the non-MoE baseline
-- `iterations=15000`
-- `coarse_iterations=1000`
-- `position_lr_max_steps=15000`
-- `pruning_interval=3000`
-- `camera_extent=10`
-- EndoNeRF-style k-plane settings
-- pixel routing enabled
-- conservative 98/2 stable/transient and lifecycle identity priors
-
-## Environment setup
-
-Follow the original dependency stack first.
+## Environment
 
 ```bash
-git clone https://github.com/ycp0000/3DGS.git
-cd 3DGS
 git submodule update --init --recursive
 conda create -n endomoe python=3.7 -y
 conda activate endomoe
@@ -211,542 +92,310 @@ pip install -e submodules/depth-diff-gaussian-rasterization
 pip install -e submodules/simple-knn
 ```
 
-This project has been used with the original 3DGS / 4DGaussians-style environment, including PyTorch 1.13.1 + CUDA 11.6 in the earlier setup.
+The current implementation retains Python 3.7 syntax compatibility checks.
 
-## Dataset setup
+## Dataset
 
-For EndoNeRF-style scenes, use an absolute dataset path and keep the expected EndoNeRF files in that directory. For example, use `/root/3DGS/data/endonerf/cutting_tissues_twice`; do not omit the leading `/`.
+Use an absolute EndoNeRF scene path:
+
+```text
+/root/3DGS/data/endonerf/cutting
+```
 
 The scene directory must contain:
 
-- `poses_bounds.npy`
-
-The config must use:
-
-- `extra_mark='endonerf'`
-- `camera_extent=10`
-
-Without `extra_mark='endonerf'`, the loader will not enter the EndoNeRF branch and may fail with `Could not recognize scene type!`.
-
-The EndoNeRF presets in `arguments/endonerf/` already set these values.
-
-## Recommended EndoMoeGaussian workflow
-
-Start with the static-to-dynamic EndoMoeGaussian path after verifying the original and CAMS-GS baselines.
-
-### 1. Run EndoMoeGaussian on cutting
-
-```bash
-python train.py \
-  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
-  --expname "endonerf/cutting_endomoeg" \
-  --configs arguments/endonerf/cutting_endomoeg.py
+```text
+poses_bounds.npy
 ```
 
-### 2. Run EndoMoeGaussian on pulling
+Do not use `root/3DGS/...`; the leading `/` is required.
+
+## Presets
+
+- `arguments/endonerf/cutting_endomoeg.py`
+- `arguments/endonerf/pulling_endomoeg.py`
+
+The presets are stage-neutral. Pipeline stage, expert role, bundle directory, and output directory are supplied explicitly on the command line.
+
+## Complete cutting workflow
+
+Adjust `SOURCE`, `RUN_ROOT`, and `MIN_EXPERT_PSNR` for the server. Set `MIN_EXPERT_PSNR` from the original EndoGaussian fixed-view test PSNR, allowing only a small tolerance.
 
 ```bash
-python train.py \
-  -s /root/3DGS/data/endonerf/pulling_soft_tissues \
-  --expname "endonerf/pulling_endomoeg" \
-  --configs arguments/endonerf/pulling_endomoeg.py
-```
+cd /root/3DGS
 
-If your pulling scene directory has a different name, replace only the `-s` path and keep it absolute.
-
-### 3. Optional independent component training
-
-Use a shared absolute component directory so every stage contributes to the same assembly:
-
-```bash
-COMPONENTS=/root/3DGS/output/endonerf/cutting_endomoeg_components
 SOURCE=/root/3DGS/data/endonerf/cutting
+RUN_ROOT=/root/autodl-tmp/endomoeg/cutting
+BUNDLES=$RUN_ROOT/bundles
 CONFIG=arguments/endonerf/cutting_endomoeg.py
+MIN_EXPERT_PSNR=36.8
+
+mkdir -p "$RUN_ROOT" "$BUNDLES"
 ```
 
-Train the shared base and global expert:
+### 1. Static canonical
 
 ```bash
-python train.py -s "$SOURCE" \
-  --expname "endonerf/cutting_endomoeg_global" \
+python train.py \
+  -s "$SOURCE" \
+  --model_path "$RUN_ROOT/01_canonical" \
   --configs "$CONFIG" \
-  --endomoeg_stage global \
-  --endomoeg_stage_iterations 2000 \
-  --endomoeg_component_output_dir "$COMPONENTS"
+  --endomoeg_pipeline_stage canonical \
+  --endomoeg_bundle_dir "$BUNDLES"
 ```
 
-Train local and full experts independently from the frozen shared base:
-
-```bash
-python train.py -s "$SOURCE" \
-  --expname "endonerf/cutting_endomoeg_local" \
-  --configs "$CONFIG" \
-  --endomoeg_stage local \
-  --endomoeg_stage_iterations 3000 \
-  --endomoeg_component_dir "$COMPONENTS" \
-  --endomoeg_component_output_dir "$COMPONENTS"
-
-python train.py -s "$SOURCE" \
-  --expname "endonerf/cutting_endomoeg_full" \
-  --configs "$CONFIG" \
-  --endomoeg_stage full \
-  --endomoeg_stage_iterations 3000 \
-  --endomoeg_component_dir "$COMPONENTS" \
-  --endomoeg_component_output_dir "$COMPONENTS"
-```
-
-Train the dual router with all experts frozen:
-
-```bash
-python train.py -s "$SOURCE" \
-  --expname "endonerf/cutting_endomoeg_router" \
-  --configs "$CONFIG" \
-  --endomoeg_stage router \
-  --endomoeg_stage_iterations 4000 \
-  --endomoeg_component_dir "$COMPONENTS" \
-  --endomoeg_component_output_dir "$COMPONENTS"
-```
-
-Run low-LR joint finetuning:
-
-```bash
-python train.py -s "$SOURCE" \
-  --expname "endonerf/cutting_endomoeg_joint" \
-  --configs "$CONFIG" \
-  --endomoeg_stage joint \
-  --endomoeg_stage_iterations 3000 \
-  --endomoeg_component_dir "$COMPONENTS"
-```
-
-The shared directory must contain:
+Expected bundle:
 
 ```text
-shared_base.pth
-global.pth
-local.pth
-full.pth
-router.pth
+$BUNDLES/canonical.pth
 ```
 
-Old `endomoeg_v1/v2/v3` component checkpoints are intentionally rejected.
+### 2. Global expert
 
-### 4. Monitor EndoMoeGaussian training
+```bash
+python train.py \
+  -s "$SOURCE" \
+  --model_path "$RUN_ROOT/02_global" \
+  --configs "$CONFIG" \
+  --endomoeg_pipeline_stage expert \
+  --endomoeg_expert_role global \
+  --endomoeg_bundle_dir "$BUNDLES" \
+  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth"
+```
 
-During the coarse-to-fine switch, PSNR should not fall to around 9 if the scene path and checkpoint state are correct. Watch:
+### 3. Local expert
 
-- `fine/validation/test/psnr`, `ssim`, and `lpips`
-- `tracking_phase_name`
-- `usage_geo_global/local/full` and `dense_usage_geo_global/local/full`
-- `route_coverage_geo_*` and `pixel_coverage_geo_*`
-- `route_effective_experts_geo` and `pixel_route_entropy_geo`
-- `pixel_router_residual_abs_mean/max`
-- `mean_visibility_alpha`, `mean_transient_probability`, `mean_lifecycle_persistent`
-- `temporal_pair_count`, `geo_temp_velocity`, and `geo_spatial_roughness`
-- `lr_group_*`, `grad_norm_group_*`, and `grad_coverage_group_*`
+```bash
+python train.py \
+  -s "$SOURCE" \
+  --model_path "$RUN_ROOT/03_local" \
+  --configs "$CONFIG" \
+  --endomoeg_pipeline_stage expert \
+  --endomoeg_expert_role local \
+  --endomoeg_bundle_dir "$BUNDLES" \
+  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth"
+```
 
-### 5. Render and evaluate
+### 4. Contact expert
+
+```bash
+python train.py \
+  -s "$SOURCE" \
+  --model_path "$RUN_ROOT/04_contact" \
+  --configs "$CONFIG" \
+  --endomoeg_pipeline_stage expert \
+  --endomoeg_expert_role contact \
+  --endomoeg_bundle_dir "$BUNDLES" \
+  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth"
+```
+
+Before Router training, confirm:
+
+```text
+$BUNDLES/global.pth
+$BUNDLES/local.pth
+$BUNDLES/contact.pth
+```
+
+### 5. Frozen Router
+
+```bash
+python train.py \
+  -s "$SOURCE" \
+  --model_path "$RUN_ROOT/05_router" \
+  --configs "$CONFIG" \
+  --endomoeg_pipeline_stage router \
+  --endomoeg_stage_iterations 4000 \
+  --endomoeg_bundle_dir "$BUNDLES" \
+  --endomoeg_min_expert_psnr "$MIN_EXPERT_PSNR"
+```
+
+Expected bundle:
+
+```text
+$BUNDLES/router.pth
+```
+
+### 6. Optional controlled Joint
+
+```bash
+JOINT_BUNDLES=$BUNDLES/joint
+
+python train.py \
+  -s "$SOURCE" \
+  --model_path "$RUN_ROOT/06_joint" \
+  --configs "$CONFIG" \
+  --endomoeg_pipeline_stage joint \
+  --endomoeg_stage_iterations 1000 \
+  --endomoeg_bundle_dir "$BUNDLES" \
+  --endomoeg_router_bundle "$BUNDLES/router.pth" \
+  --endomoeg_joint_output_dir "$JOINT_BUNDLES" \
+  --endomoeg_min_expert_psnr "$MIN_EXPERT_PSNR"
+```
+
+The Joint assembly is:
+
+```text
+$JOINT_BUNDLES/global.pth
+$JOINT_BUNDLES/local.pth
+$JOINT_BUNDLES/contact.pth
+$JOINT_BUNDLES/router.pth
+```
+
+## Pulling workflow
+
+Use the same commands with:
+
+```bash
+SOURCE=/root/3DGS/data/endonerf/pulling
+RUN_ROOT=/root/autodl-tmp/endomoeg/pulling
+CONFIG=arguments/endonerf/pulling_endomoeg.py
+```
+
+## TensorBoard
+
+```bash
+tensorboard --logdir /root/autodl-tmp/endomoeg --port 6006
+```
+
+Important Stage 2 metrics:
+
+- `fine/validation/test/psnr`
+- `fine/validation/test/ssim`
+- `fine/validation/test/lpips`
+- training loss and role-specific tracking statistics
+
+Important Stage 3 metrics:
+
+- `router/train/L_total`
+- `router/train/L_router_reconstruction`
+- `router/train/L_router_oracle`
+- `router/train/L_router_starvation`
+- `router/train/router_usage_global`
+- `router/train/router_usage_local`
+- `router/train/router_usage_contact`
+- `router/train/pixel_residual_abs_mean`
+- `router/gradients/grad_norm_router_gaussian_logits`
+- `router/gradients/grad_norm_router_feature_mlp`
+- `router/gradients/grad_norm_router_pixel`
+- `router/validation/test/psnr`
+
+Important Stage 4 metrics:
+
+- `joint/train/L_total`
+- `joint/train/L_anchor`
+- `joint/gradients/grad_norm_joint_expert_global`
+- `joint/gradients/grad_norm_joint_expert_local`
+- `joint/gradients/grad_norm_joint_expert_contact`
+- `joint/validation/test/psnr`
+
+Stop and inspect the run if:
+
+- an expert is below the original EndoGaussian quality level
+- any Router gradient norm is zero or non-finite
+- one expert usage remains exactly zero
+- rendered frames become black
+- PSNR shows abrupt frame-dependent drops
+
+## Render
+
+Render the Stage 3 Router:
 
 ```bash
 python render.py \
-  --model_path "output/endonerf/cutting_endomoeg" \
+  --model_path "$RUN_ROOT/05_router" \
   --skip_train \
-  --configs arguments/endonerf/cutting_endomoeg.py
+  --configs "$CONFIG"
 ```
 
-### 6. Compare against baselines
-
-```bash
-python metrics.py -m \
-  "output/endonerf/cutting_original" \
-  "output/endonerf/cutting_cams_gs" \
-  "output/endonerf/cutting_endomoeg"
-```
-
-## Recommended CAMS-GS workflow
-
-Do not judge the method from one run without comparing it against the existing baselines.
-
-### 1. Run the original baseline
-
-```bash
-python train.py \
-  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
-  --expname "endonerf/cutting_original" \
-  --configs arguments/endonerf/cutting_original.py
-```
-
-Why:
-
-- validates the scene/data setup
-- gives the baseline PSNR / SSIM / LPIPS reference
-- separates CAMS issues from dataset/setup issues
-
-### 2. Run CAMS-GS
-
-```bash
-python train.py \
-  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
-  --expname "endonerf/cutting_cams_gs" \
-  --configs arguments/endonerf/cutting_cams_gs.py
-```
-
-For pulling scenes, switch to:
-
-```bash
-python train.py \
-  -s /root/3DGS/data/endonerf/pulling_soft_tissues \
-  --expname "endonerf/pulling_cams_gs" \
-  --configs arguments/endonerf/pulling_cams_gs.py
-```
-
-### 3. Run CAMS-GS with kNN spatial smoothness
-
-```bash
-python train.py \
-  -s /root/3DGS/data/endonerf/cutting_tissues_twice \
-  --expname "endonerf/cutting_cams_gs_spatial" \
-  --configs arguments/endonerf/cutting_cams_gs.py \
-  --lambda_geo_spatial 0.01
-```
-
-Use this when you want the full plan.md-compliant version with spatial motion coherence.
-
-### 4. Render the trained model
+Render the Stage 4 Joint assembly:
 
 ```bash
 python render.py \
-  --model_path "output/endonerf/cutting_cams_gs" \
+  --model_path "$RUN_ROOT/06_joint" \
   --skip_train \
-  --configs arguments/endonerf/cutting_cams_gs.py
+  --configs "$CONFIG"
 ```
 
-### 5. Evaluate metrics
+`render.py` reads the saved `cfg_args`. Router runs load Stage 3 bundles; Joint runs load the new Joint bundle directory.
+
+## Evaluate
 
 ```bash
-python metrics.py -m \
-  "output/endonerf/cutting_original" \
-  "output/endonerf/cutting_cams_gs"
+python metrics.py -m "$RUN_ROOT/05_router"
+python metrics.py -m "$RUN_ROOT/06_joint"
 ```
+
+Always compare against:
+
+- original EndoGaussian
+- CAMS-GS
+- each independent expert
+- frozen Router
+- optional Joint
+
+Do not claim an improvement from training-batch PSNR alone; use fixed-view test metrics and rendered videos.
 
 ## Output layout
 
-If you pass `--expname`, outputs are written under:
-
 ```text
-./output/<expname>/
+/root/autodl-tmp/endomoeg/cutting/
+├── 01_canonical/
+├── 02_global/
+├── 03_local/
+├── 04_contact/
+├── 05_router/
+├── 06_joint/
+└── bundles/
+    ├── canonical.pth
+    ├── global.pth
+    ├── local.pth
+    ├── contact.pth
+    ├── router.pth
+    └── joint/
+        ├── global.pth
+        ├── local.pth
+        ├── contact.pth
+        └── router.pth
 ```
 
-For example:
+Every training output directory contains `cfg_args` and TensorBoard event files.
 
-```text
-./output/endonerf/cutting_cams_gs/
-```
+## Baselines and ablations
 
-Typical contents include:
+Recommended comparisons:
 
-- `cfg_args`
-- `events.out.tfevents.*`
-- checkpoints such as `chkpnt*.pth`
-- independent components under `endomoeg_components/`
-- point clouds under `point_cloud/`
-- render/eval outputs used by `render.py` and `metrics.py`
+1. original EndoGaussian
+2. CAMS-GS
+3. complete global expert
+4. complete local expert
+5. complete contact expert
+6. frozen volume-aware Router
+7. controlled Joint
+8. Router without pixel residual
+9. Router without oracle-error distillation
+10. Router without anti-starvation
+11. legacy continuous `cams_gs_moe` ablation
 
-## What to inspect during CAMS-GS runs
+The legacy residual-component checkpoints are intentionally incompatible with the version-2 complete-expert pipeline.
 
-Do not only look at final PSNR.
+## Tests
 
-For CAMS-GS runs, inspect:
+Focused tests cover:
 
-- geometry routing:
-  - `usage_geo_global`
-  - `usage_geo_local`
-  - `usage_geo_cut_graph`
-  - `route_max_prob_geo`
-  - `route_margin_geo`
-- visibility routing:
-  - `usage_vis_stable`
-  - `usage_vis_transient`
-  - `route_max_prob_vis`
-  - `route_margin_vis`
-- motion magnitude:
-  - `mean_norm_d_mu`
-  - `mean_norm_d_rot`
-  - `mean_norm_d_scale`
-  - `mean_abs_d_opacity`
-- temporal regularization:
-  - `L_geo_temp`
-  - `temporal_pair_count`
-- Patch C late-stage signals:
-  - `L_appearance_reg`
-  - `L_lifecycle_balance`
-  - `L_lifecycle_reg`
+- absolute EndoNeRF paths and loader selection
+- NumPy/Torch AABB boundaries
+- complete expert architecture and gradients
+- canonical/expert/Router bundle identity
+- full deformation-state fingerprinting
+- frozen expert and Router contracts
+- real Router gradient flow through rasterized routing features
+- camera-only Router/Joint rendering
+- controlled Joint trainable-parameter whitelist and quality gates
+- Python 3.7 syntax compatibility
 
-These are needed to diagnose whether CAMS-GS is improving because of better motion structure, or simply shifting capacity around.
-
-## How to analyze CAMS-GS results
-
-Use three layers of analysis.
-
-### 1. Metric layer
-
-Compare:
-
-- original vs CAMS-GS
-- cutting vs pulling generality
-
-Questions:
-
-- Does CAMS-GS improve PSNR / SSIM / LPIPS consistently?
-- Are gains scene-specific or stable across scenes?
-- Are metrics improving together, or is one metric trading against temporal plausibility?
-
-### 2. Routing-and-stage layer
-
-Questions:
-
-- Does the geometry routing collapse to one branch?
-- Does `cut_graph` activate meaningfully or remain unused?
-- Does visibility stay near `stable`, or does `transient` activate in dynamic regions?
-- Do the late-stage lifecycle losses become active only during `joint_finetune`?
-
-### 3. Failure-mode layer
-
-Questions:
-
-- Are renders sharper but less temporally coherent?
-- Is the cut-graph branch active but not helping metrics?
-- Is appearance modulation helping specular/transient structure or just adding noise?
-- Is lifecycle gating over-suppressing opacity in hard frames?
-- Does the scene need stronger scale/rotation modeling than the current CAMS schedule provides?
-
-## If CAMS-GS does not improve stably
-
-That is still a useful result.
-
-Bring back:
-
-- scene name
-- preset path
-- output directory
-- baseline metrics
-- CAMS-GS metrics
-- routing usage statistics
-- qualitative observations
-- whether the failure looks like:
-  - router collapse
-  - ineffective cut-graph branch
-  - unstable visibility/lifecycle gating
-  - over-regularized motion
-  - improved local appearance but worse global reconstruction
-
-That evidence is enough to decide whether the next step should be:
-
-- scheduler retiming
-- stronger cut-graph motion capacity
-- weaker lifecycle suppression
-- different appearance modulation bounds
-- better scale/rotation modeling
-
-## Suggested feedback package
-
-When you want the next debugging or redesign round, send back something like:
-
-```
-Scene: endonerf/cutting_001
-Baseline PSNR: 24.3
-CAMS-GS PSNR: 23.8
-Router collapse: usage_geo_global stayed >0.95 throughout
-Observation: local/cut_graph branches never activated
-```
-
----
-
-## Next Experiments (2026-06-10)
-
-Run these experiments with new output names and the exact same dataset split:
-
-1. **Original EndoGaussian baseline**
+Run:
 
 ```bash
-python train.py -s /root/3DGS/data/endonerf/cutting \
-  --expname "endonerf/cutting_original_v4_protocol" \
-  --configs arguments/endonerf/cutting_original.py
+python -m pytest tests -q
 ```
-
-2. **EndoMoeGaussian continuous 15000-step run**
-
-```bash
-python train.py -s /root/3DGS/data/endonerf/cutting \
-  --expname "endonerf/cutting_endomoeg_v4_continuous" \
-  --configs arguments/endonerf/cutting_endomoeg.py
-```
-
-3. **Independent component assembly**
-
-Run the global/local/full/router/joint commands in the workflow above. This is the primary test of the MoE-GS-style training protocol.
-
-4. **Required ablations**
-
-- shared HexPlane base without residual experts
-- Gaussian router without pixel router (`use_pixel_routing=False`)
-- full model without visibility/lifecycle losses
-- full model without temporal loss
-- full model without spatial loss
-
-5. **Acceptance checks**
-
-- fine step 1 remains close to the coarse PSNR instead of collapsing near 9
-- `temporal_pair_count` remains positive
-- local/full `grad_coverage_group_*` becomes non-zero in their stages
-- no expert has near-zero `route_coverage_geo_*` throughout router training
-- `pixel_route_covered_fraction` is non-zero on dynamic frames
-- visibility/lifecycle statistics remain near identity initially and change gradually
-- fixed-view validation exceeds the shared-base and best-single-expert results
-
-Use TensorBoard:
-
-```bash
-tensorboard --logdir /root/3DGS/output --port 6006
-```
-
-Report the final fixed-view PSNR/SSIM/LPIPS, per-expert route coverage, pixel-route entropy, motion magnitude, visibility/lifecycle statistics, and optimizer-group gradient coverage.
-
-## Historical Experiments (2026-06-02)
-
-After implementing MoE training stability fixes (commits fb12b44, 0a5f77e, fbb200d), run these experiments to validate the fixes:
-
-### 1. Baseline verification
-
-Verify current CAMS-GS baseline before applying fixes:
-
-```bash
-# On server (autodl_356 or similar)
-cd /root/autodl-tmp/EndoMoeGaussian
-git pull origin main
-
-# Test on EndoNeRF cutting scene
-python train.py \
-  -s /root/autodl-tmp/data/endonerf/cutting_tissues_twice \
-  --expname "endonerf/cutting_cams_gs_baseline" \
-  --configs arguments/endonerf/cutting_cams_gs.py
-```
-
-**Monitor in tensorboard:**
-- `global_motion_magnitude`, `local_motion_magnitude`, `cut_graph_motion_magnitude`
-- `usage_geo_global`, `usage_geo_local`, `usage_geo_cut_graph`
-- `L_motion_mag` (should now be active)
-- PSNR curve stability
-
-### 2. Expected improvements
-
-With the fixes, training should now:
-- ✅ Correctly mask inactive experts (active_geo=1 → only global active)
-- ✅ Penalize actual applied motion, not raw deltas
-- ✅ Prevent motion field saturation via L_motion_mag
-- ✅ Avoid training collapse (PSNR should not drop from 24.97 to 9.47)
-
-### 3. Key metrics to compare
-
-Before fixes (expected issues):
-- PSNR collapse in fine stages
-- Router collapse (all weight on one expert)
-- Motion field saturation early
-- `local_motion_magnitude` non-zero even when `active_geo=1`
-
-After fixes (expected behavior):
-- Stable PSNR progression
-- Gradual expert activation across stages
-- Bounded motion magnitudes
-- `local_motion_magnitude` correctly equals 0 when `active_geo=1`
-
-### 4. Commands summary
-
-```bash
-# Pull latest fixes
-git pull origin main
-
-# Run experiment
-python train.py -s /root/3DGS/data/endonerf/cutting_tissues_twice \
-  --expname "endonerf/cutting_cams_gs_fixed" \
-  --configs arguments/endonerf/cutting_cams_gs.py
-
-# Monitor tensorboard
-tensorboard --logdir output/endonerf/cutting_cams_gs_fixed
-
-# After training, evaluate
-python render.py --model_path output/endonerf/cutting_cams_gs_fixed \
-  --skip_train --configs arguments/endonerf/cutting_cams_gs.py
-
-python metrics.py -m output/endonerf/cutting_cams_gs_fixed
-```
-
-### 5. Report back
-
-After experiments complete, provide:
-- Final PSNR/SSIM/LPIPS
-- Tensorboard screenshots of motion magnitude curves
-- Expert usage statistics (`usage_geo_*` at different iterations)
-- Any observed training instabilities
-- Comparison with baseline (if available)
-
-```text
-Scene: cutting
-Preset: arguments/endonerf/cutting_cams_gs.py
-Run dir: output/endonerf/cutting_cams_gs
-Baseline metrics: PSNR=?, SSIM=?, LPIPS=?
-CAMS-GS metrics: PSNR=?, SSIM=?, LPIPS=?
-Geometry routing: global=?, local=?, cut_graph=?
-Visibility routing: stable=?, transient=?
-Late-stage lifecycle stats: persistent=?, transient=?
-Qualitative notes: ...
-Failure suspicion: ...
-```
-
-## Verification status
-
-Current focused regression coverage includes:
-
-- EndoMoe absolute stages and group-local LR
-- identity-safe shared HexPlane initialization
-- heterogeneous expert identity and gradient isolation
-- independent component checkpoint assembly
-- Gaussian soft top-2 and pixel-space routing
-- visibility/transient/lifecycle probability semantics
-- adjacent-time temporal supervision
-- sampled chunked spatial KNN regularization
-- fixed-view validation isolation
-- optimizer-group LR and gradient diagnostics
-- CAMS-GS scheduler behavior
-- CAMS-GS parameter-group exposure
-- checkpoint metadata compatibility
-- train-time aux merging
-- cut-graph route affecting geometry output
-- visibility / lifecycle / appearance control exposure
-- phase-gated Patch C losses
-- EndoNeRF preset key validity
-
-Relevant tests:
-
-- `tests/test_disentangled_moe_tracking.py`
-- `tests/test_endonerf_presets.py`
-
-Current focused status: `103 passed`.
-
-## Notes and caveats
-
-- `full_eval.py` is not the main EndoNeRF workflow here.
-- `render.py` and `metrics.py` should always be run with the exact preset that matches the trained checkpoint.
-- `tracking_type` metadata checks are active, so incompatible checkpoints should fail loudly.
-- The older heterogeneous MoE path remains in the repository for comparison, but it is no longer the main architectural story.
-
-## Acknowledgement
-
-This repository builds on ideas and code from:
-
-- 3D Gaussian Splatting
-- 4DGaussians
-- k-planes
-- HexPlane
-- TiNeuVox
-
-Please also see the upstream acknowledgements in the original project history.

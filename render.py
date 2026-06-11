@@ -33,6 +33,20 @@ from utils.graphics_utils import fov2focal
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
 
 
+def load_frozen_router_assembly(*args, **kwargs):
+    from models.endomoeg.inference import load_frozen_router_assembly as loader
+
+    return loader(*args, **kwargs)
+
+
+def render_frozen_expert_ensemble(*args, **kwargs):
+    from models.endomoeg.router_training import (
+        render_frozen_expert_ensemble as renderer,
+    )
+
+    return renderer(*args, **kwargs)
+
+
 def _tensor_to_hw_numpy(tensor, name):
     array = tensor.detach().cpu().numpy()
     if array.ndim == 2:
@@ -47,7 +61,17 @@ def _tensor_to_hw_numpy(tensor, name):
     raise ValueError(f"{name} must have shape [H, W], [1, H, W], or [H, W, 1], got {array.shape}")
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, reconstruct=False):
+def render_set(
+    model_path,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    reconstruct=False,
+    render_view=None,
+):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "depth")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -71,7 +95,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
             if idx == 0 and i == 0:
                 time1 = time()
-            rendering = render(view, gaussians, pipeline, background)
+            if render_view is None:
+                rendering = render(view, gaussians, pipeline, background)
+            else:
+                rendering = render_view(view)
             if i == test_times-1:
                 render_depths.append(rendering["depth"])
                 render_images.append(rendering["render"].cpu())
@@ -138,10 +165,74 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_video: bool):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree, hyperparam)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        pipeline_stage = str(
+            getattr(hyperparam, "endomoeg_pipeline_stage", "") or ""
+        ).strip().lower()
+        render_view = None
+        if pipeline_stage in {"router", "joint"}:
+            gaussians = None
+            scene = Scene(
+                dataset,
+                gaussians,
+                load_iteration=None,
+                shuffle=False,
+                initialize_gaussians=False,
+            )
+            if pipeline_stage == "joint":
+                assembly_bundle_dir = getattr(
+                    hyperparam,
+                    "endomoeg_joint_output_dir",
+                )
+                assembly_router_bundle = os.path.join(
+                    assembly_bundle_dir,
+                    "router.pth",
+                )
+            else:
+                assembly_bundle_dir = getattr(
+                    hyperparam,
+                    "endomoeg_bundle_dir",
+                )
+                assembly_router_bundle = (
+                    getattr(hyperparam, "endomoeg_router_bundle", "") or None
+                )
+            assembly = load_frozen_router_assembly(
+                assembly_bundle_dir,
+                expected_source_path=dataset.source_path,
+                device=get_device(),
+                minimum_expert_psnr=float(
+                    getattr(hyperparam, "endomoeg_min_expert_psnr", 0.0)
+                ),
+                router_bundle_path=assembly_router_bundle,
+            )
+            if int(iteration) not in (-1, assembly.iteration):
+                raise ValueError(
+                    "Requested iteration {} does not match Router bundle "
+                    "iteration {}".format(iteration, assembly.iteration)
+                )
+            infer_iter = assembly.iteration
 
-        infer_iter = scene.loaded_iter if scene.loaded_iter is not None else max(0, int(iteration))
+            def render_view(view):
+                return render_frozen_expert_ensemble(
+                    view,
+                    assembly.ensemble,
+                    assembly.router,
+                    pipeline,
+                    background,
+                    top_k=assembly.top_k,
+                )
+        else:
+            gaussians = GaussianModel(dataset.sh_degree, hyperparam)
+            scene = Scene(
+                dataset,
+                gaussians,
+                load_iteration=iteration,
+                shuffle=False,
+            )
+            infer_iter = (
+                scene.loaded_iter
+                if scene.loaded_iter is not None
+                else max(0, int(iteration))
+            )
         if hasattr(hyperparam, "current_iteration"):
             hyperparam.current_iteration = infer_iter
         if hasattr(hyperparam, "iterations") and hyperparam.iterations < infer_iter:
@@ -152,11 +243,11 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
         background = torch.tensor(bg_color, dtype=torch.float32, device=device)
         
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, reconstruct=not skip_train)
+            render_set(dataset.model_path, "train", infer_iter, scene.getTrainCameras(), gaussians, pipeline, background, reconstruct=not skip_train, render_view=render_view)
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, reconstruct=not skip_test)
+            render_set(dataset.model_path, "test", infer_iter, scene.getTestCameras(), gaussians, pipeline, background, reconstruct=not skip_test, render_view=render_view)
         if not skip_video:
-            render_set(dataset.model_path,"video",scene.loaded_iter, scene.getVideoCameras(),gaussians,pipeline,background, reconstruct=not skip_video)
+            render_set(dataset.model_path, "video", infer_iter, scene.getVideoCameras(), gaussians, pipeline, background, reconstruct=not skip_video, render_view=render_view)
 
 def reconstruct_point_cloud(images, masks, depths, camera_parameters, name):
     if o3d is None:
