@@ -46,6 +46,130 @@ def _get_aux_scale(
     return value.clamp(0.0, 1.0)
 
 
+def _add_scaffold_regularization(
+    losses: Dict[str, torch.Tensor],
+    aux: Dict[str, torch.Tensor],
+    args,
+) -> None:
+    terms = (
+        ("scaffold_arap", "L_scaffold_arap", "lambda_scaffold_arap", 1e-2),
+        (
+            "scaffold_acceleration",
+            "L_scaffold_acceleration",
+            "lambda_scaffold_acceleration",
+            1e-3,
+        ),
+        (
+            "scaffold_node_offset",
+            "L_scaffold_node_offset",
+            "lambda_scaffold_node_offset",
+            1e-3,
+        ),
+    )
+    for raw_name, loss_name, weight_name, default_weight in terms:
+        raw_value = _get_aux_tensor(aux, raw_name)
+        if raw_value is None:
+            continue
+        mean_value = _safe_mean(raw_value)
+        losses[raw_name] = mean_value.detach()
+        losses[loss_name] = mean_value * _get_float_arg(
+            args,
+            weight_name,
+            default_weight,
+        )
+    node_translation = _get_aux_tensor(
+        aux,
+        "scaffold_node_translation_norm",
+    )
+    if node_translation is not None:
+        losses["scaffold_node_translation_norm"] = _safe_mean(
+            node_translation
+        ).detach()
+    mean_radius = _get_aux_tensor(aux, "scaffold_mean_radius")
+    if mean_radius is not None:
+        losses["scaffold_mean_radius"] = _safe_mean(mean_radius).detach()
+
+
+def _add_contact_bank_regularization(
+    losses: Dict[str, torch.Tensor],
+    aux: Dict[str, torch.Tensor],
+    args,
+) -> None:
+    terms = (
+        (
+            "contact_bank_sparsity",
+            "L_contact_bank_sparsity",
+            "lambda_contact_bank_sparsity",
+            1e-4,
+        ),
+        (
+            "contact_bank_locality",
+            "L_contact_bank_locality",
+            "lambda_contact_bank_locality",
+            1e-3,
+        ),
+        (
+            "contact_bank_acceleration",
+            "L_contact_bank_acceleration",
+            "lambda_contact_bank_acceleration",
+            1e-3,
+        ),
+        (
+            "contact_bank_spatial_offset",
+            "L_contact_bank_spatial_offset",
+            "lambda_contact_bank_spatial_offset",
+            1e-3,
+        ),
+        (
+            "contact_bank_duration",
+            "L_contact_bank_duration",
+            "lambda_contact_bank_duration",
+            1e-4,
+        ),
+    )
+    for raw_name, loss_name, weight_name, default_weight in terms:
+        raw_value = _get_aux_tensor(aux, raw_name)
+        if raw_value is None:
+            continue
+        mean_value = _safe_mean(raw_value)
+        losses[raw_name] = mean_value.detach()
+        losses[loss_name] = mean_value * _get_float_arg(
+            args,
+            weight_name,
+            default_weight,
+        )
+    temporal_rbf = _get_aux_tensor(aux, "auxiliary_temporal_rbf")
+    if temporal_rbf is not None:
+        losses["contact_bank_temporal_activity"] = _safe_mean(
+            temporal_rbf
+        ).detach()
+    contact_target = _get_aux_tensor(aux, "auxiliary_contact_target")
+    if contact_target is not None:
+        losses["contact_bank_boundary_support"] = _safe_mean(
+            contact_target
+        ).detach()
+
+
+def _apply_complete_expert_loss_contract(
+    losses: Dict[str, torch.Tensor],
+    expert_role,
+) -> None:
+    role = str(expert_role or "").strip().lower()
+    if role not in {"global", "local", "contact"}:
+        return
+    allowed_prefixes = {
+        "global": (),
+        "local": ("L_scaffold_",),
+        "contact": ("L_contact_bank_", "L_vis_sparse"),
+    }[role]
+    for name, value in tuple(losses.items()):
+        if not name.startswith("L_"):
+            continue
+        if any(name.startswith(prefix) for prefix in allowed_prefixes):
+            continue
+        losses[name] = value * 0.0
+
+
 def _resolve_expert_names(
     names: Sequence[str],
     count: int,
@@ -648,6 +772,8 @@ def compute_tracking_losses(
         losses["mean_norm_d_mu"] = _safe_mean(torch.norm(d_mu, dim=-1)).detach()
         _add_temporal_regularization(losses, aux, args)
         _add_geo_spatial_loss(losses, aux, args)
+        _add_scaffold_regularization(losses, aux, args)
+        _add_contact_bank_regularization(losses, aux, args)
 
     if d_rot is not None:
         losses["mean_norm_d_rot"] = _safe_mean(torch.norm(d_rot, dim=-1)).detach()
@@ -701,4 +827,8 @@ def compute_tracking_losses(
     if entropy_vis is not None:
         losses["entropy_vis"] = entropy_vis.detach()
 
+    _apply_complete_expert_loss_contract(
+        losses,
+        aux.get("expert_role"),
+    )
     return losses

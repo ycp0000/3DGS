@@ -84,7 +84,6 @@ def _assembly():
         router=EndoMoeVolumeAwareRouter(
             {"global": 2, "local": 2, "contact": 2},
             gaussian_hidden_dim=8,
-            pixel_hidden_dim=8,
         ),
         ensemble=_FakeEnsemble(),
         payload={
@@ -97,7 +96,6 @@ def _assembly():
             },
         },
         bundle_path="/absolute/parent/router.pth",
-        top_k=2,
     )
 
 
@@ -105,8 +103,6 @@ def _hyper():
     return SimpleNamespace(
         endomoeg_joint_router_gaussian_lr=5e-4,
         endomoeg_joint_router_feature_lr=1e-4,
-        endomoeg_joint_router_pixel_lr=1e-4,
-        endomoeg_joint_global_deformation_lr=1e-6,
         endomoeg_joint_refinement_lr=5e-6,
     )
 
@@ -118,15 +114,19 @@ def test_joint_trainable_contract_freezes_canonical_and_role_backbones():
         _hyper(),
     )
 
-    assert len(groups) == 6
-    assert set(expert_groups) == {"global", "local", "contact"}
+    assert len(groups) == 4
+    assert [group["name"] for group in groups[:2]] == [
+        "joint_router_base_gates",
+        "joint_router_feature_mlp",
+    ]
+    assert set(expert_groups) == {"local", "contact"}
     assert all(
         not getattr(expert, "_xyz").requires_grad
         for _, expert in assembly.ensemble
     )
     global_expert = assembly.ensemble.experts["global"]
     assert all(
-        parameter.requires_grad
+        not parameter.requires_grad
         for parameter in global_expert._deformation.parameters()
     )
     for role in ("local", "contact"):
@@ -257,7 +257,7 @@ def test_joint_save_rebinds_router_to_updated_expert_states(
         "local": "local-joint",
         "contact": "contact-joint",
     }
-    assert captured["router_kwargs"]["inference_top_k"] == 2
+    assert "inference_top_k" not in captured["router_kwargs"]
     assert len(saved_paths) == 4
     assert all(
         not parameter.requires_grad

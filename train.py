@@ -44,6 +44,7 @@ from models.endomoeg import (
     build_canonical_bundle,
     build_expert_bundle,
     load_canonical_bundle,
+    load_expert_bundle,
     save_bundle,
 )
 from models.endomoeg.router_training import train_frozen_router
@@ -127,6 +128,18 @@ def validate_endomoeg_pipeline_args(args):
         args.endomoeg_canonical_bundle = os.path.abspath(canonical_path)
         args.endomoeg_expert_role = role
         args.tracking_type = "endomoeg_expert"
+        if role in {"local", "contact"}:
+            minimum_global_psnr = float(
+                getattr(args, "endomoeg_min_expert_psnr", 0.0)
+            )
+            if (
+                not np.isfinite(minimum_global_psnr)
+                or minimum_global_psnr <= 0.0
+            ):
+                raise ValueError(
+                    "Local/Contact expert stages require a positive "
+                    "endomoeg_min_expert_psnr for the Global anchor"
+                )
         return args
 
     if stage in {"router", "joint"}:
@@ -183,6 +196,21 @@ def should_reset_opacity(stage, iteration, opt, dataset):
         return False
     return iteration % opt.opacity_reset_interval == 0 or (
         dataset.white_background and iteration == opt.densify_from_iter
+    )
+
+
+def allows_gaussian_topology_updates(stage, hyper):
+    if stage != "fine":
+        return True
+    pipeline_stage = normalize_endomoeg_pipeline_stage(
+        getattr(hyper, "endomoeg_pipeline_stage", "")
+    )
+    expert_role = str(
+        getattr(hyper, "endomoeg_expert_role", "") or ""
+    ).strip().lower()
+    return not (
+        pipeline_stage == "expert"
+        and expert_role in {"local", "contact"}
     )
 
 
@@ -270,6 +298,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     previous_tracking_phase_name = None
     final_tracking_phase_name = None
     latest_validation_metrics = {}
+    allow_topology_updates = allows_gaussian_topology_updates(stage, hyper)
     
     for iteration in range(first_iter, final_iter+1):
         hyper.current_iteration = iteration
@@ -306,7 +335,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             previous_tracking_phase_name = tracking_phase.name
         gaussians.update_learning_rate(iteration, phase=tracking_phase)
         # Every 1000 its we increase the levels of SH up to a maximum degree
-        if iteration % 500 == 0:
+        if allow_topology_updates and iteration % 500 == 0:
             gaussians.oneupSHdegree()
         # Pick a random Camera
         if not viewpoint_stack:
@@ -599,7 +628,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     if torch.is_tensor(v) and v.numel() == 1:
                         print(f"{k}: {float(v.detach().cpu().item()):.8e}")
 
-        if stage == "fine" and hyper.time_smoothness_weight != 0:
+        base_grid_trainable = (
+            tracking_phase is None
+            or tracking_phase.is_group_trainable("tracking_base_grid")
+        )
+        if (
+            stage == "fine"
+            and hyper.time_smoothness_weight != 0
+            and base_grid_trainable
+        ):
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.plane_tv_weight, hyper.l1_time_planes)
             loss += tv_loss
         if opt.lambda_dssim != 0:
@@ -698,7 +735,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             timer.start()
             
             # Densification
-            if iteration < opt.densify_until_iter :
+            if allow_topology_updates and iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
                 if visibility_filter.numel() == gaussians.max_radii2D.numel() and visibility_filter.any():
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -804,11 +841,25 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             getattr(hyper, "endomoeg_canonical_bundle"),
             map_location="cpu",
         )
-        gaussians.restore_canonical_state(
-            canonical_payload["canonical_state"],
-            training_args=None,
-        )
         role = getattr(hyper, "endomoeg_expert_role")
+        if role == "global":
+            gaussians.restore_canonical_state(
+                canonical_payload["canonical_state"],
+                training_args=None,
+            )
+        else:
+            global_payload = load_expert_bundle(
+                os.path.join(bundle_dir, "global.pth"),
+                map_location="cpu",
+                expected_role="global",
+                expected_source_fingerprint=canonical_payload[
+                    "canonical_fingerprint"
+                ],
+                minimum_psnr=float(hyper.endomoeg_min_expert_psnr),
+            )
+            gaussians.restore_global_anchor_state(
+                global_payload["expert_state"]
+            )
         validation_metrics = scene_reconstruction(
             dataset,
             opt,

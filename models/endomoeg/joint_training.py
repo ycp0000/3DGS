@@ -13,7 +13,7 @@ from utils.loss_utils import l1_loss, ssim
 from .ensemble import freeze_gaussian_model
 from .expert_bundle import EXPERT_ROLES, build_expert_bundle, save_bundle
 from .inference import load_frozen_router_assembly
-from .router import compute_router_losses
+from .router import RESIDUAL_ROLES, compute_router_losses
 from .router_bundle import build_router_bundle, save_router_bundle
 from .router_training import (
     assert_router_gradient_contract,
@@ -46,20 +46,14 @@ def configure_joint_trainable_parameters(assembly, hyper):
 
     groups = [
         {
-            "params": _parameter_list(router.base_logits.parameters()),
+            "params": [router.base_gates],
             "lr": float(hyper.endomoeg_joint_router_gaussian_lr),
-            "name": "joint_router_gaussian_logits",
+            "name": "joint_router_base_gates",
         },
         {
-            "params": _parameter_list(router.role_embedding.parameters())
-            + _parameter_list(router.gaussian_feature_mlp.parameters()),
+            "params": _parameter_list(router.gaussian_feature_mlp.parameters()),
             "lr": float(hyper.endomoeg_joint_router_feature_lr),
             "name": "joint_router_feature_mlp",
-        },
-        {
-            "params": _parameter_list(router.pixel_router.parameters()),
-            "lr": float(hyper.endomoeg_joint_router_pixel_lr),
-            "name": "joint_router_pixel",
         },
     ]
     expert_groups = OrderedDict()
@@ -71,28 +65,20 @@ def configure_joint_trainable_parameters(assembly, hyper):
         expert._deformation.eval()
 
         if role == "global":
-            parameters = _parameter_list(expert._deformation.parameters())
-            for parameter in parameters:
-                parameter.requires_grad_(True)
-            expert._deformation.train()
-            learning_rate = float(
-                hyper.endomoeg_joint_global_deformation_lr
+            continue
+        refinement = (
+            expert._deformation.deformation_net.complete_expert_head.refinement
+        )
+        if refinement is None:
+            raise RuntimeError(
+                "Joint expert '{}' has no refinement module".format(role)
             )
-            group_name = "joint_expert_global_deformation"
-        else:
-            refinement = (
-                expert._deformation.deformation_net.complete_expert_head.refinement
-            )
-            if refinement is None:
-                raise RuntimeError(
-                    "Joint expert '{}' has no refinement module".format(role)
-                )
-            parameters = _parameter_list(refinement.parameters())
-            for parameter in parameters:
-                parameter.requires_grad_(True)
-            refinement.train()
-            learning_rate = float(hyper.endomoeg_joint_refinement_lr)
-            group_name = "joint_expert_{}_refinement".format(role)
+        parameters = _parameter_list(refinement.parameters())
+        for parameter in parameters:
+            parameter.requires_grad_(True)
+        refinement.train()
+        learning_rate = float(hyper.endomoeg_joint_refinement_lr)
+        group_name = "joint_expert_{}_refinement".format(role)
         if not parameters:
             raise RuntimeError(
                 "Joint expert '{}' has no trainable parameters".format(role)
@@ -127,9 +113,9 @@ def assert_joint_trainable_contract(assembly):
             if parameter.requires_grad
         ]
         if role == "global":
-            if not trainable_deformation:
+            if trainable_deformation:
                 raise RuntimeError(
-                    "Joint global expert deformation is not trainable"
+                    "Joint stage must keep the Global anchor frozen"
                 )
         else:
             invalid = [
@@ -324,7 +310,6 @@ def _save_joint_assembly(
         iteration=iteration,
         config=router_config,
         validation_metrics=ensemble_metrics,
-        inference_top_k=assembly.top_k,
     )
     router_path = save_router_bundle(
         os.path.join(output_dir, "router.pth"),
@@ -377,40 +362,39 @@ def train_controlled_joint(
     final_metrics = {}
     for iteration in progress:
         viewpoint = train_cameras[randint(0, len(train_cameras) - 1)]
-        sparse_start = min(
-            max(float(hyper.endomoeg_joint_sparse_start), 0.0),
-            1.0,
-        )
-        top_k = (
-            assembly.top_k
-            if iteration / max(int(opt.iterations), 1) >= sparse_start
-            else None
-        )
         output = render_frozen_expert_ensemble(
             viewpoint,
             assembly.ensemble,
             assembly.router,
             pipe,
             background,
-            top_k=top_k,
         )
         ground_truth = viewpoint.original_image.to(device).float()
         mask = viewpoint.mask.to(device)
-        blended, _, loss_dict = compute_router_losses(
-            output["weights"],
-            output["expert_rgb"],
+        loss_dict = compute_router_losses(
+            output["render"],
+            output["candidate_rgb"]["global"],
+            {
+                role: output["candidate_rgb"][role]
+                for role in RESIDUAL_ROLES
+            },
+            output["gates"],
+            output["gate_maps"],
             ground_truth,
             mask=mask,
-            oracle_temperature=float(
-                hyper.endomoeg_router_oracle_temperature
+            gain_temperature=float(
+                hyper.endomoeg_router_gain_temperature
             ),
-            lambda_oracle=float(hyper.endomoeg_router_lambda_oracle),
-            lambda_starvation=float(
-                hyper.endomoeg_router_lambda_starvation
+            lambda_gain=float(hyper.endomoeg_router_lambda_gain),
+            lambda_sparsity=float(
+                hyper.endomoeg_router_lambda_sparsity
+            ),
+            lambda_no_regret=float(
+                hyper.endomoeg_router_lambda_no_regret
             ),
         )
         dssim_loss = 1.0 - ssim(
-            (blended * mask).unsqueeze(0),
+            (output["render"] * mask).unsqueeze(0),
             (ground_truth * mask).unsqueeze(0),
         )
         anchor_loss = parameter_anchor_loss(optimizer_groups, anchors)
@@ -444,7 +428,7 @@ def train_controlled_joint(
                 psnr="{:.2f}".format(
                     float(
                         psnr(
-                            blended.unsqueeze(0),
+                            output["render"].unsqueeze(0),
                             ground_truth.unsqueeze(0),
                             mask.unsqueeze(0),
                         )
@@ -492,7 +476,6 @@ def train_controlled_joint(
                 assembly.router,
                 pipe,
                 background,
-                top_k=assembly.top_k,
             )
             if tb_writer is not None:
                 for name, value in final_metrics.items():
@@ -508,7 +491,6 @@ def train_controlled_joint(
         assembly.router,
         pipe,
         background,
-        top_k=assembly.top_k,
     )
     expert_metrics = evaluate_individual_experts(
         scene,

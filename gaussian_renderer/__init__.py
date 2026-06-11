@@ -62,6 +62,7 @@ def rasterize_endomoeg_routing_features(
     pipe,
     routing_state,
     gaussian_logits,
+    probabilities=False,
 ):
     if GaussianRasterizer is None or GaussianRasterizationSettings is None:
         raise ImportError(
@@ -74,6 +75,8 @@ def rasterize_endomoeg_routing_features(
     scales = routing_state["scales"]
     rotations = routing_state["rotations"]
     covariance = routing_state["covariance"]
+    raster_scales = None if covariance is not None else scales
+    raster_rotations = None if covariance is not None else rotations
     motion = routing_state["motion"]
     if gaussian_logits.ndim == 2 and gaussian_logits.shape[1] == 1:
         gaussian_logits = gaussian_logits[:, 0]
@@ -106,7 +109,11 @@ def rasterize_endomoeg_routing_features(
     motion_signal = motion.norm(dim=-1) / max(abs(scene_scale), 1e-6)
     routing_features = torch.stack(
         (
-            torch.sigmoid(gaussian_logits),
+            (
+                gaussian_logits.clamp(0.0, 1.0)
+                if probabilities
+                else torch.sigmoid(gaussian_logits)
+            ),
             motion_signal.clamp(0.0, 1.0),
             torch.ones_like(motion_signal),
         ),
@@ -118,8 +125,8 @@ def rasterize_endomoeg_routing_features(
         shs=None,
         colors_precomp=routing_features,
         opacities=opacity,
-        scales=scales,
-        rotations=rotations,
+        scales=raster_scales,
+        rotations=raster_rotations,
         cov3D_precomp=covariance,
     )
     feature_depth = _canonicalize_rasterized_depth(
@@ -127,11 +134,75 @@ def rasterize_endomoeg_routing_features(
         viewpoint_camera.image_height,
         viewpoint_camera.image_width,
     )
+    coverage = feature_render[2].clamp_min(0.0)
+    gaussian_prior = feature_render[0].clamp_min(0.0)
+    if probabilities:
+        gaussian_prior = torch.where(
+            coverage > 1e-6,
+            gaussian_prior / coverage.clamp_min(1e-6),
+            torch.zeros_like(gaussian_prior),
+        ).clamp(0.0, 1.0)
     return {
-        "gaussian_prior": feature_render[0].clamp_min(0.0),
+        "gaussian_prior": gaussian_prior,
         "projected_motion": feature_render[1].clamp_min(0.0),
-        "coverage": feature_render[2].clamp_min(0.0),
+        "coverage": coverage,
         "depth": feature_depth,
+    }
+
+
+def rasterize_endomoeg_composite_state(
+    viewpoint_camera,
+    reference_expert,
+    pipe,
+    background,
+    state,
+):
+    if GaussianRasterizer is None or GaussianRasterizationSettings is None:
+        raise ImportError(
+            "diff_gaussian_rasterization is required for EndoMoe composition"
+        ) from _RASTERIZER_IMPORT_ERROR
+    means3d = state["means3d"]
+    means2d = torch.zeros_like(means3d, requires_grad=True)
+    try:
+        means2d.retain_grad()
+    except RuntimeError:
+        pass
+    device = means3d.device
+    settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=math.tan(viewpoint_camera.FoVx * 0.5),
+        tanfovy=math.tan(viewpoint_camera.FoVy * 0.5),
+        bg=background,
+        scale_modifier=1.0,
+        viewmatrix=viewpoint_camera.world_view_transform.to(device),
+        projmatrix=viewpoint_camera.full_proj_transform.to(device),
+        sh_degree=reference_expert.active_sh_degree,
+        campos=viewpoint_camera.camera_center.to(device),
+        prefiltered=False,
+        debug=pipe.debug,
+    )
+    rasterizer = GaussianRasterizer(raster_settings=settings)
+    image, radii, depth = rasterizer(
+        means3D=means3d,
+        means2D=means2d,
+        shs=None,
+        colors_precomp=state["colors"],
+        opacities=state["opacity"],
+        scales=state["scales"],
+        rotations=state["rotations"],
+        cov3D_precomp=None,
+    )
+    return {
+        "render": image,
+        "depth": _canonicalize_rasterized_depth(
+            depth,
+            viewpoint_camera.image_height,
+            viewpoint_camera.image_width,
+        ),
+        "radii": radii,
+        "viewspace_points": means2d,
+        "visibility_filter": radii > 0,
     }
 
 
@@ -260,6 +331,65 @@ def render(
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
     opacity_final = pc.opacity_activation(opacity_final)
+    means3D_raster = means3D_final
+    means2D_raster = means2D
+    auxiliary_count = 0
+    auxiliary_parent_global = None
+    auxiliary_rgb_delta = None
+    auxiliary_canonical = None
+    if stage != "coarse":
+        auxiliary_means = deformation_aux.get("auxiliary_means3d")
+        if (
+            isinstance(auxiliary_means, torch.Tensor)
+            and auxiliary_means.ndim == 2
+            and auxiliary_means.shape[-1] == 3
+            and auxiliary_means.shape[0] > 0
+        ):
+            auxiliary_scales = deformation_aux["auxiliary_scales"]
+            auxiliary_rotations = deformation_aux["auxiliary_rotations"]
+            auxiliary_opacity = deformation_aux["auxiliary_opacity"]
+            auxiliary_parent_indices = deformation_aux[
+                "auxiliary_parent_indices"
+            ].long()
+            auxiliary_rgb_delta = deformation_aux["auxiliary_rgb_delta"]
+            auxiliary_canonical = deformation_aux[
+                "auxiliary_canonical_means3d"
+            ]
+            auxiliary_count = int(auxiliary_means.shape[0])
+            deformation_indices = torch.nonzero(
+                deformation_point,
+                as_tuple=False,
+            ).squeeze(-1)
+            auxiliary_parent_global = deformation_indices[
+                auxiliary_parent_indices
+            ]
+            auxiliary_screenspace = torch.zeros_like(
+                auxiliary_means,
+                requires_grad=True,
+            )
+            means3D_raster = torch.cat(
+                (means3D_final, auxiliary_means),
+                dim=0,
+            )
+            means2D_raster = torch.cat(
+                (means2D, auxiliary_screenspace),
+                dim=0,
+            )
+            scales_final = torch.cat(
+                (scales_final, pc.scaling_activation(auxiliary_scales)),
+                dim=0,
+            )
+            rotations_final = torch.cat(
+                (
+                    rotations_final,
+                    pc.rotation_activation(auxiliary_rotations),
+                ),
+                dim=0,
+            )
+            opacity_final = torch.cat(
+                (opacity_final, auxiliary_opacity.clamp(0.0, 1.0)),
+                dim=0,
+            )
     routing_scales = scales_final
     routing_rotations = rotations_final
     if pipe.compute_cov3D_python:
@@ -274,8 +404,13 @@ def render(
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.to(device).repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            dir_pp = means3D_final - viewpoint_camera.camera_center.to(
+                device
+            ).unsqueeze(0)
+            dir_pp_normalized = dir_pp / dir_pp.norm(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
         else:
@@ -287,13 +422,52 @@ def render(
     if appearance_rgb_delta is not None and deformation_point.any():
         if colors_precomp is None:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.to(device).repeat(pc.get_features.shape[0], 1))
-            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            dir_pp = means3D_final - viewpoint_camera.camera_center.to(
+                device
+            ).unsqueeze(0)
+            dir_pp_normalized = dir_pp / dir_pp.norm(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
             shs = None
         colors_precomp = colors_precomp.clone()
-        colors_precomp[deformation_point] = torch.clamp(colors_precomp[deformation_point] + appearance_rgb_delta, 0.0, 1.0)
+        colors_precomp[deformation_point] = torch.clamp_min(
+            colors_precomp[deformation_point] + appearance_rgb_delta,
+            0.0,
+        )
+
+    if auxiliary_count > 0:
+        if colors_precomp is None:
+            shs_view = pc.get_features.transpose(1, 2).view(
+                -1,
+                3,
+                (pc.max_sh_degree + 1) ** 2,
+            )
+            dir_pp = (
+                means3D_final
+                - viewpoint_camera.camera_center.to(device).unsqueeze(0)
+            )
+            dir_pp_normalized = dir_pp / dir_pp.norm(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
+            colors_precomp = torch.clamp_min(
+                eval_sh(
+                    pc.active_sh_degree,
+                    shs_view,
+                    dir_pp_normalized,
+                )
+                + 0.5,
+                0.0,
+            )
+            shs = None
+        child_colors = torch.clamp_min(
+            colors_precomp[auxiliary_parent_global] + auxiliary_rgb_delta,
+            0.0,
+        )
+        colors_precomp = torch.cat((colors_precomp, child_colors), dim=0)
 
     geo_expert_means3d = deformation_aux.get("geo_expert_means3d") if stage != "coarse" else None
     use_pixel_routing = (
@@ -492,8 +666,8 @@ def render(
         deformation_aux["pixel_routing_weights"] = pi_geo_weights
     else:
         rendered_image, radii, depth = rasterizer(
-            means3D = means3D_final,
-            means2D = means2D,
+            means3D = means3D_raster,
+            means2D = means2D_raster,
             shs = shs,
             colors_precomp = colors_precomp,
             opacities = opacity_final,
@@ -508,12 +682,38 @@ def render(
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
+    parent_radii = radii[: means3D.shape[0]]
+    routing_colors = colors_precomp
+    if return_routing_state and routing_colors is None:
+        shs_view = pc.get_features.transpose(1, 2).view(
+            -1,
+            3,
+            (pc.max_sh_degree + 1) ** 2,
+        )
+        parent_directions = (
+            means3D_final
+            - viewpoint_camera.camera_center.to(device).unsqueeze(0)
+        )
+        parent_directions = parent_directions / parent_directions.norm(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-8)
+        routing_colors = torch.clamp_min(
+            eval_sh(
+                pc.active_sh_degree,
+                shs_view,
+                parent_directions,
+            )
+            + 0.5,
+            0.0,
+        )
+
     result = {
         "render": rendered_image,
         "depth": depth,
         "viewspace_points": screenspace_points,
-        "visibility_filter": radii > 0,
-        "radii": radii,
+        "visibility_filter": parent_radii > 0,
+        "radii": parent_radii,
         "deformation_aux": (
             deformation_aux
             if stage != "coarse" and deformation_point.any()
@@ -527,14 +727,27 @@ def render(
             1.0,
         )
         result["routing_state"] = {
-            "canonical_xyz": means3D,
-            "means3d": means3D_final,
-            "means2d": screenspace_points,
+            "canonical_xyz": (
+                torch.cat((means3D, auxiliary_canonical), dim=0)
+                if auxiliary_count > 0
+                else means3D
+            ),
+            "means3d": means3D_raster,
+            "means2d": means2D_raster,
             "opacity": opacity_final,
-            "scales": None if cov3D_precomp is not None else routing_scales,
-            "rotations": None if cov3D_precomp is not None else routing_rotations,
+            "colors": routing_colors,
+            "scales": routing_scales,
+            "rotations": routing_rotations,
             "covariance": cov3D_precomp,
-            "motion": means3D_final - means3D,
+            "motion": means3D_raster
+            - (
+                torch.cat((means3D, auxiliary_canonical), dim=0)
+                if auxiliary_count > 0
+                else means3D
+            ),
             "scene_scale": float(torch.as_tensor(scene_scale).reshape(()).item()),
+            "base_point_count": int(means3D.shape[0]),
+            "auxiliary_point_count": auxiliary_count,
+            "auxiliary_parent_indices": auxiliary_parent_global,
         }
     return result

@@ -4,14 +4,22 @@ from random import randint
 import torch
 from tqdm import tqdm
 
-from gaussian_renderer import render, rasterize_endomoeg_routing_features
+from gaussian_renderer import (
+    rasterize_endomoeg_composite_state,
+    rasterize_endomoeg_routing_features,
+    render,
+)
+from utils.eval_utils import select_fixed_views
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
-from utils.eval_utils import select_fixed_views
 
 from .ensemble import FrozenExpertEnsemble
-from .expert_bundle import EXPERT_ROLES
-from .router import EndoMoeVolumeAwareRouter, compute_router_losses
+from .router import (
+    RESIDUAL_ROLES,
+    EndoMoeVolumeAwareRouter,
+    compose_residual_gaussian_state,
+    compute_router_losses,
+)
 from .router_bundle import build_router_bundle, save_router_bundle
 
 
@@ -31,14 +39,9 @@ def _gradient_norm(parameters):
 
 def collect_router_gradient_metrics(router):
     return {
-        "grad_norm_router_gaussian_logits": _gradient_norm(
-            router.base_logits.parameters()
-        ),
+        "grad_norm_router_base_gates": _gradient_norm((router.base_gates,)),
         "grad_norm_router_feature_mlp": _gradient_norm(
             router.gaussian_feature_mlp.parameters()
-        ),
-        "grad_norm_router_pixel": _gradient_norm(
-            router.pixel_router.parameters()
         ),
     }
 
@@ -57,19 +60,7 @@ def assert_router_gradient_contract(metrics):
         )
 
 
-def render_frozen_expert_ensemble(
-    viewpoint,
-    ensemble,
-    router,
-    pipe,
-    background,
-    top_k=None,
-):
-    expert_images = []
-    expert_depths = []
-    gaussian_priors = []
-    projected_motions = []
-    coverage_maps = []
+def _render_expert_states(viewpoint, ensemble, pipe, background):
     per_expert = OrderedDict()
     for role, expert in ensemble:
         package = render(
@@ -81,60 +72,185 @@ def render_frozen_expert_ensemble(
             update_deformation_stats=False,
             return_routing_state=True,
         )
-        routing_state = package["routing_state"]
-        gaussian_logits = router.gaussian_logits(
-            role,
-            routing_state,
-            viewpoint,
-            time_value=float(viewpoint.time),
-        )
-        routing_maps = rasterize_endomoeg_routing_features(
-            viewpoint,
-            expert,
-            pipe,
-            routing_state,
-            gaussian_logits,
-        )
-        expert_images.append(package["render"])
-        expert_depths.append(package["depth"].squeeze(0))
-        gaussian_priors.append(routing_maps["gaussian_prior"])
-        projected_motions.append(routing_maps["projected_motion"])
-        coverage_maps.append(routing_maps["coverage"])
         per_expert[role] = {
+            "expert": expert,
             "render": package["render"],
             "depth": package["depth"],
-            "routing_state": routing_state,
-            "gaussian_logits": gaussian_logits,
-            "routing_maps": routing_maps,
+            "routing_state": package["routing_state"],
         }
+    return per_expert
 
-    expert_rgb = torch.stack(expert_images, dim=0)
-    expert_depth = torch.stack(expert_depths, dim=0)
-    gaussian_prior = torch.stack(gaussian_priors, dim=0)
-    projected_motion = torch.stack(projected_motions, dim=0)
-    coverage = torch.stack(coverage_maps, dim=0) > 1e-8
-    weights, residual_logits = router.route_pixels(
-        expert_rgb=expert_rgb,
-        expert_depth=expert_depth,
-        gaussian_prior=gaussian_prior,
-        projected_motion=projected_motion,
-        coverage=coverage,
-        top_k=top_k,
+
+def _compose_and_render(
+    viewpoint,
+    per_expert,
+    gates,
+    pipe,
+    background,
+):
+    state = compose_residual_gaussian_state(
+        per_expert["global"]["routing_state"],
+        per_expert["local"]["routing_state"],
+        per_expert["contact"]["routing_state"],
+        gates,
     )
-    blended_image = (expert_rgb * weights.unsqueeze(1)).sum(dim=0)
-    blended_depth = (expert_depth * weights).sum(dim=0, keepdim=True)
+    package = rasterize_endomoeg_composite_state(
+        viewpoint,
+        per_expert["global"]["expert"],
+        pipe,
+        background,
+        state,
+    )
+    package["composite_state"] = state
+    return package
+
+
+def render_frozen_expert_ensemble(
+    viewpoint,
+    ensemble,
+    router,
+    pipe,
+    background,
+):
+    per_expert = _render_expert_states(
+        viewpoint,
+        ensemble,
+        pipe,
+        background,
+    )
+    global_state = per_expert["global"]["routing_state"]
+    local_state = per_expert["local"]["routing_state"]
+    contact_state = per_expert["contact"]["routing_state"]
+    gates, raw_gates = router.residual_gates(
+        global_state,
+        local_state,
+        contact_state,
+        viewpoint,
+        time_value=float(viewpoint.time),
+    )
+    composite = _compose_and_render(
+        viewpoint,
+        per_expert,
+        gates,
+        pipe,
+        background,
+    )
+    gate_maps = []
+    for index in range(len(RESIDUAL_ROLES)):
+        gate_render = rasterize_endomoeg_routing_features(
+            viewpoint,
+            per_expert["global"]["expert"],
+            pipe,
+            global_state,
+            gates[:, index],
+            probabilities=True,
+        )
+        gate_maps.append(gate_render["gaussian_prior"].clamp(0.0, 1.0))
     return {
-        "render": blended_image,
-        "depth": blended_depth,
-        "weights": weights,
-        "pixel_router_residual_logits": residual_logits,
-        "expert_rgb": expert_rgb,
-        "expert_depth": expert_depth,
-        "gaussian_prior": gaussian_prior,
-        "projected_motion": projected_motion,
-        "coverage": coverage,
+        "render": composite["render"],
+        "depth": composite["depth"],
+        "gates": gates,
+        "raw_gates": raw_gates,
+        "gate_maps": torch.stack(gate_maps, dim=0),
+        "candidate_rgb": {
+            "global": per_expert["global"]["render"],
+            "local": per_expert["local"]["render"],
+            "contact": per_expert["contact"]["render"],
+        },
         "per_expert": per_expert,
+        "composite_state": composite["composite_state"],
     }
+
+
+def _masked_psnr(image, ground_truth, mask):
+    return float(
+        psnr(
+            image.unsqueeze(0),
+            ground_truth.unsqueeze(0),
+            mask.unsqueeze(0),
+        )
+        .mean()
+        .item()
+    )
+
+
+def evaluate_router_headroom(scene, ensemble, pipe, background):
+    cameras = select_fixed_views(scene.getTestCameras(), count=4)
+    if not cameras:
+        return {}
+    totals = OrderedDict(
+        (name, 0.0)
+        for name in ("global", "local", "contact", "full", "oracle")
+    )
+    with torch.no_grad():
+        for viewpoint in cameras:
+            per_expert = _render_expert_states(
+                viewpoint,
+                ensemble,
+                pipe,
+                background,
+            )
+            parent_count = int(
+                per_expert["global"]["routing_state"]["base_point_count"]
+            )
+            full = _compose_and_render(
+                viewpoint,
+                per_expert,
+                torch.ones(
+                    parent_count,
+                    2,
+                    device=background.device,
+                ),
+                pipe,
+                background,
+            )["render"]
+            ground_truth = viewpoint.original_image.to(background.device).float()
+            mask = viewpoint.mask.to(background.device)
+            candidates = torch.stack(
+                (
+                    per_expert["global"]["render"],
+                    per_expert["local"]["render"],
+                    per_expert["contact"]["render"],
+                    full,
+                ),
+                dim=0,
+            )
+            errors = (candidates - ground_truth.unsqueeze(0)).abs().mean(dim=1)
+            oracle_indices = errors.argmin(dim=0)
+            oracle = torch.gather(
+                candidates,
+                0,
+                oracle_indices.unsqueeze(0).unsqueeze(1).expand(
+                    1,
+                    3,
+                    -1,
+                    -1,
+                ),
+            ).squeeze(0)
+            named_images = {
+                "global": candidates[0],
+                "local": candidates[1],
+                "contact": candidates[2],
+                "full": candidates[3],
+                "oracle": oracle,
+            }
+            for name, image in named_images.items():
+                totals[name] += _masked_psnr(image, ground_truth, mask)
+    return {
+        name: value / float(len(cameras))
+        for name, value in totals.items()
+    }
+
+
+def assert_router_headroom(metrics, minimum_gain):
+    if not metrics:
+        raise RuntimeError("Router headroom requires fixed test views")
+    gain = float(metrics["oracle"]) - float(metrics["global"])
+    if gain < float(minimum_gain):
+        raise RuntimeError(
+            "Residual experts provide only {:.4f} dB oracle headroom; "
+            "required {:.4f} dB".format(gain, float(minimum_gain))
+        )
 
 
 def evaluate_frozen_router(
@@ -143,7 +259,6 @@ def evaluate_frozen_router(
     router,
     pipe,
     background,
-    top_k,
 ):
     cameras = select_fixed_views(scene.getTestCameras(), count=4)
     if not cameras:
@@ -158,7 +273,6 @@ def evaluate_frozen_router(
                 router,
                 pipe,
                 background,
-                top_k=top_k,
             )
             image = output["render"].clamp(0.0, 1.0).unsqueeze(0)
             ground_truth = viewpoint.original_image.to(device).float().unsqueeze(0)
@@ -186,9 +300,7 @@ def train_frozen_router(
     tb_writer,
     config,
 ):
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ensemble = FrozenExpertEnsemble.load(
         hyper.endomoeg_bundle_dir,
         minimum_psnr=float(hyper.endomoeg_min_expert_psnr),
@@ -199,25 +311,18 @@ def train_frozen_router(
     router = EndoMoeVolumeAwareRouter(
         ensemble.point_counts(),
         gaussian_hidden_dim=int(hyper.moe_router_hidden_dim),
-        pixel_hidden_dim=int(hyper.moe_pixel_router_hidden_dim),
     ).to(device)
     optimizer = torch.optim.Adam(
         [
             {
-                "params": router.base_logits.parameters(),
+                "params": (router.base_gates,),
                 "lr": float(hyper.endomoeg_router_gaussian_lr),
-                "name": "router_gaussian_logits",
+                "name": "router_base_gates",
             },
             {
-                "params": list(router.role_embedding.parameters())
-                + list(router.gaussian_feature_mlp.parameters()),
+                "params": router.gaussian_feature_mlp.parameters(),
                 "lr": float(hyper.endomoeg_router_feature_lr),
                 "name": "router_feature_mlp",
-            },
-            {
-                "params": router.pixel_router.parameters(),
-                "lr": float(hyper.endomoeg_router_pixel_lr),
-                "name": "router_pixel",
             },
         ],
         eps=1e-15,
@@ -227,45 +332,55 @@ def train_frozen_router(
         dtype=torch.float32,
         device=device,
     )
+    headroom = evaluate_router_headroom(
+        scene,
+        ensemble,
+        pipe,
+        background,
+    )
+    assert_router_headroom(
+        headroom,
+        minimum_gain=float(hyper.endomoeg_min_oracle_headroom),
+    )
+    if tb_writer is not None:
+        for name, value in headroom.items():
+            tb_writer.add_scalar(
+                "router/headroom/psnr_{}".format(name),
+                value,
+                0,
+            )
     train_cameras = scene.getTrainCameras()
     final_metrics = {}
     progress = tqdm(range(1, int(opt.iterations) + 1), desc="Router training")
     for iteration in progress:
         viewpoint = train_cameras[randint(0, len(train_cameras) - 1)]
-        sparse_start = min(
-            max(float(hyper.endomoeg_router_sparse_start), 0.0),
-            1.0,
-        )
-        top_k = (
-            2
-            if iteration / max(int(opt.iterations), 1) >= sparse_start
-            else None
-        )
         output = render_frozen_expert_ensemble(
             viewpoint,
             ensemble,
             router,
             pipe,
             background,
-            top_k=top_k,
         )
         ground_truth = viewpoint.original_image.to(device).float()
         mask = viewpoint.mask.to(device)
-        blended, _, loss_dict = compute_router_losses(
-            output["weights"],
-            output["expert_rgb"],
+        loss_dict = compute_router_losses(
+            output["render"],
+            output["candidate_rgb"]["global"],
+            {
+                role: output["candidate_rgb"][role]
+                for role in RESIDUAL_ROLES
+            },
+            output["gates"],
+            output["gate_maps"],
             ground_truth,
             mask=mask,
-            oracle_temperature=float(
-                hyper.endomoeg_router_oracle_temperature
-            ),
-            lambda_oracle=float(hyper.endomoeg_router_lambda_oracle),
-            lambda_starvation=float(
-                hyper.endomoeg_router_lambda_starvation
-            ),
+            gain_temperature=float(hyper.endomoeg_router_gain_temperature),
+            lambda_gain=float(hyper.endomoeg_router_lambda_gain),
+            lambda_sparsity=float(hyper.endomoeg_router_lambda_sparsity),
+            lambda_no_regret=float(hyper.endomoeg_router_lambda_no_regret),
         )
         dssim_loss = 1.0 - ssim(
-            (blended * mask).unsqueeze(0),
+            (output["render"] * mask).unsqueeze(0),
             (ground_truth * mask).unsqueeze(0),
         )
         total_loss = (
@@ -285,17 +400,14 @@ def train_frozen_router(
             progress.set_postfix(
                 loss="{:.6f}".format(float(total_loss.detach().item())),
                 psnr="{:.2f}".format(
-                    float(
-                        psnr(
-                            blended.unsqueeze(0),
-                            ground_truth.unsqueeze(0),
-                            mask.unsqueeze(0),
-                        )
-                        .mean()
-                        .item()
-                    )
+                    _masked_psnr(output["render"], ground_truth, mask)
                 ),
-                topk="dense" if top_k is None else str(top_k),
+                gL="{:.3f}".format(
+                    float(output["gates"][:, 0].mean().detach().item())
+                ),
+                gC="{:.3f}".format(
+                    float(output["gates"][:, 1].mean().detach().item())
+                ),
             )
         if tb_writer is not None:
             tb_writer.add_scalar(
@@ -306,17 +418,6 @@ def train_frozen_router(
             tb_writer.add_scalar(
                 "router/train/L_dssim",
                 float(dssim_loss.detach().item()),
-                iteration,
-            )
-            tb_writer.add_scalar(
-                "router/train/pixel_residual_abs_mean",
-                float(
-                    output["pixel_router_residual_logits"]
-                    .detach()
-                    .abs()
-                    .mean()
-                    .item()
-                ),
                 iteration,
             )
             for name, value in loss_dict.items():
@@ -340,40 +441,32 @@ def train_frozen_router(
                 router,
                 pipe,
                 background,
-                top_k=top_k,
             )
-            if final_metrics:
-                print(
-                    "\n[ITER {}] Router validation: L1 {:.6f} "
-                    "PSNR {:.3f} SSIM {:.4f}".format(
+            if tb_writer is not None:
+                for name, value in final_metrics.items():
+                    tb_writer.add_scalar(
+                        "router/validation/test/{}".format(name),
+                        value,
                         iteration,
-                        final_metrics["l1"],
-                        final_metrics["psnr"],
-                        final_metrics["ssim"],
                     )
-                )
-                if tb_writer is not None:
-                    for name, value in final_metrics.items():
-                        tb_writer.add_scalar(
-                            "router/validation/test/{}".format(name),
-                            value,
-                            iteration,
-                        )
 
-    if "psnr" not in final_metrics:
-        raise RuntimeError(
-            "Final Router fixed-view validation PSNR was not computed"
+    if not final_metrics:
+        final_metrics = evaluate_frozen_router(
+            scene,
+            ensemble,
+            router,
+            pipe,
+            background,
         )
     payload = build_router_bundle(
         router,
         ensemble,
-        iteration=opt.iterations,
+        iteration=int(opt.iterations),
         config=config,
         validation_metrics=final_metrics,
     )
-    path = save_router_bundle(
-        "{}/router.pth".format(hyper.endomoeg_bundle_dir),
+    save_router_bundle(
+        hyper.endomoeg_router_bundle,
         payload,
     )
-    print("[EndoMoe] Saved frozen-expert Router bundle to {}".format(path))
-    return router, ensemble, final_metrics
+    return router, final_metrics

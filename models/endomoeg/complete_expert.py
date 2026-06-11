@@ -3,11 +3,9 @@ from typing import Dict, Iterable, Optional
 import torch
 import torch.nn as nn
 
-from models.tracking.endomoeg_experts import (
-    TissueLocalExpert,
-    ToolContactExpert,
-)
 from models.tracking.heterogeneous_moe_tracking import TrackingPhase
+from .contact_spacetime import ContactSpacetimeExpert
+from .motion_scaffold import MotionScaffoldLocalExpert
 
 
 COMPLETE_EXPERT_ROLES = ("global", "local", "contact")
@@ -23,6 +21,7 @@ class CompleteExpertScheduler:
     def build(self, iteration, total_iterations):
         del iteration, total_iterations
         contact = self.role == "contact"
+        residual_role = self.role in {"local", "contact"}
         return TrackingPhase(
             name="endomoeg_expert_{}".format(self.role),
             active_geo=1,
@@ -37,8 +36,24 @@ class CompleteExpertScheduler:
             force_geo_expert=self.role,
             force_vis_expert=None,
             trainable_group_prefixes=(
-                "tracking_time_encoder",
-                "tracking_expert_refinement",
+                ("tracking_expert_refinement",)
+                if residual_role
+                else ("tracking_time_encoder",)
+            ),
+            frozen_group_prefixes=(
+                (
+                    "xyz",
+                    "f_dc",
+                    "f_rest",
+                    "opacity",
+                    "scaling",
+                    "rotation",
+                    "tracking_base_deformation",
+                    "tracking_base_grid",
+                    "tracking_time_encoder",
+                )
+                if residual_role
+                else ()
             ),
         )
 
@@ -53,6 +68,18 @@ class CompleteEndoMoeExpert(nn.Module):
         max_rot_delta=0.05,
         max_scale_delta=0.05,
         max_opacity_delta=4.0,
+        scaffold_node_count=256,
+        scaffold_knn=4,
+        scaffold_max_node_offset_ratio=0.02,
+        scaffold_max_radius_scale=4.0,
+        contact_anchor_count=512,
+        contact_chart_count=3,
+        contact_max_spatial_offset_ratio=0.02,
+        contact_max_velocity_ratio=0.05,
+        contact_max_acceleration_ratio=0.05,
+        contact_max_rotation_radians=0.5,
+        contact_max_scale_delta=0.1,
+        contact_initial_duration=0.15,
         enable_rotation=True,
         enable_scale=True,
         enable_opacity=True,
@@ -64,26 +91,27 @@ class CompleteEndoMoeExpert(nn.Module):
         self.role = normalized_role
         self.refinement = None
         if self.role == "local":
-            self.refinement = TissueLocalExpert(
-                time_feature_dim=time_feature_dim,
+            self.refinement = MotionScaffoldLocalExpert(
+                node_count=scaffold_node_count,
+                knn=scaffold_knn,
                 hidden_dim=hidden_dim,
-                max_disp_ratio=max_disp_local_ratio,
-                max_rot_delta=max_rot_delta,
-                max_scale_delta=max_scale_delta,
-                enable_rotation=enable_rotation,
-                enable_scale=enable_scale,
+                max_translation_ratio=max_disp_local_ratio,
+                max_rotation_radians=max_rot_delta,
+                max_node_offset_ratio=scaffold_max_node_offset_ratio,
+                max_radius_scale=scaffold_max_radius_scale,
             )
         elif self.role == "contact":
-            self.refinement = ToolContactExpert(
-                time_feature_dim=time_feature_dim,
+            self.refinement = ContactSpacetimeExpert(
+                anchor_count=contact_anchor_count,
+                chart_count=contact_chart_count,
                 hidden_dim=hidden_dim,
-                max_disp_ratio=max_disp_local_ratio,
-                max_rot_delta=max_rot_delta,
-                max_scale_delta=max_scale_delta,
-                max_opacity_delta=max_opacity_delta,
-                enable_rotation=enable_rotation,
-                enable_scale=enable_scale,
-                enable_opacity=enable_opacity,
+                max_parent_opacity_delta=max_opacity_delta,
+                max_spatial_offset_ratio=contact_max_spatial_offset_ratio,
+                max_velocity_ratio=contact_max_velocity_ratio,
+                max_acceleration_ratio=contact_max_acceleration_ratio,
+                max_rotation_radians=contact_max_rotation_radians,
+                max_scale_delta=contact_max_scale_delta,
+                initial_duration=contact_initial_duration,
             )
 
     def named_parameter_groups(self):
@@ -96,6 +124,15 @@ class CompleteEndoMoeExpert(nn.Module):
     def set_aabb(self, xyz_max, xyz_min):
         if self.refinement is not None:
             self.refinement.set_aabb(xyz_max, xyz_min)
+
+    def initialize_from_canonical(
+        self,
+        canonical_means,
+        canonical_rotations=None,
+    ):
+        initializer = getattr(self.refinement, "initialize_from_canonical", None)
+        if initializer is not None:
+            initializer(canonical_means, canonical_rotations)
 
     def iter_regularized_grids(self):
         return iter(())
@@ -160,15 +197,20 @@ class CompleteEndoMoeExpert(nn.Module):
                 base_opacity,
             )
         else:
-            refined = self.refinement(
-                means3d=base_means3d,
-                scales=base_scales,
-                rotations=base_rotations,
-                opacity_logits=base_opacity,
-                time_values=time_values,
-                scene_scale=scene_scale,
-                camera=camera,
-            )
+            refinement_kwargs = {
+                "means3d": base_means3d,
+                "scales": base_scales,
+                "rotations": base_rotations,
+                "opacity_logits": base_opacity,
+                "time_values": time_values,
+                "scene_scale": scene_scale,
+                "camera": camera,
+            }
+            if self.role in {"local", "contact"}:
+                refinement_kwargs["canonical_means3d"] = canonical_means3d
+            if self.role == "local":
+                refinement_kwargs["canonical_rotations3d"] = canonical_rotations
+            refined = self.refinement(**refinement_kwargs)
 
         means_out = refined["means3d"]
         scales_out = refined["scales"]

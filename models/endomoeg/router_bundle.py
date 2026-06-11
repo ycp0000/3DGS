@@ -8,8 +8,8 @@ from .expert_bundle import EXPERT_ROLES
 
 
 ROUTER_BUNDLE_FORMAT = "endomoeg_frozen_expert_router_bundle"
-ROUTER_BUNDLE_VERSION = 2
-ROUTER_ARCHITECTURE_VERSION = "endomoeg_volume_aware_router_v1"
+ROUTER_BUNDLE_VERSION = 5
+ROUTER_ARCHITECTURE_VERSION = "endomoeg_residual_gate_router_v4"
 
 
 def _absolute_path(path):
@@ -37,12 +37,7 @@ def build_router_bundle(
     iteration,
     config=None,
     validation_metrics=None,
-    inference_top_k=2,
 ):
-    if inference_top_k is not None:
-        inference_top_k = int(inference_top_k)
-        if inference_top_k < 1 or inference_top_k > len(EXPERT_ROLES):
-            raise ValueError("inference_top_k must be between 1 and 3")
     manifest = OrderedDict()
     for role in EXPERT_ROLES:
         payload = ensemble.payloads[role]
@@ -70,7 +65,6 @@ def build_router_bundle(
         "expert_manifest": manifest,
         "point_counts": OrderedDict(router.point_counts),
         "router_state": _cpu_state_dict(router.state_dict()),
-        "inference_top_k": inference_top_k,
         "config": dict(config or {}),
         "validation_metrics": dict(validation_metrics or {}),
     }
@@ -130,11 +124,6 @@ def validate_router_bundle(payload, ensemble=None):
             )
     if not isinstance(payload.get("router_state"), Mapping):
         raise ValueError("Router bundle is missing router_state")
-    inference_top_k = payload.get("inference_top_k")
-    if inference_top_k is not None:
-        inference_top_k = int(inference_top_k)
-        if inference_top_k < 1 or inference_top_k > len(EXPERT_ROLES):
-            raise ValueError("Router inference_top_k must be between 1 and 3")
 
     if ensemble is not None:
         if (

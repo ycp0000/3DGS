@@ -2636,3 +2636,1075 @@ Claude must verify with:
 
 ### 下一步最小任务
 - 服务器拉取 `b70a3fc` 后重跑 Router stage。
+
+## Update 2026-06-11 six-stage TensorBoard root-cause audit
+
+### 已完成
+- 完整解析 `output/01`–`output/06`：canonical、global、local、contact、Router、Joint。
+- 三专家 fixed-view test PSNR 峰值分别为 `34.6898 / 34.7751 / 34.6386`，曲线和最终指标高度同质，未形成可供 MoE 利用的互补误差。
+- Router 在 step 2000 开启 hard top-2 后，oracle CE 从约 `1.05` 跳到约 `5.0–5.4`；global usage 在约 100 step 内降为 0。
+- 证明冲突来源：soft oracle 对三个专家均有正概率，但 hard top-k 将一个权重精确置零，`-p*log(1e-8)` 产生不可消除的大损失。
+- dense Router 已能接近 soft oracle 分布，但 fixed-view PSNR 仅约 `30.68`，说明近均匀 oracle 本身就在鼓励模糊融合，而非质量最优选择。
+- contact transient target 为 `0.15`，最终 usage 仅 `2.73e-5`；`±12` 初始化和弱 balance loss 使 visibility/lifecycle/appearance 专长处于饱和死区。
+- `tracking_time_encoder` 全程梯度为 0；complete expert 实际不消费外层 time features，该 optimizer group 是死参数。
+- 对照官方 EndoGaussian：当前 preset 将 HexPlane `output_coordinate_dim` 从官方 cutting 的 `64` 降为 `32`，且当前 `_forward_original()` 对 deformation residual 增加了官方没有的 `tanh` 硬上限。
+- global expert 的 mean scale delta 最终约 `0.0821`，已达到三轴 `0.05` cap 理论范数上限 `0.0866` 的约 95%，确认专家阶段存在真实容量饱和。
+- 对照官方 MoE-GS：其专家是 Ex4DGS/STG/E-D3DGS/4DGaussians 等异构 deformation priors，并按各自原始配置预训练；当前三个专家只是同一 HexPlane backbone 加轻量 role residual，不等价于论文设定。
+
+### 当前设计决策
+- 当前实验不能用于否定 MoE；它否定的是“同质专家 + 近均匀 soft oracle + hard top-k”的现有实现。
+- 在 faithful EndoGaussian 单专家恢复到 baseline 前，不再继续 Router/Joint 调参。
+- Router 主目标应先回到 photometric L1+DSSIM 的 dense volume-aware blending；稀疏化属于后续效率策略，不能与 full-support oracle 同时训练。
+- 下一版必须先量化同视角的 single expert、uniform blend、per-frame oracle、per-pixel oracle、dense Router、sparse Router，确认理论 headroom 后再训练。
+
+### 仍需做什么
+- 恢复官方 EndoGaussian cutting 容量和 deformation 语义，建立严格 baseline parity run。
+- 重构专家为真正异构 deformation priors，而不是三个同构完整 backbone。
+- 删除或重写 Router oracle/top-k 冲突，并加入 ensemble headroom 诊断与 best-checkpoint 保存。
+- 只有当 dense Router fixed-view PSNR 不低于最佳单专家时，才允许进入 Joint。
+
+### 运行过哪些测试
+- 本轮为只读日志与代码审计；未修改运行时代码，未运行测试。
+
+### 下一步最小任务
+- 先实现 baseline parity：官方 `output_coordinate_dim=64`、无硬 cap 的 EndoGaussian expert，并增加同配置对照测试。
+
+## Update 2026-06-11 heterogeneous expert architecture decision
+
+### 已完成
+- 明确放弃“三个独立同构 HexPlane + RGB softmax 混合”的专家定义；该结构没有稳定的专业分工，也会让 Router 关闭可靠的全局基线。
+- 确定采用共享 canonical Gaussian cloud、Gaussian 状态空间组合、单次 rasterization 的非对称残差 MoE。
+- 定义三个不同函数族：Global EndoGaussian anchor、Local elastic graph expert、Contact/transient visibility expert。
+
+### 当前设计决策
+- Global expert 严格复现官方 EndoGaussian：64 维 HexPlane、完整全局 deformation、始终启用，提供 no-regret baseline。
+- Local expert 使用 deformation graph/control nodes、KNN skinning 与局部 SE(3)/scale residual，仅负责局部弹性几何，不修改 opacity/appearance。
+- Contact expert 使用 contact-conditioned sparse MLP/graph，输入工具距离、深度/运动边界和残差线索，输出稀疏几何、opacity、visibility 与 appearance residual。
+- Local/Contact 使用两个独立 sigmoid gate，不使用和为 1 的 softmax；初始 gate 接近 0，使系统启动时严格等于 Global baseline。
+- 三个分量先在 Gaussian 参数空间组合，再执行一次 rasterization；避免多个独立 cloud 的 RGB 混合、重影和几何错位。
+- Router 监督使用相对 Global baseline 的 incremental gain，而不是对三个绝对误差做近均匀 soft oracle。
+
+### 仍需做什么
+- 编写架构规格与张量接口，明确每个 expert 的输入、输出、初始化、冻结策略和正则项。
+- 先恢复 Global baseline parity，再实现 Local graph residual，最后实现 Contact/transient residual。
+- 增加 `G`、`G+L`、`G+C`、`G+L+C` 与 per-pixel oracle 的 headroom 诊断；无互补增益时禁止训练 Router。
+
+### 运行过哪些测试
+- 本步骤只完成理论与架构决策，未修改运行时代码，未运行测试。
+
+### 下一步最小任务
+- 将 Global expert 恢复为官方 EndoGaussian 等价实现，并增加 baseline parity 单元测试。
+
+## Update 2026-06-11 literature-grounded heterogeneous modules
+
+### 已完成
+- 调研并核对 SC-GS（CVPR 2024）、MoSca（CVPR 2025）、Spacetime Gaussians（CVPR 2024）、NeRF-W（CVPR 2021）、HyperNeRF（TOG 2021）和 EndoGS 的关键模块。
+- 确认当前 `TissueLocalExpert` 与 `ToolContactExpert` 都只是 point-wise residual MLP，缺少已验证的结构先验，是三专家同质化的直接原因。
+- 选定 Local 与 Contact 的文献支撑架构，不再通过扩大 hidden dimension 或增加普通输出 head 修补。
+
+### 当前设计决策
+- Local expert 采用 SC-GS/MoSca 式 sparse motion scaffold：可学习 control nodes、KNN-RBF skinning、节点 SE(3) trajectory、Dual Quaternion Blending、ARAP 与 trajectory acceleration regularization。
+- Local expert 只输出 Global deformation 之上的局部 SE(3) residual；节点图使用 surface-aware/geodesic neighborhood，避免跨组织褶皱错误连接。
+- Contact expert 采用 STG 式 auxiliary spacetime Gaussian bank：temporal RBF opacity、低阶 trajectory/rotation、time/view-dependent feature。
+- Contact bank 使用 parent tissue anchor 跟随 Global+Local 粗运动，并通过 pre/contact/post temporal charts 表示切割、显露和消失；这避免要求连续 deformation field 表示拓扑不连续。
+- Contact expert 借鉴 NeRF-W 的 static/transient decomposition，但 uncertainty 仅用于诊断或受限鲁棒损失，不能自由降低全图困难像素权重。
+- 工具 mask 内部作为 occlusion invalid region；膨胀后的工具边界环、flow/depth discontinuity 与 baseline residual 用于 contact support 和 transient Gaussian spawning。
+- 初始状态保持 Global no-regret：Local SE(3) residual 为 identity，Contact parent visibility 为 1，transient Gaussian opacity 为 0。
+
+### 仍需做什么
+- 先恢复并验证官方 EndoGaussian Global baseline parity。
+- 设计 `MotionScaffoldLocalExpert` 的节点状态、DQB、surface-aware KNN 和 checkpoint schema。
+- 设计 `ContactSpacetimeExpert` 的 parent/child Gaussian 生命周期、temporal chart 和受限 visibility 接口。
+- 重写 Router 为 independent residual gates，并删除当前 full-image expert RGB softmax oracle。
+
+### 运行过哪些测试
+- 本步骤为文献调研、代码接口审计与架构决策；未修改运行时代码，未运行测试。
+
+### 下一步最小任务
+- 完成 Global baseline parity 后，仅实现 Local motion scaffold 的 identity-start 数据结构与变换单元测试。
+
+## Update 2026-06-11 Global baseline parity implementation
+
+### 已完成
+- `scene/deformation.py` 的官方 EndoGaussian backbone 恢复为 raw residual addition，移除 position/scale/rotation/opacity 上非官方的 `tanh` 硬上限。
+- cutting/pulling EndoMoe preset 的 HexPlane `output_coordinate_dim` 从 32 恢复为 64。
+
+### 当前设计决策
+- Global anchor 必须与官方 EndoGaussian deformation 语义一致；Local/Contact 的稳定性由各自结构先验和 residual identity initialization 保证，不能通过压缩 Global 容量换取。
+- 旧 motion cap 参数只保留给 legacy residual heads，不再限制官方 backbone。
+
+### 仍需做什么
+- 增加 raw residual 与 64-dimensional preset parity 测试。
+- 运行 Global 定向回归后开始 Local motion scaffold。
+
+### 运行过哪些测试
+- 本次三个运行时/配置文件修改后尚未运行测试。
+
+### 下一步最小任务
+- 添加 Global parity 测试并运行 complete expert/preset 最小回归。
+
+## Update 2026-06-11 Global parity verification
+
+### 已完成
+- 新增测试验证 EndoGaussian backbone 对超过旧 cap 的 position/scale/rotation/opacity residual 仍按 raw value 直接相加。
+- preset 测试现在强制 cutting/pulling EndoMoe 使用 64-dimensional HexPlane。
+
+### 当前设计决策
+- baseline parity 由可执行测试保护，不再依赖配置注释或人工检查。
+
+### 仍需做什么
+- 实现 Local sparse motion scaffold，并保证首轮严格 identity。
+- 为 control-node 初始化时机和 optimizer parameter registration 建立明确契约。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py tests/test_endonerf_presets.py -q --tb=short --basetemp .pytest_tmp_global_parity`
+- 结果：`28 passed, 2 warnings`。
+
+### 下一步最小任务
+- 审计 Gaussian/optimizer 初始化顺序，确定 motion scaffold 节点的静态参数化方式。
+
+## Update 2026-06-11 Local motion scaffold core
+
+### 已完成
+- 新增 `MotionScaffoldLocalExpert`，使用 farthest-point control nodes、surface-aware KNN、learnable RBF radii、node SE(3) trajectories 与 Dual Quaternion Blending。
+- Local scaffold 输出 Global backbone 之上的 position/rotation residual，不修改 scale、opacity 或 appearance。
+- 加入 ARAP、trajectory acceleration、node motion/radius diagnostics，并保持 trajectory output zero initialization。
+- `CompleteEndoMoeExpert(local)` 已切换到 scaffold；tracking architecture 标记升级为 `endomoeg_complete_local_v2`。
+
+### 当前设计决策
+- scaffold 所有可训练参数在模块构造时注册；canonical-dependent node buffers 在 optimizer 创建前初始化，避免 lazy parameter 遗漏。
+- node pivot 使用 Global displacement 的 RBF 聚合位置，因此 Local residual 跟随 Global coarse motion，而不是围绕静态 canonical pivot 旋转。
+- DQB 用于混合邻域 SE(3)，避免 LBS quaternion 线性插值造成非刚体旋转伪影。
+
+### 仍需做什么
+- 在 `GaussianModel.training_setup()` 前接入 canonical node initialization。
+- 增加 identity、DQB rigid transform、梯度与 checkpoint round-trip 测试。
+- 将 scaffold ARAP/acceleration 接入 tracking loss 和 TensorBoard。
+
+### 运行过哪些测试
+- 本次三个文件修改后尚未运行测试。
+
+### 下一步最小任务
+- 接入 optimizer 前初始化并运行 Local scaffold 最小测试。
+
+## Update 2026-06-11 Local scaffold initialization contract
+
+### 已完成
+- `GaussianModel.training_setup()` 在 optimizer 参数组创建前，用 canonical means/rotations 初始化 scaffold 节点。
+- surface-aware KNN 改为使用 canonical rotations 估计表面方向，避免 Global 动态旋转污染 canonical 邻接。
+- 新增 Local identity-start、统一 node SE(3) 的刚体距离保持、rotation normalization 测试。
+
+### 当前设计决策
+- canonical node positions/normals 是 checkpoint buffer；trajectory、node offsets 和 radii 是构造期已注册参数。
+- densification 不重新采样节点，保证训练期间 scaffold 拓扑和 optimizer state 稳定；新 Gaussians 通过现有 KNN 自动绑定。
+
+### 仍需做什么
+- 运行 Local 定向测试并修复数值/接口问题。
+- 将 ARAP 和 acceleration 显式加入 tracking loss 与日志。
+
+### 运行过哪些测试
+- 本次初始化与测试接线后尚未运行测试。
+
+### 下一步最小任务
+- 运行 complete expert 测试，验证 DQB 与初始化契约。
+
+## Update 2026-06-11 Local scaffold verification
+
+### 已完成
+- Local scaffold identity、optimizer 前初始化、统一 node translation 刚体距离保持、rotation normalization 均通过。
+- acceleration regularization 改为使用真实 axis-angle 二阶差分，移除 quaternion-vector 小角度近似误差。
+
+### 当前设计决策
+- deformation graph 中“各节点相同局部旋转”是绕不同 pivot 的局部形变，不应误判为同一全局刚体；刚体不变量测试使用统一 translation。
+
+### 仍需做什么
+- 将 `scaffold_arap` 与 `scaffold_acceleration` 加入总 loss 和 TensorBoard。
+- 配置 node count、KNN、ARAP/acceleration 权重。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py -q --tb=short --basetemp .pytest_tmp_local_scaffold`
+- 结果：`12 passed`。
+
+### 下一步最小任务
+- 接入 scaffold regularization 与配置回归。
+
+## Update 2026-06-11 Local scaffold configuration
+
+### 已完成
+- 新增 scaffold node count、KNN、ARAP、trajectory acceleration、node-offset regularization 配置。
+- cutting/pulling preset 使用 256 control nodes 与 4-neighbor skinning。
+- ARAP、translation acceleration 和 node offset 全部按 scene scale 归一化。
+
+### 当前设计决策
+- 默认权重：ARAP `1e-2`、acceleration `1e-3`、node offset `1e-3`；三者分别约束局部刚性、时间二阶平滑和 canonical scaffold 漂移。
+
+### 仍需做什么
+- tracking loss 消费三个 scaffold raw terms，并自动写入 TensorBoard。
+- 增加 preset 和 loss 数值测试。
+
+### 运行过哪些测试
+- 配置接入后尚未运行测试。
+
+### 下一步最小任务
+- 实现 scaffold loss aggregation 并运行 Local/preset 回归。
+
+## Update 2026-06-11 Local scaffold loss verification
+
+### 已完成
+- `scaffold_arap`、`scaffold_acceleration`、`scaffold_node_offset` 已加入 tracking total loss。
+- node translation norm 与 mean radius 作为诊断标量进入现有 TensorBoard tracking logger。
+- 增加 loss 权重数值测试和 preset 回归。
+
+### 当前设计决策
+- scaffold 模块返回 raw physical terms；统一 loss 层负责权重，便于 ablation 和 TensorBoard 对照。
+
+### 仍需做什么
+- 实现 Contact auxiliary spacetime Gaussian bank。
+- Contact 必须以 zero-opacity/identity 启动，并支持 temporal RBF lifecycle。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py tests/test_endonerf_presets.py -q --tb=short --basetemp .pytest_tmp_local_losses`
+- 结果：`30 passed, 2 warnings`。
+
+### 下一步最小任务
+- 设计并实现 Contact spacetime bank 的 parent binding 和 temporal lifecycle。
+
+## Update 2026-06-11 Contact spacetime bank core
+
+### 已完成
+- 新增 `ContactSpacetimeExpert`：FPS tissue anchors、pre/contact/post temporal charts、temporal RBF opacity、二阶 trajectory、rotation velocity、scale 与 RGB residual。
+- child Gaussians 每帧重新绑定最近 canonical parent，并继承 Global backbone 后的 parent pose，兼容训练期间 densification/pruning。
+- parent opacity/appearance branch 使用投影工具边界作为训练 cue；无 mask 时仍可由 learned spatial-temporal support 推理。
+- child amplitude 使用 exact-zero forward、sigmoid-surrogate backward 的 straight-through gate，启动时不改变 Global render 且保持可学习梯度。
+- Contact architecture 标记升级为 `endomoeg_complete_contact_v2`。
+
+### 当前设计决策
+- Contact 不再让所有 canonical Gaussians承担瞬态拓扑，而通过 auxiliary spacetime bank 表示出现/消失表面。
+- 三个 temporal charts 默认中心为 0.2/0.5/0.8，中心和 duration 可学习；这是对 HyperNeRF multi-chart 与 STG lifecycle 的工程化结合。
+- 工具内部 mask 不作为可重建目标；膨胀边界 ring 仅提供 contact supervision，不作为推理时硬门控。
+
+### 仍需做什么
+- renderer 追加 auxiliary Gaussians，并保持 parent densification 张量契约。
+- 加入 contact bank sparsity、contact locality、acceleration、offset、duration regularization。
+- 增加 zero-render、temporal RBF 和 renderer shape 测试。
+
+### 运行过哪些测试
+- Contact 核心三个文件修改后尚未运行测试。
+
+### 下一步最小任务
+- 先运行模块语法检查，再接入 renderer auxiliary Gaussian path。
+
+## Update 2026-06-11 Contact renderer integration
+
+### 已完成
+- renderer 可将 Contact auxiliary spacetime Gaussians 追加到 parent cloud 后单次 rasterize。
+- auxiliary child 继承 parent RGB 并叠加 learned residual；scale/rotation 使用 GaussianModel 原激活函数，opacity 使用 STG temporal alpha。
+- rasterizer 可见性/radii 对外只返回 parent 长度，确保 densification/pruning 不处理 auxiliary bank。
+- routing state 保留 parent+child 全量几何、运动、opacity 和 auxiliary count，供后续 residual Router 计算 contact coverage。
+- 新增 Contact zero-opacity、temporal chart、straight-through amplitude gradient 与 renderer shape 测试。
+
+### 当前设计决策
+- auxiliary bank 参数属于 deformation expert checkpoint，不进入 canonical Gaussian optimizer，也不参与 densification。
+- exact-zero auxiliary alpha 是 no-regret 启动条件；测试必须直接验证其 surrogate gradient，不能用零点平方损失误判参数冻结。
+
+### 仍需做什么
+- 将 Contact sparsity/locality/acceleration/offset/duration 加入 tracking loss。
+- 配置 anchor/chart 数量及正则权重。
+- 重构 Router 以正确处理 parent+child coverage，而不再做三专家和为 1 的 RGB softmax。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py tests/test_disentangled_moe_tracking.py -q --tb=short --basetemp .pytest_tmp_contact_stg`
+- 首轮 1 个旧梯度测试失败，原因是 exact-zero 输出的平方损失在零点无梯度；改为直接测试 auxiliary alpha surrogate。
+- 修正后结果：`107 passed`。
+
+### 下一步最小任务
+- 接入 Contact physical regularization 和配置测试。
+
+## Update 2026-06-11 Contact regularization design
+
+### 已完成
+- Contact bank 新增 locality raw term：只对当前 temporal RBF 激活且远离投影工具边界的 child 施加惩罚。
+- 新增 Contact anchor/chart 数量以及 sparsity、locality、acceleration、offset、duration 默认权重。
+- cutting preset 已写入完整 Contact 配置。
+
+### 当前设计决策
+- locality 使用工具边界作为训练 teacher，但不硬乘到 inference alpha；避免测试/视频相机缺失 mask 时动态内容消失。
+- duration penalty 与 amplitude sparsity共同限制 transient bank 占据整个时间轴。
+
+### 仍需做什么
+- 同步 pulling preset。
+- tracking loss 消费五个 Contact raw terms，并增加数值测试。
+
+### 运行过哪些测试
+- 本次三个文件修改后尚未运行测试。
+
+### 下一步最小任务
+- 完成 Contact loss aggregation 与 preset 回归。
+
+## Update 2026-06-11 Contact loss verification
+
+### 已完成
+- Contact sparsity、locality、acceleration、spatial offset、duration 已纳入 tracking total loss。
+- temporal activity 与 projected boundary support 自动进入 TensorBoard。
+- pulling preset 同步 Contact 配置并完成完整定向回归。
+
+### 当前设计决策
+- Contact 专家训练目标现在明确区分：photometric reconstruction 学习内容，locality 学习空间专长，RBF/duration 学习时间专长，sparsity 控制 bank 容量。
+
+### 仍需做什么
+- 将现有三专家 softmax RGB Router 重构为 Global always-on 的 Local/Contact independent residual gates。
+- 加入 `G/G+L/G+C/G+L+C` headroom 诊断与 Router fail-fast。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py tests/test_endonerf_presets.py tests/test_disentangled_moe_tracking.py -q --tb=short --basetemp .pytest_tmp_contact_losses`
+- 结果：`125 passed, 2 warnings`。
+
+### 下一步最小任务
+- 重构 Router candidate composition 和 incremental-gain objective。
+
+## Update 2026-06-11 residual expert freeze contract
+
+### 已完成
+- `TrackingPhase` 新增显式 `frozen_group_prefixes`，其优先级高于历史 always-trainable 白名单。
+- Local/Contact phase 现在冻结 canonical xyz/SH/opacity/scale/rotation、Global deformation/grid 和 outer time encoder。
+- Local/Contact 仅允许 `tracking_expert_refinement` 更新；Global 仍训练官方 EndoGaussian backbone 与 canonical cloud。
+- 单测覆盖 Local/Contact base/canonical frozen contract。
+
+### 当前设计决策
+- 真正的 residual expert 必须建立在同一固定 Global anchor 上；禁止通过重新优化 canonical 或 backbone 偷偷承担整场重建。
+
+### 仍需做什么
+- Local/Contact expert stage 从 `global.pth` 恢复 canonical 与 Global backbone，而不是从 `canonical.pth` 独立开始。
+- 增加 Global anchor PSNR quality gate 和 state transplant 测试。
+
+### 运行过哪些测试
+- 冻结契约修改后尚未运行测试。
+
+### 下一步最小任务
+- 实现 Global bundle 到 residual expert 的严格 state transplant。
+
+## Update 2026-06-11 Global anchor state transplant
+
+### 已完成
+- 新增严格 Global anchor transplant：恢复 Global expert 优化后的 canonical cloud、time encoder、HexPlane/grid 与 deformation heads。
+- transplant 过滤 `complete_expert_head` 命名空间，Local scaffold/Contact bank 保持各自 identity 初始化参数。
+- 仅允许 `endomoeg_complete_global_v1` 注入 Local/Contact；tracking type、role、shape 和 spatial context 全部 fail-fast。
+- expert pipeline 中 Global 从 canonical bundle 训练；Local/Contact 改为从已验证 `global.pth` 初始化。
+
+### 当前设计决策
+- Local/Contact 的输入基线不是 Stage 1 static canonical，而是达到质量门槛的 Stage 2 Global dynamic anchor。
+- 三个最终 bundle 可有不同 auxiliary state，但基础 canonical 和 Global deformation lineage 必须一致。
+
+### 仍需做什么
+- expert 参数验证要求 Local/Contact 提供正数 `endomoeg_min_expert_psnr`。
+- 增加 transplant 不覆盖 residual、shape mismatch 和 frozen optimizer LR 测试。
+
+### 运行过哪些测试
+- 本次三个运行时文件修改后尚未运行测试。
+
+### 下一步最小任务
+- 增加 Global anchor quality gate 与 transplant 回归。
+
+## Update 2026-06-11 Global anchor gate and lineage tests
+
+### 已完成
+- Local/Contact expert CLI 现在必须提供正数 `endomoeg_min_expert_psnr`，用于加载 `global.pth` 时的质量门槛。
+- 新增 transplant 测试：Global canonical/appearance/backbone 被完整复制，Local scaffold 参数逐项保持初始化值。
+- EndoNeRF preset/CLI 测试同步 residual expert quality-gate 契约。
+
+### 当前设计决策
+- residual expert 不允许绕过 Global 质量门；若 Global 未达到 baseline，pipeline 必须停止，而不是让 Local/Contact 重新承担全场拟合。
+
+### 仍需做什么
+- 运行 transplant/freeze/preset 定向测试。
+- 重构 residual Router 和 headroom diagnostics。
+
+### 运行过哪些测试
+- quality gate 与 transplant 测试添加后尚未运行。
+
+### 下一步最小任务
+- 验证 residual lineage 后开始 Router 重构。
+
+## Update 2026-06-11 residual lineage verification
+
+### 已完成
+- Global anchor transplant、residual parameter preservation、freeze contract 和 CLI quality gate 全部通过。
+
+### 当前设计决策
+- Stage 2 现在具有严格依赖：canonical → Global；Stage 3 residual experts：Global → Local/Contact；不再是三个并行完整专家。
+
+### 仍需做什么
+- Router 改为 Global always-on 的两个 independent residual gates。
+- headroom 在 Router 训练前验证 Local/Contact 是否真实改善 Global。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py tests/test_endonerf_presets.py -q --tb=short --basetemp .pytest_tmp_anchor_lineage`
+- 结果：`34 passed, 2 warnings`。
+
+### 下一步最小任务
+- 重写 Router loss 与 candidate composition。
+
+## Update 2026-06-11 residual Gaussian-state Router core
+
+### 已完成
+- 删除三专家 softmax、soft oracle CE、starvation、hard/straight-through top-k 与 pixel RGB blending。
+- 新 Router 输出 Local/Contact 两个独立 exact-zero straight-through gates；Global 始终启用。
+- 新增 Gaussian-state composition：parent position/scale/rotation/opacity/color residual 组合，Contact child opacity 由 parent contact gate 控制，child 同时继承 Local parent displacement。
+- final ensemble 使用单次 composite rasterization；expert renders 仅用于 frozen candidate/headroom 和 incremental-gain supervision。
+- Router loss 改为 photometric reconstruction、incremental-gain BCE、gate sparsity 与 no-regret penalty。
+- Router 训练前评估 `G/G+L/G+C/G+L+C/per-pixel oracle` fixed-view PSNR，并在 oracle headroom 不足时 fail-fast。
+
+### 当前设计决策
+- 路由是 residual activation 问题，不是互斥 expert classification；两个 gate 不要求和为 1。
+- exact-zero gate 保证 Router 初始化输出严格等于 Global anchor。
+- Local/Contact candidate 仅提供相对 Global 的增益 teacher，不再生成近均匀概率分布。
+
+### 仍需做什么
+- 更新 Router bundle/inference/Joint 到新参数和无 top-k 协议。
+- 增加新 Router composition、gradient、headroom、mask 测试，删除旧 softmax 测试。
+- 新增 Router 配置参数。
+
+### 运行过哪些测试
+- Router 核心重写后尚未运行测试。
+
+### 下一步最小任务
+- 升级 bundle 与 inference 协议并做 Python 语法检查。
+
+## Update 2026-06-11 residual Router bundle and Joint integration
+
+### 已完成
+- Router bundle 升级为 version 3 / `endomoeg_residual_gate_router_v2`，并明确拒绝任何非空 `inference_top_k`。
+- Joint optimizer 改为只优化 `base_gates` 与 Gaussian feature MLP，删除旧 pixel router、role embedding 与稀疏 top-k 调度。
+- Joint reconstruction 改为消费单次 Gaussian-state composite render、Local/Contact gate maps 与 incremental-gain/no-regret losses。
+
+### 当前设计决策
+- Router 的工程协议与理论协议统一：Global always-on，Local/Contact 是两个相互独立的 residual gates。
+- Joint finetune 不再重新引入 softmax expert competition；专家联合更新仍围绕同一个 residual composition objective。
+
+### 仍需做什么
+- 清理 Joint 中剩余的旧 `top_k` 参数传递。
+- 补齐新 Router 配置、expert bundle 版本与对应测试。
+- 更新 README，删除 oracle CE、anti-starvation、top-k 的旧描述。
+
+### 运行过哪些测试
+- `python -m py_compile models/endomoeg/router.py models/endomoeg/router_training.py models/endomoeg/router_bundle.py models/endomoeg/joint_training.py models/endomoeg/inference.py gaussian_renderer/__init__.py`
+- 结果：passed。
+
+### 下一步最小任务
+- 删除 Joint 的旧 `top_k` 调用并运行 Router/Joint 定向测试。
+
+## Update 2026-06-11 top-k protocol removal
+
+### 已完成
+- 删除 Router render/evaluation API 的 `top_k` 参数，不再保留“传入后报错”的伪兼容路径。
+- Joint bundle 保存固定使用 `inference_top_k=None`，最终评估不再访问旧 `assembly.top_k`。
+- Inference assembly 不再暴露旧 top-k 状态。
+
+### 当前设计决策
+- residual gates 是两个可同时激活的独立连续变量；top-k 会错误地重新引入互斥专家假设，因此从运行时 API 完整移除。
+
+### 仍需做什么
+- 清理 Router 构造器中的旧 pixel-router 参数与配置。
+- 升级 expert bundle lineage 版本并重写 Router/Joint 测试。
+
+### 运行过哪些测试
+- 修改后尚未运行；下一步先做语法检查与旧 API 搜索。
+
+### 下一步最小任务
+- 验证 top-k 已无运行时引用，然后补齐新配置契约。
+
+## Update 2026-06-11 Router runtime API cleanup
+
+### 已完成
+- Router 构造器删除未使用的 `pixel_hidden_dim`，只保留 Gaussian feature MLP 容量参数。
+- Inference 按新构造契约恢复 Router。
+- `render.py` 删除最后一处 `assembly.top_k`，渲染与训练现在共享同一 residual composition 路径。
+
+### 当前设计决策
+- Router 决策定义在 Gaussian state 上，pixel map 只由 Gaussian gates 投影得到，不再存在独立 pixel router。
+
+### 仍需做什么
+- 删除配置中的 pixel-router/oracle/starvation/sparse 参数，加入 gain/no-regret/headroom 参数。
+- 更新 Router training 构造调用与测试。
+
+### 运行过哪些测试
+- 前一轮 top-k 清理后 `py_compile` passed；本轮修改后待重新验证。
+
+### 下一步最小任务
+- 收紧默认配置与 cutting/pulling preset。
+
+## Update 2026-06-11 residual Router configuration
+
+### 已完成
+- Router training 按新构造器只传入 Gaussian feature hidden dimension。
+- 新增 minimum oracle headroom、incremental-gain temperature/weight、gate sparsity 与 no-regret 权重。
+- 删除 complete pipeline 未使用的 pixel-router LR、oracle CE、starvation 与 Joint sparse 配置。
+- cutting preset 已切换到 residual Router 参数。
+
+### 当前设计决策
+- 默认 headroom 门槛为 `0.3 dB`；若 Local/Contact 对 Global 没有可验证增益，Router 阶段直接失败。
+- gain teacher 温度 `0.02`，gain BCE `0.1`，gate sparsity `1e-3`，no-regret `0.5`，优先保证不劣于 Global。
+
+### 仍需做什么
+- 同步 pulling preset。
+- 升级 expert bundle lineage 版本并重写测试。
+
+### 运行过哪些测试
+- 本组三文件修改后待运行定向配置测试。
+
+### 下一步最小任务
+- 同步 pulling 配置与 expert bundle 版本契约。
+
+## Update 2026-06-11 residual expert bundle contract
+
+### 已完成
+- pulling preset 已同步 residual Router 参数。
+- expert bundle 升级为 version 3 / `endomoeg_heterogeneous_residual_expert_v3`。
+- bundle validation 新增 role-specific architecture 检查：Global v1、Local v2、Contact v2，并核对 payload 与 expert state 的 tracking type/version。
+
+### 当前设计决策
+- 新 Router 只接受同一 Global lineage 上产生的 heterogeneous residual experts；旧“独立完整专家”bundle 必须显式失效，避免静默错配。
+
+### 仍需做什么
+- 重写 Router 与 Joint 测试以匹配 residual gates。
+- 更新 preset 测试和 README。
+
+### 运行过哪些测试
+- 本组修改后尚未运行；下一步先做配置/语法验证。
+
+### 下一步最小任务
+- 运行 preset 与 bundle 定向测试，按失败重写旧 Router 测试。
+
+## Update 2026-06-11 residual Router regression suite
+
+### 已完成
+- 完整重写 `tests/test_endomoeg_router.py`，删除 softmax、pixel router、oracle CE、starvation 与 top-k 断言。
+- 新测试覆盖 equal-parent contract、exact-zero gates、surrogate gradients、incremental gain targets、state composition、Contact child gating、no-regret、bundle lineage、render gradient chain、headroom fail-fast 与 inference freeze。
+- preset 测试改为验证 headroom/gain/sparsity/no-regret 参数。
+
+### 当前设计决策
+- 回归测试直接验证“零 gate 等于 Global”与“Local/Contact 只作为增量状态”，这是新架构最关键的 no-regret 不变量。
+
+### 仍需做什么
+- 运行新 Router 测试并修复真实接口问题。
+- 更新 Joint 测试的 optimizer group 数量与 bundle top-k 断言。
+
+### 运行过哪些测试
+- 重写前 probe：preset `33 passed, 1 failed`；Router 测试因旧 import collection error。
+
+### 下一步最小任务
+- 运行 Router/preset 定向测试，随后更新 Joint 测试。
+
+## Update 2026-06-11 Joint and bundle regression alignment
+
+### 已完成
+- Joint 测试移除 pixel router/top-k，optimizer group 预期改为 2 个 Router groups + 3 个 expert groups。
+- Joint 保存测试确认新 bundle 固定 `inference_top_k=None`。
+- expert bundle 测试改用合法 Global residual architecture，并增加 role-specific architecture 拒绝测试。
+
+### 当前设计决策
+- Joint 仅允许 Global deformation 与 Local/Contact refinement 小学习率更新；canonical cloud 始终冻结。
+- bundle 的 architecture mismatch 在加载前失败，不允许依靠 state_dict shape error 间接发现。
+
+### 仍需做什么
+- 运行 Joint、bundle 与 Router 联合回归。
+- 检查剩余旧协议字符串并更新 README。
+
+### 运行过哪些测试
+- 新 Router：`14 passed`。
+- preset + complete experts：`34 passed, 2 warnings`。
+- Joint probe：旧 constructor 导致 `4 failed`，现已按新协议修正。
+
+### 下一步最小任务
+- 运行 EndoMoe 全部定向测试并清理实现残留。
+
+## Update 2026-06-11 documentation and Joint lineage correction
+
+### 已完成
+- README 已改写为 Global anchor → Local/Contact residual experts → independent residual gates 的完整方法、命令、日志与 ablation。
+- 定向回归达到 `59 passed, 2 warnings`，旧 Router Python 协议搜索无残留。
+- 发现并修复 Joint 的深层 lineage 问题：Joint 不再更新 Global deformation，只训练 Router 与 Local/Contact refinement。
+
+### 当前设计决策
+- Global anchor 一旦用于生成 residual bundles，就必须在 Router/Joint 全程冻结；否则 Local/Contact 中保存的 Global 副本会相对当前 Global 漂移，使 `(expert - Global)` 不再是纯 residual。
+- Joint 的合法更新集合现在是 Router base gates、Router feature MLP、Local scaffold、Contact bank。
+
+### 仍需做什么
+- 删除 Joint Global LR 配置并更新 Joint 测试/README 对应描述。
+- 运行完整测试与独立 Codex 审核。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_endomoeg_router.py tests/test_endomoeg_joint.py tests/test_endomoeg_bundles.py tests/test_complete_endomoeg_experts.py tests/test_endonerf_presets.py ...`
+- 结果：`59 passed, 2 warnings`（发生在 Joint lineage 修正前）。
+- `python -m compileall -q models/endomoeg gaussian_renderer scene train.py render.py arguments`：passed。
+
+### 下一步最小任务
+- 同步 Joint 配置与回归测试，验证 Global 始终冻结。
+
+## Update 2026-06-11 frozen-Global Joint configuration
+
+### 已完成
+- 默认参数与 cutting/pulling preset 删除 `endomoeg_joint_global_deformation_lr`。
+- Joint 配置现在只包含 Router 小学习率、residual refinement 学习率、anchor loss、gradient clipping 与质量门。
+
+### 当前设计决策
+- 不提供“低学习率更新 Global”的隐藏开关；只要 Global 改变，已训练 residual 的参考系就改变，因此该行为在当前 bundle 架构中理论上不合法。
+
+### 仍需做什么
+- 更新 Joint 测试，确认 Global deformation 全冻结且 optimizer 只有 4 组。
+- README 删除旧 Global 可更新描述与 gradient tag。
+
+### 运行过哪些测试
+- 本组三个配置文件修改后尚未运行。
+
+### 下一步最小任务
+- 更新 Joint regression 与 README，再运行定向测试。
+
+## Update 2026-06-11 frozen-Global Joint regression
+
+### 已完成
+- Joint regression 现在断言 Global deformation 全冻结、expert optimizer 只包含 Local/Contact，optimizer 总组数为 4。
+- README 明确 Joint 冻结 Global anchor，并删除 Global gradient 监控项。
+
+### 当前设计决策
+- Joint 只做 residual specialization 与 routing calibration，不再改变共同参考系。
+
+### 仍需做什么
+- 运行 Joint/Router/bundle/preset 定向测试。
+- 检查 README 命令与实现参数完全一致。
+
+### 运行过哪些测试
+- 本轮修改后尚未运行。
+
+### 下一步最小任务
+- 执行定向回归与文档协议搜索。
+
+## Update 2026-06-11 covariance-compatible residual composition
+
+### 已完成
+- 定向回归再次达到 `59 passed, 2 warnings`。
+- 修复 `compute_cov3D_python=True` 时 routing state 丢失 scale/rotation 的问题；Router composition 现在始终获得显式 Gaussian state。
+- routing-feature rasterization 在已有 covariance 时仍只向 rasterizer 传 covariance，不会同时传 scale/rotation。
+- 增加 covariance 路径回归，并清理 README 最后一处 independent-expert 旧措辞。
+
+### 当前设计决策
+- expert candidate 可以按 covariance 路径渲染，但 residual composition 必须保留可组合的 scale/rotation 参数；两种表示在 routing state 中同时保存，实际 raster 调用只选择一种。
+
+### 仍需做什么
+- 运行 covariance 定向测试与完整 EndoMoe 测试。
+- 执行独立 Codex 理论/工程审核。
+
+### 运行过哪些测试
+- Joint/Router/bundle/preset/complete expert：`59 passed, 2 warnings`（covariance 修复前）。
+- `compileall`：passed。
+
+### 下一步最小任务
+- 验证 covariance 回归后启动独立审核。
+
+## Update 2026-06-11 full-suite render protocol cleanup
+
+### 已完成
+- covariance/routing 定向测试通过：`16 passed`。
+- 完整测试首次运行达到 `161 passed, 1 failed`；唯一失败来自 `test_endomoeg_render.py` 的旧 mock 仍要求 `top_k`。
+- render regression 已同步新 residual Router API，删除 assembly/mock/top-k 断言。
+- 独立 Codex 与 reviewer 子代理均已按要求调用，但 ChatGPT Codex 账户模型/额度限制导致审核任务在执行前失败。
+
+### 当前设计决策
+- 不为测试保留已废弃的 top-k 兼容参数；生产 API 和测试都使用同一严格 residual-gate 协议。
+
+### 仍需做什么
+- 重跑完整测试。
+- 在本会话内完成逐文件 diff 审核，重点检查 Contact bank、Local scaffold、Router 与训练阶段契约。
+
+### 运行过哪些测试
+- covariance + Router：`16 passed`。
+- full suite probe：`161 passed, 1 failed, 2 warnings`；失败仅为旧测试签名，现已修复。
+- `compileall`：passed。
+
+### 下一步最小任务
+- 重跑完整测试并开始最终 diff 审核。
+
+## Update 2026-06-11 manual architecture audit fixes
+
+### 已完成
+- 完整测试通过：`162 passed, 2 warnings`。
+- 新增 residual topology contract：Local/Contact expert fine stage 禁止 SH-degree progression、densification、pruning 与 topology mutation。
+- 修复 Python SH evaluation 使用 canonical position 的问题，统一改为 deformed `means3D_final` view direction。
+- appearance/color residual 改为仅下界截断，保证零 residual 时不会把 Global 的高动态范围颜色静默截到 1。
+- Router state composition 的 parent color 同样保持 Global 零-gate精确等价。
+
+### 当前设计决策
+- Local/Contact 必须保持与 Global 完全相同的 parent topology；residual 专家只允许更新 refinement 参数。
+- “zero residual equals Global”不仅约束几何与 opacity，也约束 view-dependent color 数值域。
+
+### 仍需做什么
+- 对 gate-map projection 做 coverage normalization。
+- 在 FrozenExpertEnsemble 加载时验证三份 trained canonical fingerprint 与 active SH degree 一致。
+- 增加 topology、coverage 与 lineage 回归测试。
+
+### 运行过哪些测试
+- full suite（上述新修复前）：`162 passed, 2 warnings`。
+
+### 下一步最小任务
+- 实现 coverage normalization 与 ensemble lineage fail-fast。
+
+## Update 2026-06-11 coverage and canonical-lineage contracts
+
+### 已完成
+- residual gate map 改为 `alpha-weighted gate / coverage`，避免低 opacity 区域把真实 gate 系统性压小。
+- FrozenExpertEnsemble 在构造时验证 Local/Contact 的 trained canonical fingerprint 与 active SH degree 必须等于 Global。
+- 新增 residual expert topology policy 回归测试。
+
+### 当前设计决策
+- pixel gate map 表示可见 Gaussian 的条件 gate 概率，而不是 gate 与 alpha coverage 的乘积。
+- source canonical 相同不足以证明 residual lineage；必须验证 Global 训练后的 canonical state 完全相同。
+
+### 仍需做什么
+- 增加 gate coverage 数值测试、ensemble canonical mismatch 测试与 HDR color identity 测试。
+- 运行定向和完整回归。
+
+### 运行过哪些测试
+- 本组三文件修改后尚未运行。
+
+### 下一步最小任务
+- 补齐三项回归测试并执行定向验证。
+
+## Update 2026-06-11 residual invariants regression coverage
+
+### 已完成
+- 新增 FrozenExpertEnsemble canonical fingerprint 与 active SH mismatch 拒绝测试。
+- 新增 gate probability splat coverage normalization 数值测试。
+- zero-gate composition 测试扩展到 HDR color > 1，防止隐式上界截断破坏 Global 等价。
+
+### 当前设计决策
+- residual pipeline 的核心不变量由测试直接表达：共享 canonical、条件 gate 概率、零 gate 精确复现 Global。
+
+### 仍需做什么
+- 运行 topology/coverage/lineage/HDR 定向测试。
+- 继续审查 optimizer、Contact auxiliary state 与 bundle 保存路径。
+
+### 运行过哪些测试
+- 本组三个测试文件修改后尚未运行。
+
+### 下一步最小任务
+- 执行新不变量定向测试并修复任何失败。
+
+## Update 2026-06-11 exact-zero gate optimization fix
+
+### 已完成
+- incremental-gain BCE 使用 straight-through safe clamp：前向避免 `log(0)`，反向在 exact-zero gate map 保留梯度。
+- Router gate sparsity 改为二次惩罚，零 gate 处梯度为零，不会在 gain teacher 生效前把 raw gate 推入负饱和区。
+- Contact child amplitude sparsity同步改为二次惩罚，identity 启动时不产生关闭偏置。
+- 新增 exact-zero Local gain 打开、Contact degraded 关闭的梯度方向测试。
+
+### 当前设计决策
+- identity initialization 必须是“无损但可打开”，任何正则都不能在零点抢先制造负方向偏置。
+
+### 仍需做什么
+- 运行 Router/Contact 定向测试。
+- 继续检查 headroom、Joint anchor 与训练日志是否覆盖所有关键诊断。
+
+### 运行过哪些测试
+- topology/coverage/lineage/HDR：`5 passed, 2 warnings`。
+
+### 下一步最小任务
+- 验证 exact-zero 优化梯度并检查 Router 日志。
+
+## Update 2026-06-11 role-specific expert loss contract
+
+### 已完成
+- Global expert 的所有额外 tracking `L_*` 项强制归零，恢复“官方 EndoGaussian photometric/base regularization”训练目标。
+- Local 仅保留 scaffold ARAP/acceleration/node-offset 物理正则。
+- Contact 仅保留 spacetime-bank 正则与 parent opacity sparsity，禁用旧 visibility balance、entropy、confidence 与 decouple。
+- residual expert 在 base grid 冻结时不再计算无效的 HexPlane time-smoothness loss。
+- 新增角色级 loss 白名单回归测试。
+
+### 当前设计决策
+- 异质专家不能继承旧 CAMS MoE 的路由正则；每个专家只使用与自身表示匹配的 inductive bias。
+- Global 的质量上限优先，不能被为旧架构设计的 motion magnitude/spatial smoothing 再次压低。
+
+### 仍需做什么
+- 运行角色级 loss 测试并修正测试张量布局问题。
+- 更新 README TensorBoard tag 的实际层级。
+
+### 运行过哪些测试
+- Router + complete expert（本次 loss contract 前）：`31 passed`。
+
+### 下一步最小任务
+- 验证 loss 白名单并核对 TensorBoard 日志名称。
+
+## Update 2026-06-11 relative rotation residual composition
+
+### 已完成
+- Local/Contact parent rotation 改为相对 Global 的 quaternion residual composition，不再顺序插值绝对姿态。
+- Contact parent 与 Global 相同时，Contact gate 不会撤销 Local rotation。
+- Contact auxiliary child rotation 改为“child 相对 Contact parent rotation × composed parent rotation”，从而继承 Local/Contact parent motion。
+- 新增 Local rotation 与 Contact 同时激活的 parent/child 回归测试。
+
+### 当前设计决策
+- position/scale 使用 additive residual；rotation 必须在 quaternion group 上组合相对变换，不能对多个绝对姿态连续 nlerp。
+
+### 仍需做什么
+- 运行 quaternion composition 测试。
+- 更新 README 实际 TensorBoard tag。
+- 完成最后的 render/inference/checkpoint diff 审核。
+
+### 运行过哪些测试
+- role-specific loss contract：`3 passed`。
+
+### 下一步最小任务
+- 验证 rotation composition 与 Router 全套测试。
+## Update 2026-06-11 bounded Contact spacetime parameterization
+
+### 已完成
+- Contact auxiliary bank 现在缓存初始化时的精确 canonical parent 索引，不再在每帧通过 `torch.cdist` 重新寻找父 Gaussian。
+- Contact 的 spatial offset、velocity、acceleration、rotation velocity 与 scale delta 改为 scene-scale-aware 的有界参数化，防止早期优化产生不可逆的大幅漂移。
+- 回归测试新增 auxiliary child 与缓存 parent binding 一致性断言。
+
+### 当前设计决策
+- residual expert 阶段禁止 parent topology mutation，因此 Contact parent binding 必须是持久、确定且随 checkpoint 保存的离散关系。
+- Contact 运动自由度保留完整一阶/二阶时空表达能力，但通过物理尺度上界约束可优化域，避免 raw parameter 直接把 auxiliary Gaussian 推离内窥镜表面。
+
+### 仍需做什么
+- 运行 Contact 定向测试与语法检查。
+- 核对 README TensorBoard tag 与真实日志路径。
+- 运行完整测试、compileall、diff 审核后提交并推送。
+
+### 运行过哪些测试
+- 本组修改后尚未运行；下一步立即执行 Contact 定向回归。
+
+### 下一步最小任务
+- 验证 Contact identity、gradient、parent binding 与 regularization。
+## Update 2026-06-11 Contact bounds and TensorBoard documentation
+
+### 已完成
+- README 的 expert TensorBoard 标签已与 `training_report()` 的真实 `tracking/losses`、`tracking/stats` 层级对齐。
+- 新增 Contact raw motion 极值回归，验证 spatial offset 与 scale delta 的物理上界，并验证 auxiliary rotation 始终有限且单位化。
+
+### 当前设计决策
+- 文档只列出代码真实写入的 tag，避免服务器训练后误判“TensorBoard 未记录”。
+- Contact 的可学习 raw 参数允许无界优化，但进入几何状态前必须经过有界映射；测试直接覆盖极端 raw 值而非仅覆盖初始化。
+
+### 仍需做什么
+- 运行新增 Contact bounds 回归。
+- 完成 Router、Local、Contact、stage contract 的最终差异审核。
+- 运行完整验证后提交并推送。
+
+### 运行过哪些测试
+- Contact identity/gradient/regularization：`2 passed`。
+- Contact 与测试文件 `compileall`：passed。
+
+### 下一步最小任务
+- 执行 Contact bounds 定向测试并检查最终训练契约。
+## Update 2026-06-11 bounded Local scaffold geometry
+
+### 已完成
+- Local scaffold 的 learnable node offset 改为 scene-scale-aware `tanh` 有界位移，节点不能再无限漂离 canonical surface。
+- influence radius 改为“初始化时局部最近邻半径 × 有界倍率”，替代无界 `softplus(node_log_radii)`，避免 radius 塌缩或覆盖全场。
+- 新增极端 raw node offset/radius 回归，验证有界几何与有限输出。
+
+### 当前设计决策
+- Local expert 的异质性来自 deformation graph + surface-aware KNN + dual-quaternion blending；节点位置和作用域属于结构参数，必须限制在 canonical 几何邻域内。
+- 每个节点保留独立的 canonical base radius，学习量只负责有限倍数调节，从而保持局部性而不牺牲不同组织区域的尺度差异。
+
+### 仍需做什么
+- 运行 Local bounds、identity、regularization 定向回归。
+- 将 Local/Contact tracking architecture 升级为 v3，确保旧 v2 bundle 被明确拒绝。
+- 完整验证后提交并推送。
+
+### 运行过哪些测试
+- Contact bounds：`1 passed`。
+
+### 下一步最小任务
+- 验证新的 Local scaffold 参数化。
+## Update 2026-06-11 expert persistence protocol v4
+
+### 已完成
+- Local/Contact tracking architecture 从 v2 升级为 v3。
+- complete expert bundle 从 version 3 / architecture v3 升级为 version 4 / architecture v4。
+
+### 当前设计决策
+- Contact 新增 persistent parent binding，Local 新增 persistent base radii 且参数语义变化；这些都属于 checkpoint state contract 变化，必须通过版本升级 fail-fast。
+- Global backbone state 未变化，继续保持 `endomoeg_complete_global_v1`。
+
+### 仍需做什么
+- 同步 bundle、Router 与 complete expert 测试中的版本期望。
+- 验证旧 bundle 不能被新运行时静默加载。
+- 运行完整测试并推送。
+
+### 运行过哪些测试
+- Local scaffold identity/bounds/regularization：`3 passed`。
+- Local/Contact 相关文件 `compileall` 与 `git diff --check`：passed。
+
+### 下一步最小任务
+- 更新版本契约回归测试。
+## Update 2026-06-11 v4 bundle regression alignment
+
+### 已完成
+- Complete expert 与 Router 测试 fixture 已同步 Local/Contact v3 tracking architecture。
+- 测试不再构造会被新 bundle validator 错误接受的旧 v2 residual expert metadata。
+
+### 当前设计决策
+- 所有 Router manifest 与 expert payload 都必须绑定同一组明确版本；版本不一致属于数据协议错误，不采用兼容性补丁。
+
+### 仍需做什么
+- 运行 complete expert、bundle、Router 联合回归。
+- 清理测试 fixture 中无意义的旧 `top_k` 字段。
+- 执行完整验证与 push。
+
+### 运行过哪些测试
+- 本组版本同步后尚未运行。
+
+### 下一步最小任务
+- 运行版本与 Router 定向回归。
+## Update 2026-06-11 Router protocol v4 cleanup
+
+### 已完成
+- Router bundle 升级为 version 4 / residual-gate architecture v3。
+- 从 Router bundle builder、payload、validator、Router training 与 Joint save path 中彻底删除 `inference_top_k`。
+- 新协议不再保存“永远为 None”的旧互斥专家路由字段。
+
+### 当前设计决策
+- Local/Contact 是可同时激活的 independent residual gates；top-k 与该概率模型冲突，因此不保留运行时或持久化兼容字段。
+- Router bundle 协议变化与 expert bundle v4 同步 fail-fast，服务器必须从新 expert bundles 重新训练 Router。
+
+### 仍需做什么
+- 更新 Router、Joint、render 测试 fixture。
+- 运行 Router/Joint/render 定向测试。
+- 完成全量验证并推送。
+
+### 运行过哪些测试
+- v4 expert bundle 前置联合回归：`43 passed`。
+
+### 下一步最小任务
+- 删除测试中的 `inference_top_k` / `top_k` 残留。
+## Update 2026-06-11 top-k test protocol removal
+
+### 已完成
+- Router bundle 回归现在断言 payload 完全不存在 `inference_top_k`。
+- Joint save 回归改为断言 builder kwargs 不包含旧字段。
+- Render assembly fixtures 删除无效 `top_k` 属性。
+
+### 当前设计决策
+- 测试 fixture 必须反映生产协议，不能靠无消费方的遗留属性制造“兼容已覆盖”的假象。
+
+### 仍需做什么
+- 运行 Router/Joint/render 联合回归。
+- 检查代码与 README 中是否仍有 top-k 残留。
+- 运行全量测试、compileall、diff check 并推送。
+
+### 运行过哪些测试
+- 本组清理后尚未运行。
+
+### 下一步最小任务
+- 执行 residual Router 全链路定向回归。
+## Update 2026-06-11 Contact-observable Router v5
+
+### 已完成
+- Router 新增按 parent Gaussian 聚合的 auxiliary child opacity/activity 特征。
+- Contact gate 现在能直接观察当前时刻 spacetime bank 的激活，而不再只依赖坐标、时间和 parent opacity 间接猜测。
+- Router feature input 从 17 维升级为 18 维；bundle 升级为 version 5 / residual-gate architecture v4。
+- 新增回归验证 child activity 只提升对应 parent 的 Contact gate。
+
+### 当前设计决策
+- 聚合使用 `1 - exp(-sum(child_alpha))`，既保持单调性与可微性，又把多个 child 的总支持压缩到 `[0, 1)`，避免 child 数量直接放大特征尺度。
+- activity 是 routing evidence，不改变 Contact expert 本身；Router 仍通过独立 residual gate 决定是否采用该 parent 及其 children。
+
+### 仍需做什么
+- 运行 Router activity、bundle、Joint、render 联合回归。
+- 更新 README Router 设计说明与 bundle 重新训练提示。
+- 完整验证并推送。
+
+### 运行过哪些测试
+- Router/Joint/render/bundle/complete expert 协议清理后：`50 passed`。
+
+### 下一步最小任务
+- 验证新增 Contact activity feature 的数值与 checkpoint 契约。
+## Update 2026-06-11 reproducible expert-bound configuration
+
+### 已完成
+- Local node offset/radius bounds 与 Contact trajectory/rotation/scale/duration bounds 已加入 `ModelHiddenParams`。
+- `scene/deformation.py` 将配置显式传入 complete expert；`CompleteEndoMoeExpert` 再传入对应异质模块。
+- bundle 保存的 hidden-parameter config 现在能够完整重建本轮 bounded expert 架构。
+
+### 当前设计决策
+- 影响模型函数族与可优化域的参数不能只存在于 Python 默认值；必须进入命令行配置、`cfg_args` 与 bundle metadata。
+- 默认值保持当前经过审查的物理尺度：Local node offset `0.02×scene_scale`、radius factor `4×`；Contact offset/velocity/acceleration 分别为 `0.02/0.05/0.05×scene_scale`。
+
+### 仍需做什么
+- 将新参数写入 cutting/pulling presets。
+- 增加 preset 与 construction 回归。
+- 全量验证并推送。
+
+### 运行过哪些测试
+- Contact-observable Router 定向链路：`10 passed`。
+- Router 相关 `compileall` 与 `diff --check`：passed。
+
+### 下一步最小任务
+- 同步 EndoNeRF presets 与测试期望。
+## Update 2026-06-11 EndoNeRF bounded-expert presets
+
+### 已完成
+- cutting/pulling EndoMoe presets 显式记录 Local node geometry bounds 与 Contact spacetime bounds。
+- preset regression 覆盖全部新增结构超参，防止 merge/config 漏传后退回隐藏默认值。
+
+### 当前设计决策
+- cutting 与 pulling 首轮使用相同物理归一化上界，后续通过 ablation 调整，不在两个场景中引入无法归因的初始架构差异。
+
+### 仍需做什么
+- 运行 preset、complete expert、Router 联合回归。
+- 做最终完整测试、compileall、diff/security/status 审核。
+- 更新最终 HANDOFF，commit 并 push。
+
+### 运行过哪些测试
+- 本组 preset 同步后尚未运行。
+
+### 下一步最小任务
+- 验证配置合并与 expert construction。
+## Update 2026-06-11 expert-bound construction regression
+
+### 已完成
+- 新增 `deform_network` construction 回归，直接验证 Local/Contact 自定义 bounds 从 args 传入具体 refinement module。
+- README 明确所有结构 motion bounds 都进入 `cfg_args` 与 expert bundle，可复现实验。
+
+### 当前设计决策
+- 配置测试分两层：preset merge 验证字段存在，construction test 验证字段真正改变运行时模块；两者缺一都会留下静默错配风险。
+
+### 仍需做什么
+- 运行 construction 定向测试。
+- 执行完整测试与最终工程审核。
+- 提交并推送 GitHub。
+
+### 运行过哪些测试
+- preset/config/Router 定向验证：`3 passed, 2 warnings`。
+- 配置相关 `compileall` 与 `diff --check`：passed。
+
+### 下一步最小任务
+- 运行新 construction test 后启动 full suite。
+## Update 2026-06-11 final residual architecture verification
+
+### 已完成
+- 完成 Global anchor → bounded Local scaffold / bounded Contact spacetime bank → Contact-observable independent residual Router → optional frozen-Global Joint 的完整实现与协议审核。
+- Expert bundle 为 v4，Local/Contact tracking architecture 为 v3；Router bundle 为 v5 / residual-gate architecture v4，旧 bundle 明确 fail-fast。
+- README 已更新完整阶段命令、TensorBoard tag、bundle 契约、渲染评估流程与重新训练要求。
+- 本轮创建的可删除 pytest 临时目录已清理；系统占用的隐藏 pytest 目录未纳入 Git。
+
+### 当前设计决策
+- Global 始终开启，Local/Contact 只表达相对 Global 的有界增量；Router 在 Gaussian state 上组合后只 rasterize 一次。
+- Local 使用 surface-aware deformation graph、DQB、ARAP 与 acceleration；Contact 使用 persistent parent binding、bounded second-order trajectories、temporal RBF lifecycle 与 auxiliary Gaussian bank。
+- Router 使用 exact-zero independent gates、incremental-gain supervision、no-regret、sparsity，以及当前 Contact child activity 的 parent-level 可观测特征。
+
+### 仍需做什么
+- 本地代码任务只剩 Git commit/push。
+- 服务器端必须从 Stage 1 开始重训；旧 Local/Contact/Router bundles 与新协议不兼容。
+- 训练后按 README 检查 expert PSNR、oracle headroom、Router gate/target/gradient 与最终 full-sequence metrics。
+
+### 运行过哪些测试
+- 完整测试：`172 passed, 2 warnings`。
+- `python -m compileall -q arguments gaussian_renderer models scene utils train.py render.py metrics.py`：passed。
+- `git diff --check`：passed。
+- 敏感信息正则扫描：无匹配。
+- 独立 Codex review 已再次调用，但外部工具在 120 秒后超时，未返回审查结果；此前尝试也受模型/额度限制。
+
+### 下一步最小任务
+- Conventional Commit 提交全部目标文件并推送 `origin/main`，随后服务器按 README 的六阶段命令重新训练。

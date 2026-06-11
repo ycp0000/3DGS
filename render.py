@@ -218,7 +218,6 @@ def render_sets(dataset : ModelParams, hyperparam, iteration : int, pipeline : P
                     assembly.router,
                     pipeline,
                     background,
-                    top_k=assembly.top_k,
                 )
         else:
             gaussians = GaussianModel(dataset.sh_degree, hyperparam)

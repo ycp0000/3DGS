@@ -85,12 +85,18 @@ class TrackingPhase:
     force_geo_expert: Optional[str] = None
     force_vis_expert: Optional[str] = None
     trainable_group_prefixes: Tuple[str, ...] = ()
+    frozen_group_prefixes: Tuple[str, ...] = ()
     group_lr_scales: Dict[str, float] = field(default_factory=dict)
     group_schedule_progress: Dict[str, float] = field(default_factory=dict)
     route_balance_scale: float = 1.0
     route_confidence_scale: float = 1.0
 
     def is_group_trainable(self, group_name: str) -> bool:
+        if any(
+            group_name.startswith(prefix)
+            for prefix in self.frozen_group_prefixes
+        ):
+            return False
         if group_name in {
             "always",
             "xyz",

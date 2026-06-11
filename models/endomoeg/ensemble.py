@@ -62,6 +62,28 @@ class FrozenExpertEnsemble:
             raise ValueError(
                 "Frozen expert order must be {}".format(", ".join(EXPERT_ROLES))
             )
+        reference_payload = self.payloads["global"]
+        reference_fingerprint = reference_payload[
+            "trained_canonical_fingerprint"
+        ]
+        reference_sh_degree = int(
+            reference_payload["expert_state"]["canonical"]["active_sh_degree"]
+        )
+        for role in EXPERT_ROLES[1:]:
+            payload = self.payloads[role]
+            if payload["trained_canonical_fingerprint"] != reference_fingerprint:
+                raise ValueError(
+                    "Residual expert '{}' does not share the trained Global "
+                    "canonical state".format(role)
+                )
+            active_sh_degree = int(
+                payload["expert_state"]["canonical"]["active_sh_degree"]
+            )
+            if active_sh_degree != reference_sh_degree:
+                raise ValueError(
+                    "Residual expert '{}' active SH degree does not match "
+                    "Global".format(role)
+                )
         for role, model in self.experts.items():
             assert_gaussian_model_frozen(model, role)
 

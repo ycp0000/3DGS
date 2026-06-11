@@ -167,6 +167,62 @@ class Deformation(nn.Module):
                     getattr(args, "max_scale_smooth", 0.05),
                 ),
                 max_opacity_delta=getattr(args, "max_opacity_delta", 4.0),
+                scaffold_node_count=getattr(
+                    args,
+                    "endomoeg_scaffold_node_count",
+                    256,
+                ),
+                scaffold_knn=getattr(args, "endomoeg_scaffold_knn", 4),
+                scaffold_max_node_offset_ratio=getattr(
+                    args,
+                    "endomoeg_scaffold_max_node_offset_ratio",
+                    0.02,
+                ),
+                scaffold_max_radius_scale=getattr(
+                    args,
+                    "endomoeg_scaffold_max_radius_scale",
+                    4.0,
+                ),
+                contact_anchor_count=getattr(
+                    args,
+                    "endomoeg_contact_anchor_count",
+                    512,
+                ),
+                contact_chart_count=getattr(
+                    args,
+                    "endomoeg_contact_chart_count",
+                    3,
+                ),
+                contact_max_spatial_offset_ratio=getattr(
+                    args,
+                    "endomoeg_contact_max_spatial_offset_ratio",
+                    0.02,
+                ),
+                contact_max_velocity_ratio=getattr(
+                    args,
+                    "endomoeg_contact_max_velocity_ratio",
+                    0.05,
+                ),
+                contact_max_acceleration_ratio=getattr(
+                    args,
+                    "endomoeg_contact_max_acceleration_ratio",
+                    0.05,
+                ),
+                contact_max_rotation_radians=getattr(
+                    args,
+                    "endomoeg_contact_max_rotation_radians",
+                    0.5,
+                ),
+                contact_max_scale_delta=getattr(
+                    args,
+                    "endomoeg_contact_max_scale_delta",
+                    0.1,
+                ),
+                contact_initial_duration=getattr(
+                    args,
+                    "endomoeg_contact_initial_duration",
+                    0.15,
+                ),
                 enable_scale=not bool(getattr(args, "no_ds", False)),
                 enable_rotation=not bool(getattr(args, "no_dr", False)),
                 enable_opacity=not bool(getattr(args, "no_do", False)),
@@ -273,24 +329,18 @@ class Deformation(nn.Module):
         self.current_phase = phase
 
     def _forward_original(self, hidden, rays_pts_emb, scales_emb, rotations_emb, opacity_emb):
-        max_disp_ratio = getattr(self.args, "max_disp_smooth_ratio", 0.01)
-        max_rot = getattr(self.args, "max_rot_smooth", 0.05)
-        max_scale = getattr(self.args, "max_scale_smooth", 0.05)
-        max_opacity_delta = getattr(self.args, "max_opacity_delta", 4.0)
-        scene_scale = self.scene_scale.to(hidden.device, hidden.dtype).reshape(()).abs().clamp_min(1e-6)
-
         assert self.pos_deform is not None
         assert self.scales_deform is not None
         assert self.rotations_deform is not None
         assert self.opacity_deform is not None
 
-        dx = torch.tanh(self.pos_deform(hidden)) * (max_disp_ratio * scene_scale)
+        dx = self.pos_deform(hidden)
         pts = rays_pts_emb[:, :3] + dx
 
         if self.args.no_ds or scales_emb is None:
             scales = scales_emb[:, :3] if scales_emb is not None else torch.zeros_like(rays_pts_emb[:, :3])
         else:
-            ds = torch.tanh(self.scales_deform(hidden)) * max_scale
+            ds = self.scales_deform(hidden)
             scales = scales_emb[:, :3] + ds
 
         if self.args.no_dr or rotations_emb is None:
@@ -298,13 +348,13 @@ class Deformation(nn.Module):
             if rotations_emb is None:
                 rotations[:, 0] = 1.0
         else:
-            dr = torch.tanh(self.rotations_deform(hidden)) * max_rot
+            dr = self.rotations_deform(hidden)
             rotations = rotations_emb[:, :4] + dr
 
         if self.args.no_do or opacity_emb is None:
             opacity = opacity_emb[:, :1] if opacity_emb is not None else torch.zeros(rays_pts_emb.shape[0], 1, device=rays_pts_emb.device, dtype=rays_pts_emb.dtype)
         else:
-            do = torch.tanh(self.opacity_deform(hidden)) * max_opacity_delta
+            do = self.opacity_deform(hidden)
             opacity = opacity_emb[:, :1] + do
         self.latest_aux = {}
         return pts, scales, rotations, opacity
@@ -481,6 +531,17 @@ class Deformation(nn.Module):
         if self.complete_expert_head is not None:
             self.complete_expert_head.set_aabb(xyz_max, xyz_min)
 
+    def initialize_tracking_state(
+        self,
+        canonical_means,
+        canonical_rotations=None,
+    ) -> None:
+        if self.complete_expert_head is not None:
+            self.complete_expert_head.initialize_from_canonical(
+                canonical_means,
+                canonical_rotations,
+            )
+
     def iter_regularized_grids(self):
         if self.grid is not None:
             for grids in self.grid.grids:
@@ -558,7 +619,8 @@ class Deformation(nn.Module):
             return "endomoeg_v4"
         if self.tracking_mode == "endomoeg_expert":
             role = getattr(self.args, "endomoeg_expert_role", "unknown")
-            return "endomoeg_complete_{}_v1".format(role)
+            version = "v3" if role in {"local", "contact"} else "v1"
+            return "endomoeg_complete_{}_{}".format(role, version)
         if self.tracking_mode == "split":
             return "split_v1"
         return "original_v1"
@@ -636,6 +698,47 @@ class deform_network(nn.Module):
             groups = dict(groups)
             groups["tracking_time_encoder"] = self.timenet.parameters()
         return groups
+
+    def initialize_tracking_state(
+        self,
+        canonical_means,
+        canonical_rotations=None,
+    ) -> None:
+        self.deformation_net.initialize_tracking_state(
+            canonical_means,
+            canonical_rotations,
+        )
+
+    def load_global_anchor_state_dict(self, state_dict) -> None:
+        current = self.state_dict()
+        anchor_state = {
+            name: value
+            for name, value in state_dict.items()
+            if not name.startswith(
+                "deformation_net.complete_expert_head."
+            )
+        }
+        missing = [name for name in anchor_state if name not in current]
+        mismatched = [
+            name
+            for name, value in anchor_state.items()
+            if name in current and tuple(current[name].shape) != tuple(value.shape)
+        ]
+        if missing or mismatched:
+            details = []
+            if missing:
+                details.append("missing keys: {}".format(", ".join(missing)))
+            if mismatched:
+                details.append(
+                    "shape mismatch: {}".format(", ".join(mismatched))
+                )
+            raise ValueError(
+                "Global anchor deformation is incompatible ({})".format(
+                    "; ".join(details)
+                )
+            )
+        current.update(anchor_state)
+        self.load_state_dict(current, strict=True)
 
     def endomoeg_component_state_dict(self, component: str):
         if self.deformation_net.tracking_mode != "cams_gs_moe":

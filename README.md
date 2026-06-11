@@ -1,8 +1,8 @@
 # EndoMoeGaussian
 
-EndoMoeGaussian is an endoscopy-adapted dynamic Gaussian Splatting system built on EndoGaussian. Its primary method follows the MoE-GS training principle that every expert must first become a complete scene reconstructor before a separate Router learns how to combine them.
+EndoMoeGaussian is an endoscopy-adapted dynamic Gaussian Splatting system built on EndoGaussian. It keeps a high-quality EndoGaussian dynamic reconstruction as an always-on Global anchor, then learns two heterogeneous residual experts for tissue-local deformation and transient tool-contact content.
 
-The old single-model `cams_gs_moe` continuous curriculum remains only as a historical ablation. The recommended implementation uses complete, independently optimized experts and versioned identity-safe bundles.
+The old single-model `cams_gs_moe` continuous curriculum and the old three-independent-reconstructor design remain historical ablations. The recommended implementation uses a strict Global-to-residual lineage and versioned identity-safe bundles.
 
 ## Method
 
@@ -12,54 +12,55 @@ The old single-model `cams_gs_moe` continuous curriculum remains only as a histo
 - Saves `canonical.pth`.
 - The canonical fingerprint is shared by all subsequent experts.
 
-### Stage 2: three complete dynamic experts
+### Stage 2: Global dynamic anchor
 
-Every expert owns an independent:
+- Restores `canonical.pth`.
+- Trains the official EndoGaussian deformation backbone and canonical Gaussian parameters.
+- Saves the quality-gated `global.pth`.
+- Preserves raw EndoGaussian residual semantics and the official 64-channel HexPlane output.
 
-- `GaussianModel`
-- canonical Gaussian cloud and topology
-- appearance parameters
-- HexPlane deformation field
-- optimizer trajectory and densification history
+### Stage 3: heterogeneous residual experts
 
-The roles are:
+Both residual experts restore the optimized canonical cloud and dynamic backbone from `global.pth`. Canonical parameters, the Global deformation field, HexPlane, and outer time encoder are frozen.
 
-- `global`: complete EndoGaussian deformation backbone for stable full-scene motion.
-- `local`: complete backbone plus a tissue-local refinement field for non-rigid local deformation.
-- `contact`: complete backbone plus tool-contact, visibility, lifecycle, and appearance refinement.
+- `local`: a SC-GS/MoSca-inspired sparse SE(3) motion scaffold with farthest-point control nodes, bounded surface-local node offsets/radii, surface-aware KNN skinning, Dual Quaternion Blending, ARAP regularization, and temporal acceleration regularization. It refines position and rotation only.
+- `contact`: an STG/HyperNeRF-inspired auxiliary spacetime Gaussian bank with persistent tissue-parent bindings, bounded second-order trajectories, multiple temporal RBF charts, learned lifecycle duration, and projected tool-boundary supervision. It models transient contact surfaces without forcing the canonical cloud to explain appearance/disappearance.
 
-All three experts start from the same Stage 1 canonical bundle, but they are trained and saved independently as `global.pth`, `local.pth`, and `contact.pth`.
+The residual modules start as exact identities. Local and Contact therefore cannot damage the Global reconstruction before learning useful residuals.
 
-### Stage 3: frozen volume-aware Router
+All structural motion bounds are explicit preset parameters. They are written into `cfg_args` and expert bundles, including Local node offset/radius limits and Contact spatial, velocity, acceleration, rotation, scale, and duration limits.
+
+### Stage 4: frozen residual Router
 
 All experts are frozen. The Router alone is optimized using:
 
-- per-Gaussian learnable logits for each independent expert topology
-- shared Gaussian features from position, motion, view direction, opacity, scale, time, and role embedding
-- differentiable volumetric feature splatting
-- a pixel-space residual Router
-- oracle-error distillation from detached per-expert reconstruction errors
-- anti-starvation minimum-usage regularization
-- dense routing followed by soft top-2 inference
+- Global always-on reconstruction
+- independent Local and Contact Gaussian gates that do not sum to one
+- Gaussian features from canonical position, Local/Contact residual motion, opacity change, aggregated Contact child activity, view direction, and time
+- exact-zero forward gates with sigmoid surrogate gradients
+- Gaussian-state composition before one final rasterization
+- detached incremental-gain supervision relative to Global
+- gate sparsity and no-regret penalties
+- fixed-view `G`, `G+L`, `G+C`, `G+L+C`, and per-pixel oracle headroom checks
 
-The training loop fails immediately if Gaussian logits, Gaussian feature MLP, or pixel Router receive no gradient.
+The Router stage fails immediately if residual experts provide insufficient oracle headroom or if either Router parameter branch receives no gradient.
 
-### Optional Stage 4: controlled joint fine-tuning
+### Optional Stage 5: controlled joint fine-tuning
 
-This is a conservative fourth stage, not a requirement of the main method:
+This is a conservative optional stage, not a requirement of the main method:
 
 - canonical geometry, appearance, opacity, scale, rotation, and topology remain frozen
+- the Global anchor and its deformation field remain frozen
 - the Router uses small learning rates
-- the global expert may update its deformation field at a very low learning rate
 - local/contact experts may update only their role-specific refinement modules
 - parameter-anchor loss and gradient clipping constrain drift
 - the result is saved only if the Router and every individual expert pass fixed-view PSNR non-degradation gates
 
-Stage 4 writes a new assembly directory and never overwrites Stage 2/3 bundles.
+Joint fine-tuning writes a new assembly directory and never overwrites the frozen expert/Router bundles.
 
 ## Identity and safety contracts
 
-Bundle format version 2 binds:
+Expert bundle format version 4 and Router bundle version 5 bind:
 
 - absolute dataset path
 - source canonical fingerprint
@@ -71,6 +72,7 @@ Bundle format version 2 binds:
 - Router architecture and exact expert manifest
 
 The complete expert-state fingerprint includes deformation weights and spatial context. A same-topology expert with different dynamic weights is rejected.
+Bundles produced by earlier independent-expert or pre-bounded residual architectures must be retrained; they are intentionally rejected instead of being silently migrated.
 
 Other enforced contracts:
 
@@ -119,7 +121,7 @@ The presets are stage-neutral. Pipeline stage, expert role, bundle directory, an
 
 ## Complete cutting workflow
 
-Adjust `SOURCE`, `RUN_ROOT`, and `MIN_EXPERT_PSNR` for the server. Set `MIN_EXPERT_PSNR` from the original EndoGaussian fixed-view test PSNR, allowing only a small tolerance.
+Adjust `SOURCE`, `RUN_ROOT`, and `MIN_EXPERT_PSNR` for the server. Set `MIN_EXPERT_PSNR` close to the original EndoGaussian fixed-view test PSNR. Local/Contact training will not start unless `global.pth` passes this gate.
 
 ```bash
 cd /root/3DGS
@@ -173,7 +175,8 @@ python train.py \
   --endomoeg_pipeline_stage expert \
   --endomoeg_expert_role local \
   --endomoeg_bundle_dir "$BUNDLES" \
-  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth"
+  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth" \
+  --endomoeg_min_expert_psnr "$MIN_EXPERT_PSNR"
 ```
 
 ### 4. Contact expert
@@ -186,7 +189,8 @@ python train.py \
   --endomoeg_pipeline_stage expert \
   --endomoeg_expert_role contact \
   --endomoeg_bundle_dir "$BUNDLES" \
-  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth"
+  --endomoeg_canonical_bundle "$BUNDLES/canonical.pth" \
+  --endomoeg_min_expert_psnr "$MIN_EXPERT_PSNR"
 ```
 
 Before Router training, confirm:
@@ -197,7 +201,7 @@ $BUNDLES/local.pth
 $BUNDLES/contact.pth
 ```
 
-### 5. Frozen Router
+### 5. Frozen residual Router
 
 ```bash
 python train.py \
@@ -215,6 +219,8 @@ Expected bundle:
 ```text
 $BUNDLES/router.pth
 ```
+
+Before optimization, TensorBoard must show at least the configured `0.3 dB` `oracle - global` headroom. If this check fails, improve the Local/Contact experts instead of forcing Router training.
 
 ### 6. Optional controlled Joint
 
@@ -258,33 +264,45 @@ CONFIG=arguments/endonerf/pulling_endomoeg.py
 tensorboard --logdir /root/autodl-tmp/endomoeg --port 6006
 ```
 
-Important Stage 2 metrics:
+Important expert metrics:
 
 - `fine/validation/test/psnr`
 - `fine/validation/test/ssim`
 - `fine/validation/test/lpips`
 - training loss and role-specific tracking statistics
+- `fine/tracking/losses/L_scaffold_arap`
+- `fine/tracking/losses/L_scaffold_acceleration`
+- `fine/tracking/losses/L_contact_bank_sparsity`
+- `fine/tracking/losses/L_contact_bank_locality`
+- `fine/tracking/stats/scaffold_node_translation_norm`
+- `fine/tracking/stats/contact_bank_temporal_activity`
+- `fine/tracking/stats/contact_bank_boundary_support`
 
-Important Stage 3 metrics:
+Important Router metrics:
 
+- `router/headroom/psnr_global`
+- `router/headroom/psnr_local`
+- `router/headroom/psnr_contact`
+- `router/headroom/psnr_full`
+- `router/headroom/psnr_oracle`
 - `router/train/L_total`
 - `router/train/L_router_reconstruction`
-- `router/train/L_router_oracle`
-- `router/train/L_router_starvation`
-- `router/train/router_usage_global`
+- `router/train/L_router_no_regret`
+- `router/train/L_router_gate_sparsity`
+- `router/train/L_router_gain_local`
+- `router/train/L_router_gain_contact`
 - `router/train/router_usage_local`
 - `router/train/router_usage_contact`
-- `router/train/pixel_residual_abs_mean`
-- `router/gradients/grad_norm_router_gaussian_logits`
+- `router/train/router_target_local`
+- `router/train/router_target_contact`
+- `router/gradients/grad_norm_router_base_gates`
 - `router/gradients/grad_norm_router_feature_mlp`
-- `router/gradients/grad_norm_router_pixel`
 - `router/validation/test/psnr`
 
-Important Stage 4 metrics:
+Important Joint metrics:
 
 - `joint/train/L_total`
 - `joint/train/L_anchor`
-- `joint/gradients/grad_norm_joint_expert_global`
 - `joint/gradients/grad_norm_joint_expert_local`
 - `joint/gradients/grad_norm_joint_expert_contact`
 - `joint/validation/test/psnr`
@@ -293,13 +311,14 @@ Stop and inspect the run if:
 
 - an expert is below the original EndoGaussian quality level
 - any Router gradient norm is zero or non-finite
-- one expert usage remains exactly zero
+- oracle headroom is below the configured threshold
+- Local/Contact targets indicate gain but the corresponding gate remains zero
 - rendered frames become black
 - PSNR shows abrupt frame-dependent drops
 
 ## Render
 
-Render the Stage 3 Router:
+Render the frozen residual Router:
 
 ```bash
 python render.py \
@@ -308,7 +327,7 @@ python render.py \
   --configs "$CONFIG"
 ```
 
-Render the Stage 4 Joint assembly:
+Render the optional Joint assembly:
 
 ```bash
 python render.py \
@@ -330,8 +349,8 @@ Always compare against:
 
 - original EndoGaussian
 - CAMS-GS
-- each independent expert
-- frozen Router
+- Global anchor and each residual candidate
+- frozen residual Router
 - optional Joint
 
 Do not claim an improvement from training-batch PSNR alone; use fixed-view test metrics and rendered videos.
@@ -367,17 +386,21 @@ Recommended comparisons:
 
 1. original EndoGaussian
 2. CAMS-GS
-3. complete global expert
-4. complete local expert
-5. complete contact expert
-6. frozen volume-aware Router
-7. controlled Joint
-8. Router without pixel residual
-9. Router without oracle-error distillation
-10. Router without anti-starvation
-11. legacy continuous `cams_gs_moe` ablation
+3. Global EndoGaussian anchor
+4. Global + Local scaffold
+5. Global + Contact spacetime bank
+6. Global + Local + Contact without learned gates
+7. frozen residual Router
+8. controlled Joint
+9. Local without DQB/ARAP
+10. Contact without temporal charts/tool-boundary supervision
+11. Router without incremental-gain supervision
+12. Router without no-regret loss
+13. Router without headroom fail-fast
+14. legacy independent-expert Router
+15. legacy continuous `cams_gs_moe`
 
-The legacy residual-component checkpoints are intentionally incompatible with the version-2 complete-expert pipeline.
+Legacy independent-expert and residual-component checkpoints are intentionally incompatible with the version-3 heterogeneous residual pipeline.
 
 ## Tests
 
@@ -385,11 +408,13 @@ Focused tests cover:
 
 - absolute EndoNeRF paths and loader selection
 - NumPy/Torch AABB boundaries
-- complete expert architecture and gradients
+- Global parity, Local scaffold, Contact spacetime-bank architecture and gradients
 - canonical/expert/Router bundle identity
 - full deformation-state fingerprinting
-- frozen expert and Router contracts
-- real Router gradient flow through rasterized routing features
+- Global-to-residual lineage and frozen-parameter contracts
+- exact-zero residual gates and Gaussian-state composition
+- real Router gradient flow through composite and gate rasterization
+- incremental-gain, no-regret, and headroom fail-fast behavior
 - camera-only Router/Joint rendering
 - controlled Joint trainable-parameter whitelist and quality gates
 - Python 3.7 syntax compatibility

@@ -8,9 +8,14 @@ import torch
 CANONICAL_BUNDLE_FORMAT = "endomoeg_canonical_bundle"
 EXPERT_BUNDLE_FORMAT = "endomoeg_complete_expert_bundle"
 CANONICAL_BUNDLE_VERSION = 1
-EXPERT_BUNDLE_VERSION = 2
-EXPERT_ARCHITECTURE_VERSION = "endomoeg_complete_expert_v1"
+EXPERT_BUNDLE_VERSION = 4
+EXPERT_ARCHITECTURE_VERSION = "endomoeg_heterogeneous_residual_expert_v4"
 EXPERT_ROLES = ("global", "local", "contact")
+EXPERT_TRACKING_ARCHITECTURES = {
+    "global": "endomoeg_complete_global_v1",
+    "local": "endomoeg_complete_local_v3",
+    "contact": "endomoeg_complete_contact_v3",
+}
 
 
 def _absolute_path(path):
@@ -218,6 +223,23 @@ def validate_expert_bundle(
     expert_state = payload.get("expert_state")
     if not isinstance(expert_state, Mapping):
         raise ValueError("Expert bundle is missing expert_state")
+    expected_tracking_arch = EXPERT_TRACKING_ARCHITECTURES[role]
+    if payload.get("tracking_type") != "endomoeg_expert":
+        raise ValueError("Expert bundle has an invalid tracking type")
+    if expert_state.get("tracking_type") != payload.get("tracking_type"):
+        raise ValueError("Expert bundle tracking type does not match expert state")
+    if payload.get("tracking_arch_version") != expected_tracking_arch:
+        raise ValueError(
+            "Expert role '{}' requires tracking architecture '{}', got '{}'".format(
+                role,
+                expected_tracking_arch,
+                payload.get("tracking_arch_version"),
+            )
+        )
+    if expert_state.get("tracking_arch_version") != expected_tracking_arch:
+        raise ValueError(
+            "Expert state architecture does not match role '{}'".format(role)
+        )
     canonical_state = expert_state.get("canonical")
     if not isinstance(canonical_state, Mapping):
         raise ValueError("Expert bundle is missing its trained canonical state")

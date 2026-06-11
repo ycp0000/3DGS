@@ -14,9 +14,6 @@ class FrozenRouterAssembly:
         self.payload = payload
         self.bundle_path = bundle_path
         self.iteration = int(payload["iteration"])
-        self.top_k = payload.get("inference_top_k")
-        if self.top_k is not None:
-            self.top_k = int(self.top_k)
         self.assert_frozen()
 
     def assert_frozen(self):
@@ -88,7 +85,6 @@ def load_frozen_router_assembly(
     router = EndoMoeVolumeAwareRouter(
         ensemble.point_counts(),
         gaussian_hidden_dim=int(hidden_params["moe_router_hidden_dim"]),
-        pixel_hidden_dim=int(hidden_params["moe_pixel_router_hidden_dim"]),
     ).to(torch.device(device))
     router.load_state_dict(payload["router_state"], strict=True)
     router.eval()

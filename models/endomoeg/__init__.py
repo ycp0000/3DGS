@@ -29,11 +29,11 @@ from .inference import (
     resolve_router_bundle_path,
 )
 from .router import (
-    DEFAULT_MINIMUM_USAGE,
     EndoMoeVolumeAwareRouter,
+    RESIDUAL_ROLES,
+    compose_residual_gaussian_state,
     compute_router_losses,
-    oracle_routing_targets,
-    sparsify_router_weights,
+    incremental_gain_targets,
 )
 from .router_bundle import (
     ROUTER_ARCHITECTURE_VERSION,
@@ -49,8 +49,8 @@ __all__ = [
     "COMPLETE_EXPERT_ROLES",
     "CompleteEndoMoeExpert",
     "CompleteExpertScheduler",
-    "DEFAULT_MINIMUM_USAGE",
     "EndoMoeVolumeAwareRouter",
+    "RESIDUAL_ROLES",
     "EXPERT_ARCHITECTURE_VERSION",
     "EXPERT_BUNDLE_FORMAT",
     "EXPERT_ROLES",
@@ -65,8 +65,9 @@ __all__ = [
     "expert_fingerprint",
     "assert_gaussian_model_frozen",
     "freeze_gaussian_model",
+    "compose_residual_gaussian_state",
     "compute_router_losses",
-    "oracle_routing_targets",
+    "incremental_gain_targets",
     "load_canonical_bundle",
     "load_expert_bundle",
     "load_frozen_router_assembly",
@@ -74,7 +75,6 @@ __all__ = [
     "resolve_router_bundle_path",
     "save_bundle",
     "save_router_bundle",
-    "sparsify_router_weights",
     "validate_canonical_bundle",
     "validate_expert_bundle",
     "validate_router_bundle",

@@ -306,6 +306,54 @@ class GaussianModel:
         if training_args is not None:
             self.training_setup(training_args)
 
+    def restore_global_anchor_state(self, state):
+        required = (
+            "canonical",
+            "deformation",
+            "tracking_type",
+            "tracking_arch_version",
+            "spatial_context",
+        )
+        missing = [name for name in required if name not in state]
+        if missing:
+            raise ValueError(
+                "Global anchor state is missing fields: {}".format(
+                    ", ".join(missing)
+                )
+            )
+        if state["tracking_type"] != "endomoeg_expert":
+            raise ValueError("Global anchor must be an EndoMoe complete expert")
+        if state["tracking_arch_version"] != "endomoeg_complete_global_v1":
+            raise ValueError(
+                "Global anchor architecture is incompatible: {}".format(
+                    state["tracking_arch_version"]
+                )
+            )
+        current_role = getattr(
+            self._deformation.deformation_net.args,
+            "endomoeg_expert_role",
+            "",
+        )
+        if current_role not in {"local", "contact"}:
+            raise ValueError(
+                "Global anchor transplant is only valid for residual experts"
+            )
+        self.restore_canonical_state(state["canonical"], training_args=None)
+        self._deformation.load_global_anchor_state_dict(state["deformation"])
+        spatial_context = state["spatial_context"]
+        for field in ("scene_scale", "xyz_max", "xyz_min"):
+            if field not in spatial_context:
+                raise ValueError(
+                    "Global anchor spatial_context is missing field: {}".format(
+                        field
+                    )
+                )
+        self._deformation.set_scene_scale(spatial_context["scene_scale"])
+        self._deformation.set_aabb(
+            spatial_context["xyz_max"],
+            spatial_context["xyz_min"],
+        )
+
     def restore(self, model_args, training_args):
         if isinstance(model_args[2], dict):
             deformation_state_dict = model_args[2]
@@ -465,6 +513,10 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self._deformation_accum = torch.zeros((self.get_xyz.shape[0],3),device="cuda")
         self.lr_schedule_max_steps = max(int(training_args.position_lr_max_steps), 1)
+        self._deformation.initialize_tracking_state(
+            self.get_xyz.detach(),
+            self.get_rotation.detach(),
+        )
 
         param_groups = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz", "schedule": "xyz", "phase_lr_scale": 1.0},

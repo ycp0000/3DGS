@@ -65,7 +65,6 @@ def test_render_sets_routes_through_frozen_router_assembly(
         ensemble=object(),
         router=object(),
         iteration=4000,
-        top_k=2,
     )
     calls = {}
     monkeypatch.setattr(
@@ -89,7 +88,6 @@ def test_render_sets_routes_through_frozen_router_assembly(
         router,
         pipeline,
         background,
-        top_k,
     ):
         calls["ensemble_render"] = {
             "view": view,
@@ -97,7 +95,6 @@ def test_render_sets_routes_through_frozen_router_assembly(
             "router": router,
             "pipeline": pipeline,
             "background": background,
-            "top_k": top_k,
         }
         return {
             "render": torch.zeros(3, 2, 2),
@@ -144,7 +141,6 @@ def test_render_sets_routes_through_frozen_router_assembly(
     )
 
     assert calls["render_set"] == ("test", 4000)
-    assert calls["ensemble_render"]["top_k"] == 2
     assert calls["load_kwargs"]["expected_source_path"] == dataset.source_path
     assert hyper.current_iteration == 4000
     assert hyper.iterations == 4000
@@ -171,7 +167,6 @@ def test_render_sets_rejects_router_iteration_mismatch(
             ensemble=object(),
             router=object(),
             iteration=4000,
-            top_k=2,
         ),
     )
 
@@ -211,7 +206,6 @@ def test_render_sets_loads_joint_output_assembly(monkeypatch, tmp_path):
             ensemble=object(),
             router=object(),
             iteration=500,
-            top_k=2,
         )
 
     monkeypatch.setattr(

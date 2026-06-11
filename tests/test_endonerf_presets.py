@@ -20,6 +20,7 @@ from arguments import (
 )
 from models.tracking.cams_gs_tracking import CAMSGSScheduler
 from train import (
+    allows_gaussian_topology_updates,
     normalize_endomoeg_pipeline_stage,
     validate_endomoeg_pipeline_args,
 )
@@ -310,11 +311,63 @@ def test_endomoeg_presets_use_complete_expert_pipeline_defaults():
         assert candidate.iterations == baseline.iterations
         assert candidate.position_lr_max_steps == baseline.position_lr_max_steps
         assert candidate.endomoeg_expert_hidden_dim == 64
-        assert candidate.moe_pixel_router_hidden_dim == 32
-        assert candidate.endomoeg_router_sparse_start == pytest.approx(0.5)
+        assert candidate.endomoeg_scaffold_max_node_offset_ratio == pytest.approx(
+            0.02
+        )
+        assert candidate.endomoeg_scaffold_max_radius_scale == pytest.approx(4.0)
+        assert candidate.endomoeg_contact_max_spatial_offset_ratio == pytest.approx(
+            0.02
+        )
+        assert candidate.endomoeg_contact_max_velocity_ratio == pytest.approx(0.05)
+        assert candidate.endomoeg_contact_max_acceleration_ratio == pytest.approx(
+            0.05
+        )
+        assert candidate.endomoeg_contact_max_rotation_radians == pytest.approx(
+            0.5
+        )
+        assert candidate.endomoeg_contact_max_scale_delta == pytest.approx(0.1)
+        assert candidate.endomoeg_contact_initial_duration == pytest.approx(0.15)
+        assert candidate.kplanes_config["output_coordinate_dim"] == 64
+        assert candidate.endomoeg_min_oracle_headroom == pytest.approx(0.3)
+        assert candidate.endomoeg_router_gain_temperature == pytest.approx(0.02)
+        assert candidate.endomoeg_router_lambda_gain == pytest.approx(0.1)
+        assert candidate.endomoeg_router_lambda_sparsity == pytest.approx(1e-3)
+        assert candidate.endomoeg_router_lambda_no_regret == pytest.approx(0.5)
         assert candidate.endomoeg_router_gradient_warmup == 20
         assert candidate.endomoeg_joint_anchor_lambda == pytest.approx(1e-3)
         assert candidate.endomoeg_joint_max_psnr_drop == pytest.approx(0.05)
+
+
+def test_residual_experts_disable_canonical_topology_updates():
+    global_hyper = type(
+        "Hyper",
+        (),
+        {
+            "endomoeg_pipeline_stage": "expert",
+            "endomoeg_expert_role": "global",
+        },
+    )()
+    local_hyper = type(
+        "Hyper",
+        (),
+        {
+            "endomoeg_pipeline_stage": "expert",
+            "endomoeg_expert_role": "local",
+        },
+    )()
+    contact_hyper = type(
+        "Hyper",
+        (),
+        {
+            "endomoeg_pipeline_stage": "expert",
+            "endomoeg_expert_role": "contact",
+        },
+    )()
+
+    assert allows_gaussian_topology_updates("coarse", local_hyper)
+    assert allows_gaussian_topology_updates("fine", global_hyper)
+    assert not allows_gaussian_topology_updates("fine", local_hyper)
+    assert not allows_gaussian_topology_updates("fine", contact_hyper)
 
 
 def test_endomoeg_preset_preserves_cli_pipeline_stage_and_role(tmp_path):
@@ -322,6 +375,7 @@ def test_endomoeg_preset_preserves_cli_pipeline_stage_and_role(tmp_path):
     args.endomoeg_pipeline_stage = "expert"
     args.endomoeg_expert_role = "local"
     args.endomoeg_bundle_dir = str((tmp_path / "bundles").resolve())
+    args.endomoeg_min_expert_psnr = 30.0
     module = _load_module(ENDONERF_PRESET_DIR / "cutting_endomoeg.py")
 
     merged = merge_hparams(
@@ -352,6 +406,7 @@ def test_endomoeg_pipeline_requires_absolute_bundle_paths(tmp_path):
     args.endomoeg_pipeline_stage = "expert"
     args.endomoeg_expert_role = "local"
     args.endomoeg_bundle_dir = "relative/bundles"
+    args.endomoeg_min_expert_psnr = 30.0
 
     with pytest.raises(ValueError, match="absolute"):
         validate_endomoeg_pipeline_args(args)
@@ -364,6 +419,16 @@ def test_endomoeg_pipeline_requires_absolute_bundle_paths(tmp_path):
     assert validated.endomoeg_canonical_bundle == str(
         (tmp_path / "canonical.pth").resolve()
     )
+
+
+def test_residual_expert_requires_positive_global_anchor_quality_gate(tmp_path):
+    args = _build_default_args()
+    args.endomoeg_pipeline_stage = "expert"
+    args.endomoeg_expert_role = "contact"
+    args.endomoeg_bundle_dir = str(tmp_path.resolve())
+
+    with pytest.raises(ValueError, match="Global anchor"):
+        validate_endomoeg_pipeline_args(args)
 
 
 def test_endomoeg_pipeline_rejects_unknown_stage_and_role(tmp_path):

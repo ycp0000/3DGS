@@ -16,6 +16,7 @@ from models.endomoeg.expert_bundle import (
     validate_expert_bundle,
 )
 from models.endomoeg.ensemble import (
+    FrozenExpertEnsemble,
     assert_gaussian_model_frozen,
     freeze_gaussian_model,
 )
@@ -97,8 +98,8 @@ def test_canonical_bundle_round_trip_and_fingerprint(tmp_path):
 
 def test_complete_expert_bundle_rejects_legacy_and_source_mismatch(tmp_path):
     model = _build_gaussian_stub(
-        tracking_type="original",
-        arch_version="original_v1",
+        tracking_type="endomoeg_expert",
+        arch_version="endomoeg_complete_global_v1",
     )
     canonical = build_canonical_bundle(model, iteration=1000)
     payload = build_expert_bundle(
@@ -141,6 +142,11 @@ def test_complete_expert_bundle_rejects_legacy_and_source_mismatch(tmp_path):
     tampered["expert_state"]["deformation"]["weight"].add_(1.0)
     with pytest.raises(ValueError, match="full-state fingerprint"):
         validate_expert_bundle(tampered)
+
+    wrong_architecture = copy.deepcopy(payload)
+    wrong_architecture["tracking_arch_version"] = "endomoeg_complete_global_v0"
+    with pytest.raises(ValueError, match="requires tracking architecture"):
+        validate_expert_bundle(wrong_architecture)
 
 
 def test_complete_expert_state_round_trip_preserves_topology_and_deformation():
@@ -209,6 +215,49 @@ def test_assert_gaussian_model_frozen_detects_trainable_state():
 
     with pytest.raises(RuntimeError, match="still has trainable"):
         assert_gaussian_model_frozen(model, "local")
+
+
+def test_frozen_ensemble_requires_exact_global_canonical_lineage():
+    experts = []
+    payloads = []
+    for role in ("global", "local", "contact"):
+        model = freeze_gaussian_model(_build_gaussian_stub())
+        experts.append((role, model))
+        payloads.append(
+            (
+                role,
+                {
+                    "trained_canonical_fingerprint": "global-trained",
+                    "expert_state": {
+                        "canonical": {"active_sh_degree": 2},
+                    },
+                },
+            )
+        )
+
+    FrozenExpertEnsemble(
+        experts,
+        payloads,
+        source_canonical_fingerprint="source",
+    )
+
+    mismatched_payloads = copy.deepcopy(payloads)
+    mismatched_payloads[1][1]["trained_canonical_fingerprint"] = "different"
+    with pytest.raises(ValueError, match="trained Global canonical"):
+        FrozenExpertEnsemble(
+            experts,
+            mismatched_payloads,
+            source_canonical_fingerprint="source",
+        )
+
+    mismatched_sh = copy.deepcopy(payloads)
+    mismatched_sh[2][1]["expert_state"]["canonical"]["active_sh_degree"] = 3
+    with pytest.raises(ValueError, match="active SH degree"):
+        FrozenExpertEnsemble(
+            experts,
+            mismatched_sh,
+            source_canonical_fingerprint="source",
+        )
 
 
 def test_bundle_io_rejects_relative_paths():

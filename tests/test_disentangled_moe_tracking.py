@@ -2271,6 +2271,8 @@ def test_renderer_recomputes_covariance_after_cams_deformation(monkeypatch):
     covariance_calls = {}
 
     class _FakeDeformation:
+        deformation_net = SimpleNamespace(scene_scale=torch.tensor(10.0))
+
         def __call__(self, means3d, scales, rotations, opacity, time):
             return means3d + 1.0, scales + 3.0, rotations + 5.0, opacity + 7.0
 
@@ -2317,7 +2319,15 @@ def test_renderer_recomputes_covariance_after_cams_deformation(monkeypatch):
     )
     pipe = SimpleNamespace(compute_cov3D_python=True, convert_SHs_python=False, debug=False)
 
-    renderer.render(camera, point_cloud, pipe, torch.zeros(3), override_color=torch.zeros(2, 3), stage="fine")
+    output = renderer.render(
+        camera,
+        point_cloud,
+        pipe,
+        torch.zeros(3),
+        override_color=torch.zeros(2, 3),
+        stage="fine",
+        return_routing_state=True,
+    )
 
     expected_scales = torch.tensor([[14.0, 14.5, 15.0], [12.5, 13.0, 13.5]])
     expected_rotations = torch.tensor([[26.0, 25.0, 25.0, 25.0], [20.8, 20.1, 20.2, 20.3]])
@@ -2331,6 +2341,12 @@ def test_renderer_recomputes_covariance_after_cams_deformation(monkeypatch):
         _FakeRasterizer.last_kwargs["cov3D_precomp"],
         torch.cat((expected_scales, expected_rotations[:, :3]), dim=-1),
     )
+    assert torch.allclose(output["routing_state"]["scales"], expected_scales)
+    assert torch.allclose(
+        output["routing_state"]["rotations"],
+        expected_rotations,
+    )
+    assert output["routing_state"]["covariance"] is not None
 
 
 def test_validation_render_does_not_update_deformation_statistics(monkeypatch):
@@ -2474,6 +2490,119 @@ def test_renderer_applies_appearance_delta_and_opacity_gate_to_rasterizer_inputs
     assert torch.allclose(_FakeRasterizer.last_kwargs["colors_precomp"][1], base_colors[1])
     assert torch.allclose(_FakeRasterizer.last_kwargs["opacities"], torch.tensor([[4.1], [0.2]]))
     assert torch.allclose(outputs["deformation_aux"]["appearance_rgb_delta"], torch.tensor([[0.3, -0.1, 0.2]]))
+
+
+def test_renderer_appends_contact_spacetime_gaussians_without_densifying_them(
+    monkeypatch,
+):
+    class _FakeRasterizer:
+        last_kwargs = None
+
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            type(self).last_kwargs = kwargs
+            count = kwargs["means3D"].shape[0]
+            height = self.raster_settings.kwargs["image_height"]
+            width = self.raster_settings.kwargs["image_width"]
+            return (
+                torch.zeros(3, height, width),
+                torch.arange(1, count + 1, dtype=torch.float32),
+                torch.zeros(1, height, width),
+            )
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+
+    class _FakeDeformation:
+        deformation_net = SimpleNamespace(scene_scale=torch.tensor(1.0))
+
+        def __call__(self, means3d, scales, rotations, opacity, time, camera=None):
+            del time, camera
+            return means3d, scales, rotations, opacity
+
+        def get_aux_outputs(self):
+            return {
+                "appearance_rgb_delta": torch.zeros(1, 3),
+                "auxiliary_means3d": torch.tensor(
+                    [[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]]
+                ),
+                "auxiliary_canonical_means3d": torch.tensor(
+                    [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+                ),
+                "auxiliary_scales": torch.zeros(2, 3),
+                "auxiliary_rotations": torch.tensor(
+                    [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+                ),
+                "auxiliary_opacity": torch.tensor([[0.3], [0.4]]),
+                "auxiliary_parent_indices": torch.tensor([0, 0]),
+                "auxiliary_rgb_delta": torch.tensor(
+                    [[0.1, 0.0, 0.0], [0.0, 0.2, 0.0]]
+                ),
+            }
+
+    class _FakePointCloud:
+        def __init__(self):
+            self.get_xyz = torch.tensor(
+                [[0.0, 0.0, 0.0], [2.0, 2.0, 2.0]]
+            )
+            self._opacity = torch.tensor([[0.1], [0.2]])
+            self._scaling = torch.zeros(2, 3)
+            self._rotation = torch.tensor(
+                [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
+            )
+            self._deformation_table = torch.tensor([True, False])
+            self._deformation_accum = torch.zeros(2, 3)
+            self._deformation = _FakeDeformation()
+            self.active_sh_degree = 0
+            self.max_sh_degree = 0
+            self.scaling_activation = lambda value: value
+            self.rotation_activation = lambda value: value
+            self.opacity_activation = lambda value: value
+            self.get_features = torch.zeros(2, 1, 3)
+
+    point_cloud = _FakePointCloud()
+    camera = SimpleNamespace(
+        FoVx=0.5,
+        FoVy=0.5,
+        image_height=4,
+        image_width=4,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+        time=0.5,
+    )
+    pipe = SimpleNamespace(
+        compute_cov3D_python=False,
+        convert_SHs_python=False,
+        debug=False,
+    )
+    base_colors = torch.tensor(
+        [[0.2, 0.2, 0.2], [0.6, 0.6, 0.6]]
+    )
+
+    output = renderer.render(
+        camera,
+        point_cloud,
+        pipe,
+        torch.zeros(3),
+        override_color=base_colors,
+        stage="fine",
+        update_deformation_stats=False,
+        return_routing_state=True,
+    )
+
+    raster_kwargs = _FakeRasterizer.last_kwargs
+    assert raster_kwargs["means3D"].shape == (4, 3)
+    assert raster_kwargs["opacities"].shape == (4, 1)
+    assert torch.allclose(
+        raster_kwargs["colors_precomp"][2:],
+        torch.tensor([[0.3, 0.2, 0.2], [0.2, 0.4, 0.2]]),
+    )
+    assert output["radii"].shape == (2,)
+    assert output["visibility_filter"].shape == (2,)
+    assert output["routing_state"]["means3d"].shape == (4, 3)
+    assert output["routing_state"]["auxiliary_point_count"] == 2
 
 
 def test_renderer_defaults_to_gaussian_moe_blend_when_pixel_routing_disabled(monkeypatch):
@@ -3069,10 +3198,13 @@ def test_renderer_canonicalizes_legacy_replicated_depth(monkeypatch):
 
 def test_endomoeg_routing_feature_splat_propagates_router_gradients(monkeypatch):
     class _FakeRasterizer:
+        last_kwargs = None
+
         def __init__(self, raster_settings):
             self.raster_settings = raster_settings
 
         def __call__(self, **kwargs):
+            type(self).last_kwargs = kwargs
             height = self.raster_settings.kwargs["image_height"]
             width = self.raster_settings.kwargs["image_width"]
             features = kwargs["colors_precomp"].mean(dim=0).view(3, 1, 1)
@@ -3098,7 +3230,7 @@ def test_endomoeg_routing_feature_splat_propagates_router_gradients(monkeypatch)
         "opacity": torch.ones(4, 1),
         "scales": torch.ones(4, 3),
         "rotations": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(4, 1),
-        "covariance": None,
+        "covariance": torch.ones(4, 6),
         "motion": torch.randn(4, 3) * 0.1,
         "scene_scale": 10.0,
     }
@@ -3115,10 +3247,72 @@ def test_endomoeg_routing_feature_splat_propagates_router_gradients(monkeypatch)
     assert outputs["projected_motion"].shape == (2, 3)
     assert outputs["coverage"].shape == (2, 3)
     assert outputs["depth"].shape == (1, 2, 3)
+    assert _FakeRasterizer.last_kwargs["scales"] is None
+    assert _FakeRasterizer.last_kwargs["rotations"] is None
+    assert _FakeRasterizer.last_kwargs["cov3D_precomp"] is not None
 
     outputs["gaussian_prior"].mean().backward()
     assert gaussian_logits.grad is not None
     assert torch.count_nonzero(gaussian_logits.grad).item() > 0
+
+
+def test_endomoeg_probability_splat_normalizes_by_visible_coverage(monkeypatch):
+    class _FakeRasterizer:
+        def __init__(self, raster_settings):
+            self.raster_settings = raster_settings
+
+        def __call__(self, **kwargs):
+            height = self.raster_settings.kwargs["image_height"]
+            width = self.raster_settings.kwargs["image_width"]
+            gate = kwargs["colors_precomp"][:, 0].mean()
+            coverage = gate.new_tensor(0.4)
+            features = torch.stack(
+                (gate * coverage, gate.new_zeros(()), coverage)
+            ).view(3, 1, 1)
+            return (
+                features.expand(3, height, width),
+                torch.ones(kwargs["means3D"].shape[0]),
+                torch.ones(1, height, width),
+            )
+
+    renderer = _load_gaussian_renderer_module(monkeypatch, _FakeRasterizer)
+    camera = SimpleNamespace(
+        FoVx=1.0,
+        FoVy=1.0,
+        image_height=2,
+        image_width=3,
+        world_view_transform=torch.eye(4),
+        full_proj_transform=torch.eye(4),
+        camera_center=torch.zeros(3),
+    )
+    routing_state = {
+        "means3d": torch.randn(4, 3),
+        "means2d": torch.zeros(4, 3),
+        "opacity": torch.ones(4, 1),
+        "scales": torch.ones(4, 3),
+        "rotations": torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(4, 1),
+        "covariance": None,
+        "motion": torch.zeros(4, 3),
+        "scene_scale": 10.0,
+    }
+
+    outputs = renderer.rasterize_endomoeg_routing_features(
+        camera,
+        SimpleNamespace(active_sh_degree=0),
+        SimpleNamespace(debug=False),
+        routing_state,
+        torch.full((4,), 0.5),
+        probabilities=True,
+    )
+
+    assert torch.allclose(
+        outputs["gaussian_prior"],
+        torch.full((2, 3), 0.5),
+    )
+    assert torch.allclose(
+        outputs["coverage"],
+        torch.full((2, 3), 0.4),
+    )
 
 
 def test_cams_visibility_head_exposes_render_affecting_controls():
