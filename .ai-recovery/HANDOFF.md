@@ -2625,12 +2625,14 @@ Claude must verify with:
 - singleton 通道布局按完整期望形状匹配，避免 `H=1` 时 `[1,H,W]` 与 `[H,W,1]` 发生轴歧义。
 
 ### 仍需做什么
-- 完成 diff 检查、提交并 push 到 `origin/main`。
+- 服务器执行 `git pull origin main`，重新运行 Stage 3 Router 命令验证真实 EndoNeRF batch。
 
 ### 运行过哪些测试
 - Router 定向回归：`15 passed`。
 - 完整测试集：`155 passed, 2 warnings`。
 - `H=1` 无歧义布局修正后重跑：Router `15 passed`；完整测试 `155 passed, 2 warnings`。
+- `py_compile` 与 `git diff --check`：passed。
+- 修复提交 `b70a3fc` 已 push 到 `origin/main`。
 
 ### 下一步最小任务
-- 执行最终检查并提交推送。
+- 服务器拉取 `b70a3fc` 后重跑 Router stage。
