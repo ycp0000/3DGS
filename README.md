@@ -26,7 +26,7 @@ Both residual experts restore the optimized canonical cloud and dynamic backbone
 - `local`: a SC-GS/MoSca-inspired sparse SE(3) motion scaffold with farthest-point control nodes, bounded surface-local node offsets/radii, surface-aware KNN skinning, learnable sparse node gates, absolute spatial support, identity-preserving Dual Quaternion Blending, ARAP regularization, and temporal acceleration regularization. It refines position and rotation only.
 - `contact`: an STG/HyperNeRF-inspired auxiliary spacetime Gaussian bank with persistent tissue-parent bindings, bounded second-order trajectories, multiple temporal RBF charts, learned lifecycle duration, and projected tool-boundary supervision. It models transient contact surfaces without forcing the canonical cloud to explain appearance/disappearance.
 
-The residual modules start as exact identities. Residual training uses a frozen Global render as a teacher: high-error regions receive boosting supervision, already-correct regions are preserved by distillation, and pixel-wise no-regret penalizes regressions. A low-LR warm-up, refinement-only gradient clipping, stage-0 Global parity check, and best-state rollback prevent Local or Contact bundles from finishing below the Global anchor.
+The residual modules start as exact identities. Residual training uses a frozen Global render as a teacher: full-image reconstruction keeps gradients on every valid pixel, high-error regions receive bounded extra boosting, already-correct regions are preserved by distillation, and a smooth pixel-wise no-regret barrier penalizes regressions. Binocular inverse-depth supervision is also teacher-relative. Legacy TV, DSSIM, LPIPS, and monocular Pearson depth losses are disabled in residual stages because they bypass the Global quality anchor. A low-LR warm-up, refinement-only gradient clipping, exact fixed-view RGB/depth parity checks, and best-state rollback prevent Local or Contact bundles from finishing below the Global anchor.
 
 All structural motion bounds are explicit preset parameters. They are written into `cfg_args` and expert bundles, including Local node offset/radius limits and Contact spatial, velocity, acceleration, rotation, scale, and duration limits.
 
@@ -60,7 +60,7 @@ Joint fine-tuning writes a new assembly directory and never overwrites the froze
 
 ## Identity and safety contracts
 
-Expert bundle format version 5 and Router bundle version 5 bind:
+Expert bundle format version 6 and Router bundle version 6 bind:
 
 - absolute dataset path
 - source canonical fingerprint
@@ -74,7 +74,7 @@ Expert bundle format version 5 and Router bundle version 5 bind:
 The complete expert-state fingerprint includes deformation weights and spatial context. A same-topology expert with different dynamic weights is rejected.
 Bundles produced by earlier independent-expert or pre-bounded residual architectures must be retrained; they are intentionally rejected instead of being silently migrated.
 
-The version-5 residual protocol changes both Local state and training semantics. Use a new bundle directory and rerun canonical, Global, Local, Contact, and Router stages; do not reuse version-4 expert bundles.
+The version-6 residual protocol changes Local state, residual objectives, depth protection, and start-parity validation. Use a new bundle directory and rerun canonical, Global, Local, Contact, and Router stages; do not reuse version-5 expert or Router bundles.
 
 Other enforced contracts:
 
@@ -276,9 +276,11 @@ Important expert metrics:
 - `fine/tracking/losses/L_scaffold_acceleration`
 - `fine/tracking/losses/L_scaffold_gate_sparsity`
 - `fine/tracking/losses/L_residual_boost`
+- `fine/tracking/losses/L_residual_reconstruction`
 - `fine/tracking/losses/L_residual_preserve`
 - `fine/tracking/losses/L_residual_no_regret`
 - `fine/tracking/losses/L_residual_total`
+- `fine/tracking/losses/L_residual_depth`
 - `fine/tracking/losses/L_contact_bank_sparsity`
 - `fine/tracking/losses/L_contact_bank_locality`
 - `fine/tracking/stats/scaffold_node_translation_norm`
@@ -286,12 +288,18 @@ Important expert metrics:
 - `fine/tracking/stats/scaffold_spatial_support_mean`
 - `fine/tracking/stats/residual_teacher_error`
 - `fine/tracking/stats/residual_candidate_error`
+- `fine/tracking/stats/residual_teacher_psnr`
+- `fine/tracking/stats/residual_psnr_delta`
+- `fine/tracking/stats/residual_regressed_fraction`
+- `fine/tracking/stats/residual_depth_regressed_fraction`
 - `fine/tracking/stats/residual_grad_norm_before_clip`
 - `fine/tracking/stats/lr_group_tracking_expert_refinement`
 - `fine/tracking/stats/contact_bank_temporal_activity`
 - `fine/tracking/stats/contact_bank_boundary_support`
 - `fine/residual/global_baseline_psnr`
 - `fine/residual/best_psnr`
+- `fine/residual/parity_rgb_max_abs`
+- `fine/residual/parity_depth_max_abs`
 
 Important Router metrics:
 
@@ -415,7 +423,7 @@ Recommended comparisons:
 14. legacy independent-expert Router
 15. legacy continuous `cams_gs_moe`
 
-Legacy independent-expert and residual-component checkpoints are intentionally incompatible with the version-5 heterogeneous residual pipeline.
+Legacy independent-expert and residual-component checkpoints are intentionally incompatible with the version-6 heterogeneous residual pipeline.
 
 ## Tests
 

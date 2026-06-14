@@ -359,7 +359,7 @@ def test_gain_supervision_opens_exact_zero_local_gate_without_sparse_bias():
 def _expert_payloads(point_count=2):
     architectures = {
         "global": "endomoeg_complete_global_v1",
-        "local": "endomoeg_complete_local_v4",
+        "local": "endomoeg_complete_local_v5",
         "contact": "endomoeg_complete_contact_v4",
     }
     return {
@@ -394,6 +394,11 @@ def test_router_bundle_binds_residual_experts_without_top_k_protocol():
     validate_router_bundle(bundle, ensemble=ensemble)
     assert "inference_top_k" not in bundle
     assert tuple(bundle["point_counts"].values()) == (2, 2, 2)
+
+    version_five = dict(bundle)
+    version_five["version"] = 5
+    with pytest.raises(ValueError, match="Unsupported Router bundle version"):
+        validate_router_bundle(version_five, ensemble=ensemble)
 
     replaced = _expert_payloads()
     replaced["local"]["expert_state_fingerprint"] = "replacement"

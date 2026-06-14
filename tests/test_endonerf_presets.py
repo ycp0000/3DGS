@@ -1,7 +1,7 @@
 import importlib.util
 import math
 import sys
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from collections import UserDict
 from pathlib import Path
 
@@ -23,6 +23,9 @@ from train import (
     allows_gaussian_topology_updates,
     clip_residual_refinement_gradients,
     normalize_endomoeg_pipeline_stage,
+    should_apply_color_refinement,
+    validate_global_anchor_config,
+    validate_residual_depth_shapes,
     validate_endomoeg_pipeline_args,
 )
 from utils.params_utils import merge_hparams
@@ -321,13 +324,24 @@ def test_endomoeg_presets_use_complete_expert_pipeline_defaults():
         )
         assert candidate.lambda_scaffold_gate_sparsity == pytest.approx(1e-3)
         assert candidate.endomoeg_residual_hard_quantile == pytest.approx(0.7)
+        assert candidate.endomoeg_residual_reconstruction_weight == pytest.approx(
+            1.0
+        )
+        assert candidate.endomoeg_residual_boost_weight == pytest.approx(0.25)
         assert candidate.endomoeg_residual_preserve_weight == pytest.approx(1.0)
         assert candidate.endomoeg_residual_no_regret_weight == pytest.approx(2.0)
+        assert candidate.endomoeg_residual_no_regret_temperature == pytest.approx(
+            0.01
+        )
+        assert candidate.endomoeg_residual_depth_weight == pytest.approx(0.05)
         assert candidate.endomoeg_residual_lr_scale == pytest.approx(0.01)
         assert candidate.endomoeg_residual_warmup_iterations == 500
         assert candidate.endomoeg_residual_gradient_clip == pytest.approx(0.05)
         assert candidate.endomoeg_residual_max_baseline_psnr_drop == pytest.approx(
             0.05
+        )
+        assert candidate.endomoeg_residual_render_parity_tolerance == pytest.approx(
+            1e-5
         )
         assert candidate.endomoeg_contact_max_spatial_offset_ratio == pytest.approx(
             0.02
@@ -382,6 +396,35 @@ def test_residual_experts_disable_canonical_topology_updates():
     assert allows_gaussian_topology_updates("fine", global_hyper)
     assert not allows_gaussian_topology_updates("fine", local_hyper)
     assert not allows_gaussian_topology_updates("fine", contact_hyper)
+
+
+def test_residual_experts_disable_legacy_color_outlier_mask_refinement():
+    teacher = object()
+
+    assert should_apply_color_refinement(999, residual_teacher=None)
+    assert not should_apply_color_refinement(1000, residual_teacher=None)
+    assert not should_apply_color_refinement(1, residual_teacher=teacher)
+
+
+def test_residual_depth_shape_contract_rejects_silent_broadcasting():
+    candidate = torch.zeros(2, 1, 8, 10)
+    teacher = torch.zeros_like(candidate)
+    target = torch.zeros_like(candidate)
+
+    validate_residual_depth_shapes(candidate, teacher, target)
+
+    with pytest.raises(ValueError, match="must match"):
+        validate_residual_depth_shapes(
+            candidate,
+            teacher[:1],
+            target,
+        )
+    with pytest.raises(ValueError, match=r"\[B, 1, H, W\]"):
+        validate_residual_depth_shapes(
+            candidate,
+            teacher,
+            target.squeeze(1),
+        )
 
 
 def test_endomoeg_preset_preserves_cli_pipeline_stage_and_role(tmp_path):
@@ -452,6 +495,38 @@ def test_residual_gradient_clipping_only_touches_refinement_group():
     assert norm.item() == pytest.approx(5.0)
     assert refinement.grad.norm().item() == pytest.approx(1.0)
     assert torch.equal(frozen.grad, torch.tensor((7.0, 8.0)))
+
+
+def test_global_anchor_config_rejects_base_deformation_mismatch():
+    hyper = Namespace(
+        no_grid=False,
+        no_ds=False,
+        no_dr=False,
+        no_do=False,
+        no_dshs=False,
+        apply_rotation=False,
+        kplanes_config={"resolution": [64, 64, 64, 100]},
+        multires=[1, 2, 4, 8],
+        defor_depth=0,
+        net_width=32,
+        timebase_pe=4,
+        timenet_width=64,
+        timenet_output=32,
+        scale_rotation_pe=2,
+        opacity_pe=2,
+        bounds=1.6,
+    )
+    payload = {
+        "config": {
+            "hidden_params": dict(vars(hyper)),
+        }
+    }
+
+    validate_global_anchor_config(hyper, payload)
+    payload["config"]["hidden_params"]["net_width"] = 64
+
+    with pytest.raises(ValueError, match="net_width"):
+        validate_global_anchor_config(hyper, payload)
 
 
 def test_endomoeg_pipeline_requires_absolute_bundle_paths(tmp_path):

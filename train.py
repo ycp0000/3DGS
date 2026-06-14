@@ -216,12 +216,165 @@ def build_frozen_global_teacher(dataset, global_payload, device):
     return freeze_gaussian_model(teacher)
 
 
+def validate_global_anchor_config(hyper, global_payload):
+    hidden_params = (
+        (global_payload.get("config") or {}).get("hidden_params") or {}
+    )
+    compatibility_keys = (
+        "no_grid",
+        "no_ds",
+        "no_dr",
+        "no_do",
+        "no_dshs",
+        "apply_rotation",
+        "kplanes_config",
+        "multires",
+        "defor_depth",
+        "net_width",
+        "timebase_pe",
+        "timenet_width",
+        "timenet_output",
+        "scale_rotation_pe",
+        "opacity_pe",
+        "bounds",
+    )
+    mismatched = []
+    for key in compatibility_keys:
+        if key not in hidden_params or not hasattr(hyper, key):
+            continue
+        if hidden_params[key] != getattr(hyper, key):
+            mismatched.append(key)
+    if mismatched:
+        raise ValueError(
+            "Residual expert base deformation config does not match its "
+            "Global anchor: {}".format(", ".join(mismatched))
+        )
+
+
+@torch.no_grad()
+def validate_residual_teacher_render_parity(
+    scene,
+    candidate,
+    teacher,
+    pipe,
+    background,
+    tolerance,
+):
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance <= 0.0:
+        raise ValueError(
+            "Residual render parity tolerance must be finite and positive"
+        )
+    cameras = (
+        select_fixed_views(scene.getTestCameras(), count=4)
+        + select_fixed_views(scene.getTrainCameras(), count=4)
+    )
+    if not cameras:
+        raise RuntimeError(
+            "Residual teacher parity requires at least one fixed camera"
+        )
+    rgb_max_abs = 0.0
+    rgb_mean_abs = 0.0
+    depth_max_abs = 0.0
+    depth_mean_abs = 0.0
+    for camera in cameras:
+        candidate_pkg = render(
+            camera,
+            candidate,
+            pipe,
+            background,
+            stage="fine",
+            update_deformation_stats=False,
+        )
+        teacher_pkg = render(
+            camera,
+            teacher,
+            pipe,
+            background,
+            stage="fine",
+            update_deformation_stats=False,
+        )
+        for owner, package in (
+            ("candidate", candidate_pkg),
+            ("teacher", teacher_pkg),
+        ):
+            for output_name in ("render", "depth"):
+                if not torch.isfinite(package[output_name]).all():
+                    raise FloatingPointError(
+                        "{} {} contains NaN or Inf during residual "
+                        "start-parity validation".format(owner, output_name)
+                    )
+        rgb_delta = (
+            candidate_pkg["render"] - teacher_pkg["render"]
+        ).abs()
+        depth_delta = (
+            candidate_pkg["depth"] - teacher_pkg["depth"]
+        ).abs()
+        rgb_max_abs = max(rgb_max_abs, float(rgb_delta.max().item()))
+        rgb_mean_abs += float(rgb_delta.mean().item())
+        depth_max_abs = max(
+            depth_max_abs,
+            float(depth_delta.max().item()),
+        )
+        depth_mean_abs += float(depth_delta.mean().item())
+    camera_count = float(len(cameras))
+    metrics = {
+        "parity_rgb_max_abs": rgb_max_abs,
+        "parity_rgb_mean_abs": rgb_mean_abs / camera_count,
+        "parity_depth_max_abs": depth_max_abs,
+        "parity_depth_mean_abs": depth_mean_abs / camera_count,
+    }
+    if rgb_max_abs > tolerance or depth_max_abs > tolerance:
+        raise RuntimeError(
+            "Residual candidate is not render-equivalent to its frozen "
+            "Global teacher before optimization: RGB max abs {:.3e}, "
+            "depth max abs {:.3e}, tolerance {:.3e}".format(
+                rgb_max_abs,
+                depth_max_abs,
+                tolerance,
+            )
+        )
+    return metrics
+
+
 def should_reset_opacity(stage, iteration, opt, dataset):
     if stage != "coarse":
         return False
     return iteration % opt.opacity_reset_interval == 0 or (
         dataset.white_background and iteration == opt.densify_from_iter
     )
+
+
+def should_apply_color_refinement(iteration, residual_teacher):
+    return residual_teacher is None and int(iteration) < 1000
+
+
+def validate_residual_depth_shapes(candidate, teacher, target):
+    tensors = {
+        "candidate": candidate,
+        "teacher": teacher,
+        "target": target,
+    }
+    invalid = [
+        "{}={}".format(name, tuple(value.shape))
+        for name, value in tensors.items()
+        if value.ndim != 4 or value.shape[1] != 1
+    ]
+    if invalid:
+        raise ValueError(
+            "Residual depth tensors must have shape [B, 1, H, W]: {}".format(
+                ", ".join(invalid)
+            )
+        )
+    if candidate.shape != teacher.shape or candidate.shape != target.shape:
+        raise ValueError(
+            "Residual candidate, teacher, and target depth shapes must match: "
+            "candidate={}, teacher={}, target={}".format(
+                tuple(candidate.shape),
+                tuple(teacher.shape),
+                tuple(target.shape),
+            )
+        )
 
 
 def allows_gaussian_topology_updates(stage, hyper):
@@ -345,6 +498,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     residual_best_metrics = {}
     residual_best_psnr = -float("inf")
     if residual_teacher is not None:
+        parity_metrics = validate_residual_teacher_render_parity(
+            scene,
+            gaussians,
+            residual_teacher,
+            pipe,
+            background,
+            hyper.endomoeg_residual_render_parity_tolerance,
+        )
         zero = gaussians.get_xyz.new_zeros(())
         residual_best_metrics = training_report(
             tb_writer,
@@ -399,6 +560,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 residual_best_psnr,
                 0,
             )
+            for name, value in parity_metrics.items():
+                tb_writer.add_scalar(
+                    "{}/residual/{}".format(stage, name),
+                    value,
+                    0,
+                )
     video_cams = scene.getVideoCameras()
     temporal_times = sorted_unique_times(
         camera.time for camera in scene.getTrainCameras()
@@ -473,6 +640,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         gt_depths = []
         masks = []
         teacher_images = []
+        teacher_depths = []
 
         radii_list = []
         visibility_filter_list = []
@@ -516,6 +684,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     )
                 teacher_images.append(
                     teacher_pkg["render"].detach().unsqueeze(0)
+                )
+                teacher_depths.append(
+                    teacher_pkg["depth"].detach().unsqueeze(0)
                 )
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
@@ -573,14 +744,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         mask_tensor = torch.cat(masks, 0)
                 
         # mask_tensor = None
-        if iteration < 1000:
+        apply_color_refinement = should_apply_color_refinement(
+            iteration,
+            residual_teacher,
+        )
+        if apply_color_refinement:
             color_diff = torch.pow(image_tensor-gt_image_tensor, 2).sum(dim=1, keepdim=True)
             color_diff = color_diff.reshape(color_diff.shape[0], -1)
             quantile = torch.quantile(color_diff, 0.98, dim=1)
             color_to_refine = (color_diff > quantile).reshape(*mask_tensor.shape)
             mask_tensor[color_to_refine] = torch.ones(color_to_refine.sum(), device=device, dtype=torch.bool)
                 
-        if iteration % 500 == 0 and iteration < 1000:
+        if iteration % 500 == 0 and apply_color_refinement:
             tmp = (color_to_refine.squeeze().detach().cpu().numpy()*255).astype(np.uint8)
             cv2.imwrite('color_to_refine.png', tmp)
             tmp = (image_tensor.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()*255).astype(np.uint8)
@@ -603,6 +778,12 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 hard_quantile=float(
                     hyper.endomoeg_residual_hard_quantile
                 ),
+                reconstruction_weight=float(
+                    hyper.endomoeg_residual_reconstruction_weight
+                ),
+                boost_weight=float(
+                    hyper.endomoeg_residual_boost_weight
+                ),
                 preserve_weight=float(
                     hyper.endomoeg_residual_preserve_weight
                 ),
@@ -612,14 +793,112 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 no_regret_margin=float(
                     hyper.endomoeg_residual_no_regret_margin
                 ),
+                no_regret_temperature=float(
+                    hyper.endomoeg_residual_no_regret_temperature
+                ),
             )
             image_reconstruction_loss = residual_training_metrics[
                 "L_residual_total"
             ]
+            teacher_psnr = psnr(
+                teacher_image_tensor,
+                gt_image_tensor,
+                mask_tensor,
+            ).mean().double()
+            residual_training_metrics["residual_teacher_psnr"] = (
+                teacher_psnr.detach()
+            )
+            residual_training_metrics["residual_psnr_delta"] = (
+                psnr(
+                    image_tensor,
+                    gt_image_tensor,
+                    mask_tensor,
+                ).mean().double()
+                - teacher_psnr
+            ).detach()
+            residual_training_metrics["residual_teacher_l1"] = l1_loss(
+                teacher_image_tensor,
+                gt_image_tensor,
+                mask_tensor,
+            ).detach()
 
         scene_mode = getattr(scene, "mode", "binocular")
         if (gt_depth_tensor!=0).sum() < 10:
             depth_loss = torch.zeros((), device=device)
+        elif residual_teacher is not None and scene_mode == "binocular":
+            teacher_depth_tensor = torch.cat(teacher_depths, dim=0)
+            validate_residual_depth_shapes(
+                depth_tensor,
+                teacher_depth_tensor,
+                gt_depth_tensor,
+            )
+            depth_epsilon = 1e-6
+            depth_valid_mask = (
+                (mask_tensor > 0)
+                & (gt_depth_tensor > depth_epsilon)
+                & (teacher_depth_tensor > depth_epsilon)
+            )
+            inverse_depth = torch.where(
+                depth_tensor > depth_epsilon,
+                depth_tensor.clamp_min(depth_epsilon).reciprocal(),
+                torch.zeros_like(depth_tensor),
+            )
+            inverse_teacher_depth = torch.where(
+                teacher_depth_tensor > depth_epsilon,
+                teacher_depth_tensor.clamp_min(depth_epsilon).reciprocal(),
+                torch.zeros_like(teacher_depth_tensor),
+            )
+            inverse_gt_depth = torch.where(
+                gt_depth_tensor > depth_epsilon,
+                gt_depth_tensor.clamp_min(depth_epsilon).reciprocal(),
+                torch.zeros_like(gt_depth_tensor),
+            )
+            depth_metrics = compute_residual_boosting_losses(
+                inverse_depth,
+                inverse_teacher_depth,
+                inverse_gt_depth,
+                mask=depth_valid_mask,
+                hard_quantile=float(
+                    hyper.endomoeg_residual_hard_quantile
+                ),
+                reconstruction_weight=1.0,
+                boost_weight=0.0,
+                preserve_weight=float(
+                    hyper.endomoeg_residual_preserve_weight
+                ),
+                no_regret_weight=float(
+                    hyper.endomoeg_residual_no_regret_weight
+                ),
+                no_regret_margin=float(
+                    hyper.endomoeg_residual_no_regret_margin
+                ),
+                no_regret_temperature=float(
+                    hyper.endomoeg_residual_no_regret_temperature
+                ),
+            )
+            depth_weight = float(
+                hyper.endomoeg_residual_depth_weight
+            )
+            depth_loss = depth_metrics["L_residual_total"] * depth_weight
+            residual_training_metrics.update(
+                {
+                    "L_residual_depth": depth_loss.detach(),
+                    "residual_depth_candidate_error": depth_metrics[
+                        "residual_candidate_error"
+                    ],
+                    "residual_depth_teacher_error": depth_metrics[
+                        "residual_teacher_error"
+                    ],
+                    "residual_depth_regressed_fraction": depth_metrics[
+                        "residual_regressed_fraction"
+                    ],
+                }
+            )
+        elif residual_teacher is not None:
+            depth_loss = torch.zeros((), device=device)
+            residual_training_metrics[
+                "residual_monocular_depth_disabled"
+            ] = depth_loss.new_ones(())
         elif scene_mode == 'binocular':
             depth_pred = depth_tensor.clone()
             depth_gt = gt_depth_tensor.clone()
@@ -636,9 +915,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         else:
             raise ValueError(f"{scene_mode} is not implemented.")
 
-        depth_tvloss = TV_loss(depth_tensor, mask_tensor)
-        img_tvloss = TV_loss(image_tensor, mask_tensor)
-        tv_loss = 0.03 * (img_tvloss + depth_tvloss)
+        if residual_teacher is None:
+            depth_tvloss = TV_loss(depth_tensor, mask_tensor)
+            img_tvloss = TV_loss(image_tensor, mask_tensor)
+            tv_loss = 0.03 * (img_tvloss + depth_tvloss)
+        else:
+            tv_loss = torch.zeros((), device=device)
+            residual_training_metrics[
+                "residual_legacy_tv_disabled"
+            ] = tv_loss.new_ones(())
 
         psnr_ = psnr(image_tensor, gt_image_tensor, mask_tensor).mean().double()
 
@@ -786,10 +1071,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         ):
             tv_loss = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.plane_tv_weight, hyper.l1_time_planes)
             loss += tv_loss
-        if opt.lambda_dssim != 0:
+        if residual_teacher is None and opt.lambda_dssim != 0:
             ssim_loss = ssim(image_tensor,gt_image_tensor)
             loss += opt.lambda_dssim * (1.0-ssim_loss)
-        if opt.lambda_lpips !=0:
+        if residual_teacher is None and opt.lambda_lpips !=0:
             lpipsloss = lpips_loss(image_tensor,gt_image_tensor,lpips_model)
             loss += opt.lambda_lpips * lpipsloss
         
@@ -859,6 +1144,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                         postfix["Lmag"] = f"{tracking_metrics['L_mag_geo'].detach().item():.1e}"
                     if "L_raw_geo" in tracking_metrics:
                         postfix["Lraw"] = f"{tracking_metrics['L_raw_geo'].detach().item():.1e}"
+                    if "residual_teacher_psnr" in tracking_metrics:
+                        postfix["tpsnr"] = (
+                            f"{tracking_metrics['residual_teacher_psnr'].detach().item():.2f}"
+                        )
+                    if "residual_psnr_delta" in tracking_metrics:
+                        postfix["dP"] = (
+                            f"{tracking_metrics['residual_psnr_delta'].detach().item():+.2f}"
+                        )
                 progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
@@ -947,13 +1240,6 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
-    if stage == "fine" and final_tracking_phase_name is not None:
-        save_completed_endomoeg_phase(
-            gaussians,
-            scene.model_path,
-            final_tracking_phase_name,
-            getattr(hyper, "endomoeg_component_output_dir", ""),
-        )
     if residual_best_state is not None:
         gaussians.restore_expert_state(
             residual_best_state,
@@ -965,6 +1251,13 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             "[EndoMoe] Restored best residual expert at PSNR {:.4f}".format(
                 residual_best_psnr
             )
+        )
+    if stage == "fine" and final_tracking_phase_name is not None:
+        save_completed_endomoeg_phase(
+            gaussians,
+            scene.model_path,
+            final_tracking_phase_name,
+            getattr(hyper, "endomoeg_component_output_dir", ""),
         )
     return latest_validation_metrics
 
@@ -1048,6 +1341,7 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                 ],
                 minimum_psnr=float(hyper.endomoeg_min_expert_psnr),
             )
+            validate_global_anchor_config(hyper, global_payload)
             gaussians.restore_global_anchor_state(
                 global_payload["expert_state"]
             )

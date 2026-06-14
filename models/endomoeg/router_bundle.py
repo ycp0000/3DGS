@@ -8,7 +8,7 @@ from .expert_bundle import EXPERT_ROLES
 
 
 ROUTER_BUNDLE_FORMAT = "endomoeg_frozen_expert_router_bundle"
-ROUTER_BUNDLE_VERSION = 5
+ROUTER_BUNDLE_VERSION = 6
 ROUTER_ARCHITECTURE_VERSION = "endomoeg_residual_gate_router_v4"
 
 

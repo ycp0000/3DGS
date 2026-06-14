@@ -148,6 +148,11 @@ def test_complete_expert_bundle_rejects_legacy_and_source_mismatch(tmp_path):
     with pytest.raises(ValueError, match="requires tracking architecture"):
         validate_expert_bundle(wrong_architecture)
 
+    version_five = copy.deepcopy(payload)
+    version_five["version"] = 5
+    with pytest.raises(ValueError, match="Unsupported expert bundle version"):
+        validate_expert_bundle(version_five)
+
 
 def test_complete_expert_state_round_trip_preserves_topology_and_deformation():
     source = _build_gaussian_stub(

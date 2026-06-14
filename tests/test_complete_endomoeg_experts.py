@@ -97,12 +97,15 @@ def test_residual_boosting_is_zero_regret_at_teacher_identity():
         teacher,
         target,
         hard_quantile=0.75,
+        reconstruction_weight=1.0,
+        boost_weight=0.25,
         preserve_weight=2.0,
         no_regret_weight=3.0,
+        no_regret_temperature=0.01,
     )
 
     assert losses["L_residual_preserve"].item() == pytest.approx(0.0)
-    assert losses["L_residual_no_regret"].item() == pytest.approx(0.0)
+    assert losses["L_residual_no_regret"].item() > 0.0
     assert losses["residual_hard_fraction"].item() == pytest.approx(0.25)
     losses["L_residual_total"].backward()
     assert candidate.grad[:, :, 0, 0].abs().sum().item() > 0.0
@@ -130,6 +133,56 @@ def test_residual_boosting_penalizes_regression_outside_hard_region():
     assert losses["residual_candidate_error"].item() > (
         losses["residual_teacher_error"].item()
     )
+    assert losses["residual_regressed_fraction"].item() == pytest.approx(0.25)
+    assert losses["residual_mean_regret"].item() > 0.0
+
+
+def test_residual_reconstruction_protects_non_hard_improvable_pixels():
+    teacher = torch.zeros(1, 1, 1, 4)
+    target = torch.tensor([[[[1.0, 0.5, 0.25, 0.0]]]])
+    candidate = teacher.clone().requires_grad_(True)
+
+    losses = compute_residual_boosting_losses(
+        candidate,
+        teacher,
+        target,
+        hard_quantile=0.75,
+        reconstruction_weight=1.0,
+        boost_weight=0.25,
+        preserve_weight=0.0,
+        no_regret_weight=1.0,
+        no_regret_temperature=0.01,
+    )
+    losses["L_residual_total"].backward()
+
+    assert candidate.grad[0, 0, 0, 0].item() < 0.0
+    assert candidate.grad[0, 0, 0, 1].item() < 0.0
+    assert candidate.grad[0, 0, 0, 2].item() < 0.0
+    assert candidate.grad[0, 0, 0, 3].item() == pytest.approx(0.0)
+
+
+def test_residual_objective_ignores_invalid_pixels_but_rejects_valid_nan():
+    teacher = torch.zeros(1, 1, 1, 2)
+    target = torch.zeros_like(teacher)
+    candidate = teacher.clone()
+    candidate[..., 1] = float("nan")
+    mask = torch.tensor([[[[True, False]]]])
+
+    losses = compute_residual_boosting_losses(
+        candidate,
+        teacher,
+        target,
+        mask=mask,
+    )
+    assert torch.isfinite(losses["L_residual_total"])
+
+    with pytest.raises(FloatingPointError, match="candidate"):
+        compute_residual_boosting_losses(
+            candidate,
+            teacher,
+            target,
+            mask=torch.ones_like(mask),
+        )
 
 
 def test_residual_scheduler_warms_up_before_decay():
@@ -313,7 +366,7 @@ def test_deform_network_builds_complete_expert_and_reports_role_version():
     assert model.deformation_net.complete_expert_head.role == "local"
     assert (
         model.deformation_net.get_tracking_arch_version()
-        == "endomoeg_complete_local_v4"
+        == "endomoeg_complete_local_v5"
     )
     assert "tracking_expert_refinement" in model.get_tracking_parameter_groups()
 
@@ -358,6 +411,9 @@ def test_residual_expert_transplants_global_anchor_without_overwriting_refinemen
     _assign_gaussian_state(global_model)
     with torch.no_grad():
         global_model._deformation.deformation_net.pos_deform[-1].bias.fill_(0.7)
+        global_model._deformation.deformation_net.rotations_deform[
+            -1
+        ].bias.fill_(0.2)
         global_model._features_dc.fill_(0.25)
     global_state = global_model.capture_expert_state()
 
@@ -380,6 +436,34 @@ def test_residual_expert_transplants_global_anchor_without_overwriting_refinemen
     local_state = local_model._deformation.state_dict()
     for name, value in refinement_before.items():
         assert torch.equal(local_state[name], value)
+
+    local_model._deformation.initialize_tracking_state(
+        local_model.get_xyz.detach(),
+        local_model.get_rotation.detach(),
+    )
+    time_values = torch.full(
+        (global_model.get_xyz.shape[0], 1),
+        0.37,
+    )
+    global_outputs = global_model._deformation(
+        global_model.get_xyz,
+        global_model._scaling,
+        global_model._rotation,
+        global_model._opacity,
+        time_values,
+    )
+    local_outputs = local_model._deformation(
+        local_model.get_xyz,
+        local_model._scaling,
+        local_model._rotation,
+        local_model._opacity,
+        time_values,
+    )
+    for global_output, local_output in zip(
+        global_outputs,
+        local_outputs,
+    ):
+        assert torch.allclose(local_output, global_output, atol=1e-7)
 
 
 @pytest.mark.parametrize("role", ("global", "local", "contact"))

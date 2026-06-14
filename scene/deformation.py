@@ -624,7 +624,12 @@ class Deformation(nn.Module):
             return "endomoeg_v4"
         if self.tracking_mode == "endomoeg_expert":
             role = getattr(self.args, "endomoeg_expert_role", "unknown")
-            version = "v4" if role in {"local", "contact"} else "v1"
+            if role == "local":
+                version = "v5"
+            elif role == "contact":
+                version = "v4"
+            else:
+                version = "v1"
             return "endomoeg_complete_{}_{}".format(role, version)
         if self.tracking_mode == "split":
             return "split_v1"

@@ -8,12 +8,12 @@ import torch
 CANONICAL_BUNDLE_FORMAT = "endomoeg_canonical_bundle"
 EXPERT_BUNDLE_FORMAT = "endomoeg_complete_expert_bundle"
 CANONICAL_BUNDLE_VERSION = 1
-EXPERT_BUNDLE_VERSION = 5
-EXPERT_ARCHITECTURE_VERSION = "endomoeg_heterogeneous_residual_expert_v5"
+EXPERT_BUNDLE_VERSION = 6
+EXPERT_ARCHITECTURE_VERSION = "endomoeg_heterogeneous_residual_expert_v6"
 EXPERT_ROLES = ("global", "local", "contact")
 EXPERT_TRACKING_ARCHITECTURES = {
     "global": "endomoeg_complete_global_v1",
-    "local": "endomoeg_complete_local_v4",
+    "local": "endomoeg_complete_local_v5",
     "contact": "endomoeg_complete_contact_v4",
 }
 

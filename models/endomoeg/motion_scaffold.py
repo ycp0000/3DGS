@@ -506,9 +506,9 @@ class MotionScaffoldLocalExpert(nn.Module):
             + point_gate * aligned_rotation,
             dim=-1,
         )
-        transformed_rotations = F.normalize(
-            _quaternion_multiply(gated_rotation, rotations),
-            dim=-1,
+        transformed_rotations = _quaternion_multiply(
+            gated_rotation,
+            rotations,
         )
         regularization = self._regularization(
             nodes,
