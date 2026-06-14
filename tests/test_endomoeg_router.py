@@ -359,8 +359,8 @@ def test_gain_supervision_opens_exact_zero_local_gate_without_sparse_bias():
 def _expert_payloads(point_count=2):
     architectures = {
         "global": "endomoeg_complete_global_v1",
-        "local": "endomoeg_complete_local_v3",
-        "contact": "endomoeg_complete_contact_v3",
+        "local": "endomoeg_complete_local_v4",
+        "contact": "endomoeg_complete_contact_v4",
     }
     return {
         role: {

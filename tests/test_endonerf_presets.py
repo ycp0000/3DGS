@@ -21,6 +21,7 @@ from arguments import (
 from models.tracking.cams_gs_tracking import CAMSGSScheduler
 from train import (
     allows_gaussian_topology_updates,
+    clip_residual_refinement_gradients,
     normalize_endomoeg_pipeline_stage,
     validate_endomoeg_pipeline_args,
 )
@@ -315,6 +316,19 @@ def test_endomoeg_presets_use_complete_expert_pipeline_defaults():
             0.02
         )
         assert candidate.endomoeg_scaffold_max_radius_scale == pytest.approx(4.0)
+        assert candidate.endomoeg_scaffold_initial_gate_probability == pytest.approx(
+            0.05
+        )
+        assert candidate.lambda_scaffold_gate_sparsity == pytest.approx(1e-3)
+        assert candidate.endomoeg_residual_hard_quantile == pytest.approx(0.7)
+        assert candidate.endomoeg_residual_preserve_weight == pytest.approx(1.0)
+        assert candidate.endomoeg_residual_no_regret_weight == pytest.approx(2.0)
+        assert candidate.endomoeg_residual_lr_scale == pytest.approx(0.01)
+        assert candidate.endomoeg_residual_warmup_iterations == 500
+        assert candidate.endomoeg_residual_gradient_clip == pytest.approx(0.05)
+        assert candidate.endomoeg_residual_max_baseline_psnr_drop == pytest.approx(
+            0.05
+        )
         assert candidate.endomoeg_contact_max_spatial_offset_ratio == pytest.approx(
             0.02
         )
@@ -399,6 +413,45 @@ def test_endomoeg_component_loading_arguments_have_safe_defaults():
     assert args.endomoeg_component_output_dir == ""
     assert args.endomoeg_strict_component_loading is True
     assert args.endomoeg_stage_iterations == -1
+
+
+def test_residual_gradient_clipping_only_touches_refinement_group():
+    refinement = torch.nn.Parameter(torch.tensor((3.0, 4.0)))
+    frozen = torch.nn.Parameter(torch.tensor((1.0, 2.0)))
+    refinement.grad = torch.tensor((3.0, 4.0))
+    frozen.grad = torch.tensor((7.0, 8.0))
+    optimizer = torch.optim.Adam(
+        [
+            {
+                "params": [refinement],
+                "name": "tracking_expert_refinement",
+            },
+            {
+                "params": [frozen],
+                "name": "tracking_base_deformation",
+            },
+        ],
+        lr=1e-3,
+    )
+    phase = type(
+        "Phase",
+        (),
+        {
+            "is_group_trainable": staticmethod(
+                lambda name: name == "tracking_expert_refinement"
+            )
+        },
+    )()
+
+    norm = clip_residual_refinement_gradients(
+        optimizer,
+        phase,
+        max_norm=1.0,
+    )
+
+    assert norm.item() == pytest.approx(5.0)
+    assert refinement.grad.norm().item() == pytest.approx(1.0)
+    assert torch.equal(frozen.grad, torch.tensor((7.0, 8.0)))
 
 
 def test_endomoeg_pipeline_requires_absolute_bundle_paths(tmp_path):

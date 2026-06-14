@@ -65,6 +65,12 @@ def _add_scaffold_regularization(
             "lambda_scaffold_node_offset",
             1e-3,
         ),
+        (
+            "scaffold_gate_sparsity",
+            "L_scaffold_gate_sparsity",
+            "lambda_scaffold_gate_sparsity",
+            1e-3,
+        ),
     )
     for raw_name, loss_name, weight_name, default_weight in terms:
         raw_value = _get_aux_tensor(aux, raw_name)
@@ -88,6 +94,13 @@ def _add_scaffold_regularization(
     mean_radius = _get_aux_tensor(aux, "scaffold_mean_radius")
     if mean_radius is not None:
         losses["scaffold_mean_radius"] = _safe_mean(mean_radius).detach()
+    for name in (
+        "scaffold_point_gate_mean",
+        "scaffold_spatial_support_mean",
+    ):
+        value = _get_aux_tensor(aux, name)
+        if value is not None:
+            losses[name] = _safe_mean(value).detach()
 
 
 def _add_contact_bank_regularization(

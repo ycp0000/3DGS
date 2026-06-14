@@ -150,7 +150,7 @@ class Deformation(nn.Module):
             )
         elif self.tracking_mode == "endomoeg_expert":
             expert_role = getattr(args, "endomoeg_expert_role", "")
-            self.scheduler = CompleteExpertScheduler(expert_role)
+            self.scheduler = CompleteExpertScheduler(expert_role, args)
             self.complete_expert_head = CompleteEndoMoeExpert(
                 role=expert_role,
                 time_feature_dim=getattr(args, "timenet_output", 32),
@@ -182,6 +182,11 @@ class Deformation(nn.Module):
                     args,
                     "endomoeg_scaffold_max_radius_scale",
                     4.0,
+                ),
+                scaffold_initial_gate_probability=getattr(
+                    args,
+                    "endomoeg_scaffold_initial_gate_probability",
+                    0.05,
                 ),
                 contact_anchor_count=getattr(
                     args,
@@ -619,7 +624,7 @@ class Deformation(nn.Module):
             return "endomoeg_v4"
         if self.tracking_mode == "endomoeg_expert":
             role = getattr(self.args, "endomoeg_expert_role", "unknown")
-            version = "v3" if role in {"local", "contact"} else "v1"
+            version = "v4" if role in {"local", "contact"} else "v1"
             return "endomoeg_complete_{}_{}".format(role, version)
         if self.tracking_mode == "split":
             return "split_v1"

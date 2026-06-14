@@ -145,6 +145,7 @@ class MotionScaffoldLocalExpert(nn.Module):
         max_rotation_radians: float = 0.35,
         max_node_offset_ratio: float = 0.02,
         max_radius_scale: float = 4.0,
+        initial_gate_probability: float = 0.05,
         normal_weight: float = 0.25,
         temporal_step: float = 1.0 / 155.0,
     ) -> None:
@@ -156,16 +157,20 @@ class MotionScaffoldLocalExpert(nn.Module):
         self.max_rotation_radians = float(max_rotation_radians)
         self.max_node_offset_ratio = float(max_node_offset_ratio)
         self.max_radius_scale = float(max_radius_scale)
+        self.initial_gate_probability = float(initial_gate_probability)
         if self.max_node_offset_ratio < 0.0:
             raise ValueError("max_node_offset_ratio must be non-negative")
         if self.max_radius_scale < 1.0:
             raise ValueError("max_radius_scale must be at least 1")
+        if not 0.0 < self.initial_gate_probability < 1.0:
+            raise ValueError("initial_gate_probability must be in (0, 1)")
         self.normal_weight = float(normal_weight)
         self.temporal_step = float(temporal_step)
         time_dim = 1 + 2 * self.time_frequencies
         self.trajectory = _build_mlp(3 + time_dim, hidden_dim, 6)
         self.node_offsets = nn.Parameter(torch.zeros(self.node_count, 3))
         self.node_log_radius_scale = nn.Parameter(torch.zeros(self.node_count))
+        self.node_gate_logits = nn.Parameter(torch.empty(self.node_count))
         self.register_buffer(
             "node_positions",
             torch.zeros(self.node_count, 3),
@@ -188,6 +193,10 @@ class MotionScaffoldLocalExpert(nn.Module):
         _zero_last_linear(self.trajectory)
         nn.init.zeros_(self.node_offsets)
         nn.init.zeros_(self.node_log_radius_scale)
+        initial_logit = torch.logit(
+            torch.tensor(self.initial_gate_probability)
+        ).item()
+        nn.init.constant_(self.node_gate_logits, initial_logit)
 
     def named_parameter_groups(self) -> Dict[str, Iterable[nn.Parameter]]:
         return {"tracking_expert_refinement": self.parameters()}
@@ -286,7 +295,7 @@ class MotionScaffoldLocalExpert(nn.Module):
         nodes: torch.Tensor,
         node_normals: torch.Tensor,
         radii: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         distances = torch.cdist(canonical_means, nodes)
         local_z = canonical_means.new_zeros(canonical_means.shape)
         local_z[:, 2] = 1.0
@@ -311,7 +320,8 @@ class MotionScaffoldLocalExpert(nn.Module):
         weights = unnormalized / unnormalized.sum(dim=1, keepdim=True).clamp_min(
             1e-8
         )
-        return indices, weights
+        support = unnormalized.amax(dim=1, keepdim=True)
+        return indices, weights, support
 
     @staticmethod
     def _node_base_positions(
@@ -446,7 +456,7 @@ class MotionScaffoldLocalExpert(nn.Module):
             normalized_scale,
         )
         node_rotation = _axis_angle_to_quaternion(axis_angle)
-        indices, weights = self._surface_aware_neighbors(
+        indices, weights, spatial_support = self._surface_aware_neighbors(
             canonical_means3d,
             canonical_rotations3d,
             nodes,
@@ -476,8 +486,28 @@ class MotionScaffoldLocalExpert(nn.Module):
             blended_real,
             blended_dual,
         )
+        node_gates = torch.sigmoid(self.node_gate_logits[:active])
+        point_gate = (
+            (weights * node_gates[indices]).sum(dim=1, keepdim=True)
+            * spatial_support
+        ).clamp(0.0, 1.0)
+        transformed_means = means3d + point_gate * (
+            transformed_means - means3d
+        )
+        identity_rotation = torch.zeros_like(blended_real)
+        identity_rotation[:, 0] = 1.0
+        aligned_rotation = torch.where(
+            blended_real[:, :1] < 0.0,
+            -blended_real,
+            blended_real,
+        )
+        gated_rotation = F.normalize(
+            (1.0 - point_gate) * identity_rotation
+            + point_gate * aligned_rotation,
+            dim=-1,
+        )
         transformed_rotations = F.normalize(
-            _quaternion_multiply(blended_real, rotations),
+            _quaternion_multiply(gated_rotation, rotations),
             dim=-1,
         )
         regularization = self._regularization(
@@ -497,7 +527,7 @@ class MotionScaffoldLocalExpert(nn.Module):
             "opacity_logits": opacity_logits,
             "d_mu": d_mu,
             "d_scale": torch.zeros_like(scales),
-            "d_rot": axis_angle[indices[:, 0]],
+            "d_rot": axis_angle[indices[:, 0]] * point_gate,
             "d_opacity_logit": torch.zeros_like(opacity_logits),
             "appearance_offsets": means3d.new_zeros((means3d.shape[0], 3)),
             "appearance_rgb_delta": means3d.new_zeros((means3d.shape[0], 3)),
@@ -510,6 +540,9 @@ class MotionScaffoldLocalExpert(nn.Module):
                 node_offset / normalized_scale
             ).square().mean(),
             "scaffold_mean_radius": radii.mean(),
+            "scaffold_gate_sparsity": node_gates.mean(),
+            "scaffold_point_gate_mean": point_gate.mean(),
+            "scaffold_spatial_support_mean": spatial_support.mean(),
         }
         output.update(regularization)
         return output

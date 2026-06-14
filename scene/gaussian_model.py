@@ -572,8 +572,11 @@ class GaussianModel:
             phase_scale = 1.0
             if phase is not None:
                 group_name = param_group["name"]
+                trainable = phase.is_group_trainable(group_name)
+                for parameter in param_group["params"]:
+                    parameter.requires_grad_(trainable)
                 phase_scale = phase.lr_scale_for_group(group_name)
-                if not phase.is_group_trainable(group_name):
+                if not trainable:
                     base_lr = 0.0
 
             param_group["lr"] = base_lr * phase_scale

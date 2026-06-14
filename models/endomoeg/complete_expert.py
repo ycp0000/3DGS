@@ -12,16 +12,48 @@ COMPLETE_EXPERT_ROLES = ("global", "local", "contact")
 
 
 class CompleteExpertScheduler:
-    def __init__(self, role):
+    def __init__(self, role, args=None):
         normalized_role = str(role).strip().lower()
         if normalized_role not in COMPLETE_EXPERT_ROLES:
             raise ValueError("Unsupported complete expert role: {}".format(role))
         self.role = normalized_role
+        self.residual_lr_scale = float(
+            getattr(args, "endomoeg_residual_lr_scale", 0.01)
+        )
+        self.residual_warmup_iterations = max(
+            int(
+                getattr(
+                    args,
+                    "endomoeg_residual_warmup_iterations",
+                    500,
+                )
+            ),
+            1,
+        )
 
     def build(self, iteration, total_iterations):
-        del iteration, total_iterations
         contact = self.role == "contact"
         residual_role = self.role in {"local", "contact"}
+        iteration = max(int(iteration), 0)
+        total_iterations = max(int(total_iterations), 1)
+        warmup_progress = min(
+            iteration / float(self.residual_warmup_iterations),
+            1.0,
+        )
+        decay_denominator = max(
+            total_iterations - self.residual_warmup_iterations,
+            1,
+        )
+        decay_progress = min(
+            max(
+                (
+                    iteration - self.residual_warmup_iterations
+                )
+                / float(decay_denominator),
+                0.0,
+            ),
+            1.0,
+        )
         return TrackingPhase(
             name="endomoeg_expert_{}".format(self.role),
             active_geo=1,
@@ -55,6 +87,22 @@ class CompleteExpertScheduler:
                 if residual_role
                 else ()
             ),
+            group_lr_scales=(
+                {
+                    "tracking_expert_refinement": (
+                        self.residual_lr_scale * warmup_progress
+                    ),
+                }
+                if residual_role
+                else {}
+            ),
+            group_schedule_progress=(
+                {
+                    "tracking_expert_refinement": decay_progress,
+                }
+                if residual_role
+                else {}
+            ),
         )
 
 
@@ -72,6 +120,7 @@ class CompleteEndoMoeExpert(nn.Module):
         scaffold_knn=4,
         scaffold_max_node_offset_ratio=0.02,
         scaffold_max_radius_scale=4.0,
+        scaffold_initial_gate_probability=0.05,
         contact_anchor_count=512,
         contact_chart_count=3,
         contact_max_spatial_offset_ratio=0.02,
@@ -99,6 +148,9 @@ class CompleteEndoMoeExpert(nn.Module):
                 max_rotation_radians=max_rot_delta,
                 max_node_offset_ratio=scaffold_max_node_offset_ratio,
                 max_radius_scale=scaffold_max_radius_scale,
+                initial_gate_probability=(
+                    scaffold_initial_gate_probability
+                ),
             )
         elif self.role == "contact":
             self.refinement = ContactSpacetimeExpert(

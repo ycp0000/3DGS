@@ -9,6 +9,9 @@ from models.endomoeg.complete_expert import (
     CompleteExpertScheduler,
 )
 from models.endomoeg.motion_scaffold import MotionScaffoldLocalExpert
+from models.endomoeg.residual_training import (
+    compute_residual_boosting_losses,
+)
 from scene.deformation import deform_network
 from scene.gaussian_model import GaussianModel
 from scene.tracking_losses import compute_tracking_losses
@@ -81,6 +84,79 @@ def _deformation_args(role):
         current_iteration=0,
         iterations=100,
     )
+
+
+def test_residual_boosting_is_zero_regret_at_teacher_identity():
+    teacher = torch.zeros(1, 3, 2, 2)
+    target = teacher.clone()
+    target[:, :, 0, 0] = 1.0
+    candidate = teacher.clone().requires_grad_(True)
+
+    losses = compute_residual_boosting_losses(
+        candidate,
+        teacher,
+        target,
+        hard_quantile=0.75,
+        preserve_weight=2.0,
+        no_regret_weight=3.0,
+    )
+
+    assert losses["L_residual_preserve"].item() == pytest.approx(0.0)
+    assert losses["L_residual_no_regret"].item() == pytest.approx(0.0)
+    assert losses["residual_hard_fraction"].item() == pytest.approx(0.25)
+    losses["L_residual_total"].backward()
+    assert candidate.grad[:, :, 0, 0].abs().sum().item() > 0.0
+    assert candidate.grad[:, :, 1, 1].abs().sum().item() == pytest.approx(0.0)
+
+
+def test_residual_boosting_penalizes_regression_outside_hard_region():
+    teacher = torch.zeros(1, 3, 2, 2)
+    target = teacher.clone()
+    target[:, :, 0, 0] = 1.0
+    candidate = teacher.clone()
+    candidate[:, :, 1, 1] = 0.5
+
+    losses = compute_residual_boosting_losses(
+        candidate,
+        teacher,
+        target,
+        hard_quantile=0.75,
+        preserve_weight=2.0,
+        no_regret_weight=3.0,
+    )
+
+    assert losses["L_residual_preserve"].item() > 0.0
+    assert losses["L_residual_no_regret"].item() > 0.0
+    assert losses["residual_candidate_error"].item() > (
+        losses["residual_teacher_error"].item()
+    )
+
+
+def test_residual_scheduler_warms_up_before_decay():
+    args = SimpleNamespace(
+        endomoeg_residual_lr_scale=0.02,
+        endomoeg_residual_warmup_iterations=100,
+    )
+    scheduler = CompleteExpertScheduler("local", args)
+
+    start = scheduler.build(iteration=0, total_iterations=1000)
+    midpoint = scheduler.build(iteration=50, total_iterations=1000)
+    warm = scheduler.build(iteration=100, total_iterations=1000)
+    decayed = scheduler.build(iteration=550, total_iterations=1000)
+
+    assert start.lr_scale_for_group("tracking_expert_refinement") == 0.0
+    assert midpoint.lr_scale_for_group(
+        "tracking_expert_refinement"
+    ) == pytest.approx(0.01)
+    assert warm.lr_scale_for_group(
+        "tracking_expert_refinement"
+    ) == pytest.approx(0.02)
+    assert warm.schedule_progress_for_group(
+        "tracking_expert_refinement"
+    ) == pytest.approx(0.0)
+    assert decayed.schedule_progress_for_group(
+        "tracking_expert_refinement"
+    ) == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize("role", ("global", "local", "contact"))
@@ -237,7 +313,7 @@ def test_deform_network_builds_complete_expert_and_reports_role_version():
     assert model.deformation_net.complete_expert_head.role == "local"
     assert (
         model.deformation_net.get_tracking_arch_version()
-        == "endomoeg_complete_local_v3"
+        == "endomoeg_complete_local_v4"
     )
     assert "tracking_expert_refinement" in model.get_tracking_parameter_groups()
 
@@ -387,12 +463,9 @@ def test_local_motion_scaffold_identity_and_rigid_transform_contract():
     )
 
     assert not torch.allclose(transformed["means3d"], means)
-    assert torch.allclose(
-        torch.cdist(transformed["means3d"], transformed["means3d"]),
-        torch.cdist(means, means),
-        atol=1e-5,
-        rtol=1e-5,
-    )
+    assert 0.0 < transformed["scaffold_point_gate_mean"].item() < 0.1
+    assert 0.0 < transformed["scaffold_spatial_support_mean"].item() <= 1.0
+    assert transformed["d_mu"].norm(dim=-1).max().item() < 0.02
     assert torch.allclose(
         transformed["rotations"].norm(dim=-1),
         torch.ones(means.shape[0]),
@@ -437,6 +510,43 @@ def test_local_motion_scaffold_bounds_node_geometry():
     )
     assert torch.isfinite(output["means3d"]).all()
     assert torch.isfinite(output["rotations"]).all()
+
+
+def test_local_motion_scaffold_node_gate_preserves_global_identity():
+    means, scales, rotations, opacity = _canonical_inputs(count=12)
+    scaffold = MotionScaffoldLocalExpert(
+        node_count=6,
+        knn=4,
+        hidden_dim=16,
+    )
+    scaffold.set_aabb(means.amax(dim=0), means.amin(dim=0))
+    scaffold.initialize_from_canonical(means, rotations)
+    with torch.no_grad():
+        last_linear = [
+            layer
+            for layer in scaffold.trajectory
+            if isinstance(layer, nn.Linear)
+        ][-1]
+        last_linear.bias[:3].fill_(1.0)
+        scaffold.node_gate_logits.fill_(-100.0)
+
+    output = scaffold(
+        canonical_means3d=means,
+        canonical_rotations3d=rotations,
+        means3d=means,
+        scales=scales,
+        rotations=rotations,
+        opacity_logits=opacity,
+        time_values=torch.full((means.shape[0], 1), 0.5),
+        scene_scale=torch.tensor(1.0),
+    )
+
+    assert torch.allclose(output["means3d"], means, atol=1e-7)
+    assert torch.allclose(output["rotations"], rotations, atol=1e-7)
+    assert output["scaffold_point_gate_mean"].item() == pytest.approx(
+        0.0,
+        abs=1e-8,
+    )
 
 
 def test_local_scaffold_regularization_is_part_of_tracking_objective():

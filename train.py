@@ -49,6 +49,10 @@ from models.endomoeg import (
 )
 from models.endomoeg.router_training import train_frozen_router
 from models.endomoeg.joint_training import train_controlled_joint
+from models.endomoeg.ensemble import freeze_gaussian_model
+from models.endomoeg.residual_training import (
+    compute_residual_boosting_losses,
+)
 from models.tracking.cams_gs_moe_tracking import required_endomoeg_components
 from scene.tracking_losses import compute_tracking_losses
 to8b = lambda x : (255*np.clip(x.cpu().numpy(),0,1)).astype(np.uint8)
@@ -191,6 +195,27 @@ def endomoeg_bundle_config(dataset, hyper, opt):
     }
 
 
+def build_frozen_global_teacher(dataset, global_payload, device):
+    config = global_payload.get("config") or {}
+    model_params = config.get("model_params") or {}
+    hidden_params = config.get("hidden_params") or {}
+    if not model_params or not hidden_params:
+        raise ValueError(
+            "Global expert bundle is missing reconstruction config required for "
+            "residual teacher reconstruction"
+        )
+    teacher = GaussianModel(
+        int(model_params.get("sh_degree", getattr(dataset, "sh_degree", 3))),
+        Namespace(**hidden_params),
+    )
+    teacher._deformation = teacher._deformation.to(device)
+    teacher.restore_expert_state(
+        global_payload["expert_state"],
+        training_args=None,
+    )
+    return freeze_gaussian_model(teacher)
+
+
 def should_reset_opacity(stage, iteration, opt, dataset):
     if stage != "coarse":
         return False
@@ -211,6 +236,29 @@ def allows_gaussian_topology_updates(stage, hyper):
     return not (
         pipeline_stage == "expert"
         and expert_role in {"local", "contact"}
+    )
+
+
+def clip_residual_refinement_gradients(optimizer, phase, max_norm):
+    if phase is None or float(max_norm) <= 0.0:
+        return None
+    parameters = []
+    for group in optimizer.param_groups:
+        group_name = str(group.get("name", ""))
+        if not group_name.startswith("tracking_expert_refinement"):
+            continue
+        if not phase.is_group_trainable(group_name):
+            continue
+        parameters.extend(
+            parameter
+            for parameter in group["params"]
+            if parameter.grad is not None
+        )
+    if not parameters:
+        return None
+    return torch.nn.utils.clip_grad_norm_(
+        parameters,
+        max_norm=float(max_norm),
     )
 
 
@@ -265,7 +313,9 @@ def load_requested_endomoeg_components(gaussians, hyper):
 
 def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_iterations, 
                          checkpoint_iterations, checkpoint, debug_from,
-                         gaussians, scene, stage, tb_writer, train_iter, timer):
+                         gaussians, scene, stage, tb_writer, train_iter, timer,
+                         residual_teacher=None,
+                         residual_teacher_metrics=None):
     first_iter = 0
     gaussians.training_setup(opt)
     if checkpoint:
@@ -291,6 +341,64 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         lpips_model = external_lpips.LPIPS(net="vgg").to(device)
     else:
         lpips_model = LocalLPIPS(net_type="vgg").to(device)
+    residual_best_state = None
+    residual_best_metrics = {}
+    residual_best_psnr = -float("inf")
+    if residual_teacher is not None:
+        zero = gaussians.get_xyz.new_zeros(())
+        residual_best_metrics = training_report(
+            tb_writer,
+            0,
+            zero,
+            zero,
+            l1_loss,
+            0.0,
+            (0,),
+            scene,
+            render,
+            [pipe, background],
+            stage,
+            tracking_metrics=None,
+            lpips_model=lpips_model,
+            log_training_scalars=False,
+        ) or {}
+        residual_best_psnr = float(
+            residual_best_metrics.get("test", {}).get(
+                "psnr",
+                -float("inf"),
+            )
+        )
+        expected_psnr = float(
+            (residual_teacher_metrics or {}).get(
+                "psnr",
+                residual_best_psnr,
+            )
+        )
+        max_drop = float(
+            hyper.endomoeg_residual_max_baseline_psnr_drop
+        )
+        if residual_best_psnr < expected_psnr - max_drop:
+            raise RuntimeError(
+                "Residual stage is not equivalent to its Global anchor: "
+                "baseline PSNR {:.4f}, bundle PSNR {:.4f}, allowed drop "
+                "{:.4f}".format(
+                    residual_best_psnr,
+                    expected_psnr,
+                    max_drop,
+                )
+            )
+        residual_best_state = gaussians.capture_expert_state()
+        print(
+            "[EndoMoe] Residual stage Global baseline PSNR {:.4f}".format(
+                residual_best_psnr
+            )
+        )
+        if tb_writer is not None:
+            tb_writer.add_scalar(
+                "{}/residual/global_baseline_psnr".format(stage),
+                residual_best_psnr,
+                0,
+            )
     video_cams = scene.getVideoCameras()
     temporal_times = sorted_unique_times(
         camera.time for camera in scene.getTrainCameras()
@@ -364,6 +472,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         gt_images = []
         gt_depths = []
         masks = []
+        teacher_images = []
 
         radii_list = []
         visibility_filter_list = []
@@ -395,6 +504,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             gt_images.append(gt_image.unsqueeze(0))
             gt_depths.append(gt_depth.unsqueeze(0))
             masks.append(mask.unsqueeze(0))
+            if residual_teacher is not None:
+                with torch.no_grad():
+                    teacher_pkg = render(
+                        viewpoint_cam,
+                        residual_teacher,
+                        pipe,
+                        background,
+                        stage=stage,
+                        update_deformation_stats=False,
+                    )
+                teacher_images.append(
+                    teacher_pkg["render"].detach().unsqueeze(0)
+                )
             radii_list.append(radii.unsqueeze(0))
             visibility_filter_list.append(visibility_filter.unsqueeze(0))
             viewspace_point_tensor_list.append(viewspace_point_tensor)
@@ -469,6 +591,31 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             cv2.imwrite('mask.png', tmp)
         
         Ll1 = l1_loss(image_tensor, gt_image_tensor, mask_tensor)
+        image_reconstruction_loss = Ll1
+        residual_training_metrics = {}
+        if residual_teacher is not None:
+            teacher_image_tensor = torch.cat(teacher_images, dim=0)
+            residual_training_metrics = compute_residual_boosting_losses(
+                image_tensor,
+                teacher_image_tensor,
+                gt_image_tensor,
+                mask=mask_tensor,
+                hard_quantile=float(
+                    hyper.endomoeg_residual_hard_quantile
+                ),
+                preserve_weight=float(
+                    hyper.endomoeg_residual_preserve_weight
+                ),
+                no_regret_weight=float(
+                    hyper.endomoeg_residual_no_regret_weight
+                ),
+                no_regret_margin=float(
+                    hyper.endomoeg_residual_no_regret_margin
+                ),
+            )
+            image_reconstruction_loss = residual_training_metrics[
+                "L_residual_total"
+            ]
 
         scene_mode = getattr(scene, "mode", "binocular")
         if (gt_depth_tensor!=0).sum() < 10:
@@ -495,10 +642,10 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         psnr_ = psnr(image_tensor, gt_image_tensor, mask_tensor).mean().double()
 
-        loss = Ll1 + depth_loss + tv_loss
+        loss = image_reconstruction_loss + depth_loss + tv_loss
 
         geo_expert_names, vis_expert_names = gaussians._deformation.get_expert_names()
-        tracking_metrics = {}
+        tracking_metrics = dict(residual_training_metrics)
         if stage == "fine" and deformation_aux_list:
             merged_aux = {}
             for key in deformation_aux_list[0].keys():
@@ -554,7 +701,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             for loss_name in tracking_loss_names:
                 tracking_loss = tracking_loss + tracking_loss_dict[loss_name]
 
-            tracking_metrics = dict(tracking_loss_dict)
+            tracking_metrics.update(tracking_loss_dict)
             if tracking_phase is not None:
                 tracking_metrics["phase_active_geo"] = torch.tensor(float(tracking_phase.active_geo), device=loss.device)
                 tracking_metrics["phase_active_vis"] = torch.tensor(float(tracking_phase.active_vis), device=loss.device)
@@ -647,6 +794,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             loss += opt.lambda_lpips * lpipsloss
         
         loss.backward()
+        residual_grad_norm = clip_residual_refinement_gradients(
+            gaussians.optimizer,
+            tracking_phase,
+            getattr(
+                hyper,
+                "endomoeg_residual_gradient_clip",
+                0.0,
+            ),
+        )
+        if residual_grad_norm is not None:
+            tracking_metrics["residual_grad_norm_before_clip"] = (
+                residual_grad_norm.detach()
+            )
         if stage == "fine" and iteration % 10 == 0:
             tracking_metrics.update(
                 collect_optimizer_group_metrics(gaussians.optimizer)
@@ -723,6 +883,23 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             )
             if validation_metrics:
                 latest_validation_metrics = validation_metrics
+                if residual_teacher is not None:
+                    candidate_psnr = float(
+                        validation_metrics.get("test", {}).get(
+                            "psnr",
+                            -float("inf"),
+                        )
+                    )
+                    if candidate_psnr > residual_best_psnr:
+                        residual_best_psnr = candidate_psnr
+                        residual_best_metrics = validation_metrics
+                        residual_best_state = gaussians.capture_expert_state()
+                    if tb_writer is not None:
+                        tb_writer.add_scalar(
+                            "{}/residual/best_psnr".format(stage),
+                            residual_best_psnr,
+                            iteration,
+                        )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration, stage)
@@ -776,6 +953,18 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             scene.model_path,
             final_tracking_phase_name,
             getattr(hyper, "endomoeg_component_output_dir", ""),
+        )
+    if residual_best_state is not None:
+        gaussians.restore_expert_state(
+            residual_best_state,
+            training_args=None,
+        )
+        scene.save(train_iter, stage)
+        latest_validation_metrics = residual_best_metrics
+        print(
+            "[EndoMoe] Restored best residual expert at PSNR {:.4f}".format(
+                residual_best_psnr
+            )
         )
     return latest_validation_metrics
 
@@ -842,6 +1031,8 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             map_location="cpu",
         )
         role = getattr(hyper, "endomoeg_expert_role")
+        residual_teacher = None
+        residual_teacher_metrics = {}
         if role == "global":
             gaussians.restore_canonical_state(
                 canonical_payload["canonical_state"],
@@ -860,6 +1051,15 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             gaussians.restore_global_anchor_state(
                 global_payload["expert_state"]
             )
+            residual_teacher = build_frozen_global_teacher(
+                dataset,
+                global_payload,
+                get_device(),
+            )
+            residual_teacher_metrics = global_payload.get(
+                "validation_metrics",
+                {},
+            )
         validation_metrics = scene_reconstruction(
             dataset,
             opt,
@@ -876,6 +1076,8 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             tb_writer,
             opt.iterations,
             timer,
+            residual_teacher=residual_teacher,
+            residual_teacher_metrics=residual_teacher_metrics,
         )
         test_metrics = validation_metrics.get("test", {})
         if "psnr" not in test_metrics:
@@ -989,8 +1191,9 @@ def training_report(
     stage,
     tracking_metrics=None,
     lpips_model=None,
+    log_training_scalars=True,
 ):
-    if tb_writer:
+    if tb_writer and log_training_scalars:
         tb_writer.add_scalar(
             f"{stage}/train_loss_patches/l1_loss",
             Ll1.item(),
