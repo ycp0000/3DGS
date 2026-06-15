@@ -35,7 +35,11 @@ try:
 except ImportError:
     external_lpips = None
 from utils.device_utils import get_device, safe_cuda_event
-from utils.eval_utils import select_fixed_views
+from utils.eval_utils import (
+    evaluate_fixed_view_metrics,
+    measure_bundle_metrics,
+    select_fixed_views,
+)
 from utils.scene_utils import render_training_image
 from utils.temporal_utils import nearest_adjacent_time, sorted_unique_times
 from time import time
@@ -1204,8 +1208,23 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     render_training_image(scene, gaussians, video_cams, render, pipe, background, stage, iteration-1,timer.get_elapsed_time())
             timer.start()
             
-            # Densification
-            if allow_topology_updates and iteration < opt.densify_until_iter:
+            # Densification.
+            #
+            # The final iteration is treated as a "freeze and validate"
+            # step: no topology mutations are allowed, so the model
+            # rendered by the preceding `training_report` call (if any
+            # at this iteration) is byte-identical to the model that
+            # `capture_expert_state` will persist into the bundle.
+            # Without this guard, last-iter prune silently invalidates
+            # `latest_validation_metrics`, which is exactly the failure
+            # that turns Stage 3 baseline parity checks into opaque
+            # RuntimeErrors at residual training start.
+            is_final_iteration = iteration >= final_iter
+            if (
+                allow_topology_updates
+                and iteration < opt.densify_until_iter
+                and not is_final_iteration
+            ):
                 # Keep track of max radii in image-space for pruning
                 if visibility_filter.numel() == gaussians.max_radii2D.numel() and visibility_filter.any():
                     gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -1373,11 +1392,44 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             residual_teacher=residual_teacher,
             residual_teacher_metrics=residual_teacher_metrics,
         )
-        test_metrics = validation_metrics.get("test", {})
+        # Re-measure metrics on the exact model state we are about to
+        # persist. ``validation_metrics`` may reflect an earlier
+        # snapshot (best-state restore, last-iter pruning) and using it
+        # here would create a metric/state mismatch that downstream
+        # parity gates cannot recover from.
+        device = get_device()
+        background = torch.tensor(
+            [1.0, 1.0, 1.0] if dataset.white_background else [0.0, 0.0, 0.0],
+            dtype=torch.float32,
+            device=device,
+        )
+        bundle_metrics_lpips = (
+            external_lpips.LPIPS(net="vgg").to(device)
+            if external_lpips is not None
+            else LocalLPIPS(net_type="vgg").to(device)
+        )
+        test_metrics = measure_bundle_metrics(
+            scene,
+            gaussians,
+            pipe,
+            background,
+            lpips_model=bundle_metrics_lpips,
+        )
         if "psnr" not in test_metrics:
             raise RuntimeError(
                 "Final fixed-view test PSNR is required before saving an expert bundle"
             )
+        loop_psnr = float(
+            (validation_metrics.get("test") or {}).get("psnr", float("nan"))
+        )
+        bundle_psnr = float(test_metrics.get("psnr", float("nan")))
+        print(
+            "[EndoMoe] Bundle metric coherence check: "
+            "loop-reported PSNR {:.4f} | bundle-resampled PSNR {:.4f}".format(
+                loop_psnr,
+                bundle_psnr,
+            )
+        )
         expert_payload = build_expert_bundle(
             gaussians,
             role=role,

@@ -125,6 +125,12 @@ The presets are stage-neutral. Pipeline stage, expert role, bundle directory, an
 
 Adjust `SOURCE`, `RUN_ROOT`, and `MIN_EXPERT_PSNR` for the server. Set `MIN_EXPERT_PSNR` close to the original EndoGaussian fixed-view test PSNR. Local/Contact training will not start unless `global.pth` passes this gate.
 
+> The bundle's `validation_metrics["psnr"]` is now measured *after* the
+> training loop ends and topology is frozen, so it always corresponds
+> to the model state actually persisted into the bundle. If you have
+> bundles from before this fix, refresh them in place with
+> `python tools/refresh_bundle_metrics.py --bundle <path> --source <data>`.
+
 ```bash
 cd /root/3DGS
 
