@@ -253,7 +253,42 @@ class Deformation(nn.Module):
         )
 
     def reset_backbone_to_identity(self) -> None:
-        if self.tracking_mode not in {"cams_gs_moe", "endomoeg_expert"}:
+        # Identity initialisation zero-inits the last Linear layer of every
+        # deformation head, which makes ``forward_dynamic`` collapse to the
+        # canonical state on iteration 0 (``dx=ds=dr=do=0``).
+        #
+        # That property is required for architectures whose final renderer
+        # composes a *frozen* baseline with a *residual* delta: in those
+        # designs the residual head must start at exact identity so the
+        # initial render matches the baseline.
+        #
+        # The deformation backbone of an ``endomoeg_expert`` Global anchor
+        # is *not* such a residual head. It is a normal HexPlane-driven
+        # deformation field that has to learn end-to-end from coarse start
+        # to dynamic fit, identical to the original EndoGaussian baseline.
+        # Zero-initialising its last Linear silently severs the gradient
+        # path back to ``feature_out`` and ``grid``: ``W=0`` means
+        # ``dL/d(input) = dL/d(output) @ W = 0``, so HexPlane and the trunk
+        # MLP receive no learning signal beyond what trickles through the
+        # last-layer weight update. This caps Global PSNR at roughly the
+        # canonical (coarse-only) reconstruction level no matter how long
+        # training runs - the failure mode that made Stage 2 plateau at
+        # ~23 dB while the original EndoGaussian baseline reaches ~38 dB
+        # on the same data with the same loss.
+        #
+        # For Local/Contact residual experts the Global anchor is
+        # transplanted via ``restore_global_anchor_state`` *after*
+        # construction, which overwrites these zero-initialised weights
+        # with the trained Global backbone. The refinement modules
+        # themselves (``MotionScaffoldLocalExpert`` / ``ContactSpacetimeExpert``)
+        # already zero-init their own output layers in their respective
+        # ``reset_parameters``, which is the correct place for residual
+        # identity-init in this architecture.
+        #
+        # Only ``cams_gs_moe`` retains the legacy identity-init behaviour
+        # because its multi-expert routing path historically depends on
+        # all experts starting from the canonical state.
+        if self.tracking_mode != "cams_gs_moe":
             return
         for head in (self.pos_deform, self.scales_deform, self.rotations_deform, self.opacity_deform):
             if head is None:
