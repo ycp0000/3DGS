@@ -467,35 +467,79 @@ def test_residual_expert_transplants_global_anchor_without_overwriting_refinemen
 
 
 @pytest.mark.parametrize("role", ("global", "local", "contact"))
-def test_complete_expert_dynamic_start_is_exactly_canonical(role):
+def test_complete_expert_residual_refinement_starts_at_identity(role):
+    """Residual refinement modules (Local scaffold, Contact spacetime
+    bank) must produce zero residual on iteration 0, so the candidate
+    render is byte-identical to the loaded Global anchor before any
+    optimisation step. This is the contract that
+    ``validate_residual_teacher_render_parity`` relies on.
+
+    The deformation backbone (HexPlane / feature_out / per-attribute
+    deformation heads) is intentionally NOT identity-initialised for
+    ``endomoeg_expert``. For Global the backbone has to train end-to-end
+    just like the original EndoGaussian baseline; zero-initialising its
+    last Linear layers severs the gradient through the upstream blocks
+    and caps Stage 2 PSNR. For Local/Contact the backbone is
+    transplanted from the trained Global anchor at load time
+    (``restore_global_anchor_state``), so its initial weights here are
+    irrelevant.
+    """
     network = deform_network(_deformation_args(role))
     deformation = network.deformation_net
-    for head in (
-        deformation.pos_deform,
-        deformation.scales_deform,
-        deformation.rotations_deform,
-        deformation.opacity_deform,
-    ):
-        linear_layers = [
-            module for module in head.modules() if isinstance(module, nn.Linear)
-        ]
-        assert torch.count_nonzero(linear_layers[-1].weight).item() == 0
-        assert torch.count_nonzero(linear_layers[-1].bias).item() == 0
 
+    if role == "global":
+        # The Global role must keep the backbone trainable end-to-end.
+        # Zero-init of the last Linear would silently sever gradients;
+        # this test guards against any future refactor that reintroduces
+        # that behaviour.
+        for head in (
+            deformation.pos_deform,
+            deformation.scales_deform,
+            deformation.rotations_deform,
+            deformation.opacity_deform,
+        ):
+            last_linear = [
+                module for module in head.modules() if isinstance(module, nn.Linear)
+            ][-1]
+            assert torch.count_nonzero(last_linear.weight).item() > 0, (
+                "Global backbone last Linear is zero-initialised; this "
+                "severs gradient flow to HexPlane/feature_out and caps "
+                "fine PSNR around the canonical reconstruction."
+            )
+        return
+
+    # Residual roles: refinement modules must self-zero-init their own
+    # outputs so that, once the trained Global backbone is transplanted,
+    # the composite render is identical to Global.
     means, scales, rotations, opacity = _canonical_inputs()
     network.initialize_tracking_state(means, rotations)
-    outputs = network(
-        means,
-        scales,
-        rotations,
-        opacity,
-        torch.rand(means.shape[0], 1),
-    )
 
-    assert torch.allclose(outputs[0], means)
-    assert torch.allclose(outputs[1], scales)
-    assert torch.allclose(outputs[2], rotations)
-    assert torch.allclose(outputs[3], opacity)
+    refinement = (
+        deformation.complete_expert_head.refinement
+    )
+    assert refinement is not None
+
+    refinement_kwargs = {
+        "means3d": means,
+        "scales": scales,
+        "rotations": rotations,
+        "opacity_logits": opacity,
+        "time_values": torch.rand(means.shape[0], 1),
+        "scene_scale": torch.tensor(1.0),
+        "camera": None,
+    }
+    if role == "local":
+        refinement_kwargs["canonical_means3d"] = means
+        refinement_kwargs["canonical_rotations3d"] = rotations
+    elif role == "contact":
+        refinement_kwargs["canonical_means3d"] = means
+    refined = refinement(**refinement_kwargs)
+
+    # Refinement deltas must vanish on initialisation so that the
+    # composite Global+Refinement render equals the trained Global render
+    # before any optimisation has happened.
+    assert torch.allclose(refined["means3d"], means, atol=1e-6)
+    assert torch.allclose(refined["rotations"], rotations, atol=1e-6)
 
 
 def test_local_motion_scaffold_identity_and_rigid_transform_contract():
