@@ -15,7 +15,11 @@ import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lpips_loss, TV_loss
 from lpipsPyTorch import LPIPS as LocalLPIPS
-from gaussian_renderer import render, network_gui
+from gaussian_renderer import (
+    rasterize_endomoeg_routing_features,
+    render,
+    network_gui,
+)
 import sys
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -341,6 +345,75 @@ def validate_residual_teacher_render_parity(
     return metrics
 
 
+@torch.no_grad()
+def project_residual_support_map(viewpoint, gaussians, pipe, render_pkg):
+    routing_state = render_pkg.get("routing_state")
+    deformation_aux = render_pkg.get("deformation_aux") or {}
+    support = deformation_aux.get("residual_support")
+    if routing_state is None or not torch.is_tensor(support):
+        return None
+
+    device = gaussians.get_xyz.device
+    dtype = gaussians.get_xyz.dtype
+    parent_count = int(
+        routing_state.get("base_point_count", gaussians.get_xyz.shape[0])
+    )
+    parent_support = torch.zeros(
+        parent_count,
+        1,
+        device=device,
+        dtype=dtype,
+    )
+    support = support.detach().to(device=device, dtype=dtype)
+    if support.ndim == 1:
+        support = support.unsqueeze(-1)
+    if int(support.shape[0]) == parent_count:
+        parent_support.copy_(support[:parent_count])
+    else:
+        deformation_mask = gaussians._deformation_table.to(device=device)
+        deformation_indices = torch.nonzero(
+            deformation_mask,
+            as_tuple=False,
+        ).squeeze(-1)
+        if int(support.shape[0]) != int(deformation_indices.numel()):
+            return None
+        parent_support[deformation_indices] = support
+
+    auxiliary_count = int(routing_state.get("auxiliary_point_count", 0) or 0)
+    if auxiliary_count > 0:
+        auxiliary_support = deformation_aux.get("auxiliary_residual_support")
+        if torch.is_tensor(auxiliary_support):
+            auxiliary_support = auxiliary_support.detach().to(
+                device=device,
+                dtype=dtype,
+            )
+            if auxiliary_support.ndim == 1:
+                auxiliary_support = auxiliary_support.unsqueeze(-1)
+            auxiliary_support = auxiliary_support[:auxiliary_count]
+        else:
+            auxiliary_support = torch.zeros(
+                auxiliary_count,
+                1,
+                device=device,
+                dtype=dtype,
+            )
+        support_values = torch.cat((parent_support, auxiliary_support), dim=0)
+    else:
+        support_values = parent_support
+
+    projected = rasterize_endomoeg_routing_features(
+        viewpoint,
+        gaussians,
+        pipe,
+        routing_state,
+        support_values.clamp(0.0, 1.0),
+        probabilities=True,
+    )["gaussian_prior"]
+    if projected.ndim == 2:
+        projected = projected.unsqueeze(0)
+    return projected.clamp(0.0, 1.0).detach()
+
+
 def should_reset_opacity(stage, iteration, opt, dataset):
     if stage != "coarse":
         return False
@@ -645,6 +718,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         masks = []
         teacher_images = []
         teacher_depths = []
+        residual_support_maps = []
 
         radii_list = []
         visibility_filter_list = []
@@ -654,7 +728,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         merged_d_mu_for_commit = None
         
         for viewpoint_cam in viewpoint_cams:
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, stage=stage)
+            render_pkg = render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                background,
+                stage=stage,
+                return_routing_state=residual_teacher is not None,
+            )
             image, depth, viewspace_point_tensor, visibility_filter, radii = \
                 render_pkg["render"], render_pkg["depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
             gt_image = viewpoint_cam.original_image.to(device).float()
@@ -677,6 +758,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             gt_depths.append(gt_depth.unsqueeze(0))
             masks.append(mask.unsqueeze(0))
             if residual_teacher is not None:
+                support_map = project_residual_support_map(
+                    viewpoint_cam,
+                    gaussians,
+                    pipe,
+                    render_pkg,
+                )
+                if support_map is not None:
+                    residual_support_maps.append(support_map.unsqueeze(0))
                 with torch.no_grad():
                     teacher_pkg = render(
                         viewpoint_cam,
@@ -774,11 +863,17 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         residual_training_metrics = {}
         if residual_teacher is not None:
             teacher_image_tensor = torch.cat(teacher_images, dim=0)
+            residual_support_tensor = (
+                torch.cat(residual_support_maps, dim=0)
+                if len(residual_support_maps) == len(teacher_images)
+                else None
+            )
             residual_training_metrics = compute_residual_boosting_losses(
                 image_tensor,
                 teacher_image_tensor,
                 gt_image_tensor,
                 mask=mask_tensor,
+                support=residual_support_tensor,
                 hard_quantile=float(
                     hyper.endomoeg_residual_hard_quantile
                 ),
@@ -862,6 +957,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 inverse_teacher_depth,
                 inverse_gt_depth,
                 mask=depth_valid_mask,
+                support=residual_support_tensor,
                 hard_quantile=float(
                     hyper.endomoeg_residual_hard_quantile
                 ),

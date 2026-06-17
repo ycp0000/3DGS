@@ -3726,3 +3726,667 @@ Claude must verify with:
 
 ### 下一步最小任务
 - 在服务器 `git pull origin main`，删除或更换旧 bundle 输出目录，然后启动 canonical stage。
+
+## Update 2026-06-14 residual-stage collapse root cause
+
+### 已完成
+- 完整解析 `output/01`–`04` TensorBoard：Global test PSNR 38.40，Local/Contact 分别退化到约 25.27/24.70。
+- 证明 Global bundle 恢复和 residual identity 正确：03/04 step 1 的 residual motion 均为零；崩塌从第一次 residual optimizer update 开始。
+- 新增 `models/endomoeg/residual_training.py`，实现 hard-region boosting、easy-region teacher preservation 和 pixel-wise no-regret。
+- 新增两项定向测试，覆盖恒等起点梯度与非困难区域退化惩罚。
+
+### 当前设计决策
+- Local/Contact 必须作为冻结 Global 上的 boosting residual，而不是重新执行无保护的全图光度 SGD。
+- Global 高误差像素负责提供增量学习信号；Global 已拟合区域必须蒸馏保持；任何像素级退化必须进入 hinge no-regret。
+- 现有 ARAP/acceleration 不约束偏离 Global，不能作为防崩塌机制。
+
+### 仍需做什么
+- 将冻结 Global teacher 接入 residual expert 训练循环。
+- 增加 residual 专用低学习率、warm-up、gradient clipping 和阶段 best-state rollback。
+- 将 Local deformation graph 改为有局部激活门的 identity-preserving 支持域。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py -k "residual_boosting" -q --tb=short --basetemp .pytest_tmp_residual_boosting`：2 passed。
+
+### 下一步最小任务
+- 在 `train.py` 中构建冻结 Global teacher，并用 residual boosting loss 替换 Local/Contact 的无保护全图 L1 优化目标。
+
+## Update 2026-06-14 frozen-Global residual boosting integration
+
+### 已完成
+- `train.py` 在 Local/Contact 阶段从 `global.pth` 重建并冻结 Global teacher。
+- 每个训练视角同时渲染 residual candidate 与 Global teacher；训练目标改为 hard-region boost + easy-region preservation + pixel no-regret。
+- 新增四个可复现配置项并写入 cutting preset：hard quantile、preserve weight、no-regret weight、no-regret margin。
+
+### 当前设计决策
+- Global teacher 只在 residual expert 阶段存在；Global、canonical、router、joint 和原始 EndoGaussian 路径不改变。
+- TensorBoard 保留原始 patch L1，同时额外记录 `L_residual_*`、teacher/candidate error 和 hard fraction。
+- teacher 使用 Global bundle 自带 hidden config 重建，避免当前 Local/Contact config 误建 Global 网络。
+
+### 仍需做什么
+- 为 residual refinement 增加低 LR warm-up 与 gradient clipping。
+- 增加 stage-0 Global 等价性验证和 best-state no-regret rollback。
+- 修正 Local graph 的全场归一化支持域，加入 identity-preserving spatial gate。
+
+### 运行过哪些测试
+- `python -m py_compile train.py arguments/__init__.py arguments/endonerf/cutting_endomoeg.py models/endomoeg/residual_training.py`：passed。
+- residual boosting 定向测试：2 passed；preset 模块导入无错误。
+
+### 下一步最小任务
+- 修改 CompleteExpert scheduler/optimizer，使 residual LR 从零 warm-up 到安全上限，并在 step 前裁剪 refinement 梯度。
+
+## Update 2026-06-14 residual optimizer contract
+
+### 已完成
+- CompleteExpert scheduler 新增 residual 专用 LR scale、线性 warm-up 和 warm-up 后的独立衰减进度。
+- 默认 residual 有效 LR：step 1 约 `3.2e-8`，step 500 约 `1.6e-5`，相较旧实现 step 10 约 `1.59e-3` 降低约两个数量级。
+- `GaussianModel.update_learning_rate()` 现在同步切换参数 `requires_grad`；冻结 Global/canonical 不再只设置 LR=0。
+
+### 当前设计决策
+- residual optimizer 必须从 Global 最优点进行 trust-region 式小步更新，不能复用 Global 大范围拟合的 LR。
+- warm-up 与后续 decay 使用不同进度：先逐步打开 residual，再从 deformation schedule 起点衰减。
+- 冻结是计算图契约，不只是 optimizer 数值约定。
+
+### 仍需做什么
+- 将 LR/warm-up 参数加入 CLI/preset。
+- 在反向后仅裁剪 residual refinement 梯度。
+- 增加 LR warm-up、冻结梯度和 clipping 回归测试。
+
+### 运行过哪些测试
+- `tests/test_complete_endomoeg_experts.py`：22 passed。
+- `py_compile`：CompleteExpert、deformation、GaussianModel passed。
+
+### 下一步最小任务
+- 补充 scheduler 行为测试，并在 `train.py` 接入 residual gradient clipping 与 TensorBoard 指标。
+
+## Update 2026-06-14 residual warm-up and clipping verification
+
+### 已完成
+- 新增 scheduler 回归，验证 LR 从 0 线性 warm-up，warm-up 后才推进 decay schedule。
+- `train.py` 仅收集并裁剪当前可训练的 `tracking_expert_refinement` 梯度。
+- TensorBoard 新增 `residual_grad_norm_before_clip`；默认 clipping max norm 为 0.05。
+- CLI 默认项已加入 residual LR scale、warm-up iterations 和 gradient clip。
+
+### 当前设计决策
+- clipping 不能作用于冻结 Global，也不能掩盖梯度缺失；只处理 residual refinement 且保留裁剪前范数诊断。
+- warm-up step 0 的 residual LR 必须严格为零，随后连续增长，避免 Adam 首步符号更新破坏恒等起点。
+
+### 仍需做什么
+- 将新 optimizer 参数同步到 cutting/pulling preset。
+- 为 Local graph 增加局部激活门和 identity blend。
+- 增加 stage-0/best-state rollback，确保bundle最终不低于Global基线。
+
+### 运行过哪些测试
+- `tests/test_complete_endomoeg_experts.py`：23 passed。
+- `py_compile train.py arguments/__init__.py tests/test_complete_endomoeg_experts.py`：passed。
+
+### 下一步最小任务
+- 修改 `MotionScaffoldLocalExpert`：保留绝对空间支持强度，引入稀疏节点门，并以门控残差而非全场DQB覆盖输出。
+
+## Update 2026-06-14 identity-preserving local support gates
+
+### 已完成
+- Local scaffold 新增 learnable node gates，默认激活概率 0.05。
+- Gaussian residual gate = 邻域节点门加权值 × 未归一化空间支持强度；不再因 KNN 归一化而强制覆盖全场。
+- position 使用 gated residual，rotation 使用 identity-to-DQB quaternion nlerp 后再与 Global rotation composition。
+- 新增 gate sparsity、point gate mean、spatial support mean 指标与正则。
+- 新增门关闭时严格恢复 Global identity 的回归测试。
+
+### 当前设计决策
+- Local异质性来自“稀疏局部支持域 + deformation graph + DQB”，不是第二个稠密全局变形场。
+- 空间权重必须同时保留相对邻居权重与绝对支持强度；只做归一化会丢失“远离所有节点”的语义。
+- 节点门初始小但非零，使轨迹参数可获得梯度；轨迹零初始化仍保证 stage-0 严格 identity。
+
+### 仍需做什么
+- 将 initial gate probability 和 gate sparsity lambda 接入 args/preset/bundle。
+- 升级 Local/Contact expert bundle architecture version，拒绝旧协议静默加载。
+- 增加 stage best-state rollback。
+
+### 运行过哪些测试
+- `tests/test_complete_endomoeg_experts.py`：24 passed。
+- `py_compile`：motion scaffold、tracking losses、expert tests passed。
+
+### 下一步最小任务
+- 完成 Local gate 配置 plumbing 与持久化协议升级。
+
+## Update 2026-06-14 local gate configuration plumbing
+
+### 已完成
+- `endomoeg_scaffold_initial_gate_probability` 已从 ModelHiddenParams 传入 CompleteExpert 和 MotionScaffold。
+- `lambda_scaffold_gate_sparsity` 已加入默认配置。
+- 新结构参数会随 hidden config 写入 expert bundle，能够完整重建 Local 模块。
+
+### 当前设计决策
+- 影响函数族和可优化域的参数必须显式进入配置，不能依赖 Python 默认值。
+- 默认 gate probability 0.05，在保持轨迹梯度通路的同时把初始残差作用限制在小范围。
+
+### 仍需做什么
+- 同步 cutting/pulling presets 与 preset tests。
+- 升级 expert architecture/bundle version。
+- 实现 stage-0 baseline 与 best-state rollback。
+
+### 运行过哪些测试
+- `tests/test_complete_endomoeg_experts.py`：24 passed。
+- `py_compile`：CompleteExpert、deformation、arguments passed。
+
+### 下一步最小任务
+- 更新 presets 和 bundle protocol，明确拒绝旧 Local/Contact checkpoint。
+
+## Update 2026-06-14 reproducible residual presets
+
+### 已完成
+- cutting/pulling presets 已同步 Local gate、gate sparsity、residual boosting、LR warm-up 和 gradient clipping 全部参数。
+- preset regression 新增对应数值断言。
+
+### 当前设计决策
+- cutting 与 pulling 首轮保持相同归一化超参数，后续通过 ablation 调整，避免架构修正与场景调参混杂。
+- 所有影响 residual 安全边界的参数都必须进入 cfg_args 和 expert bundle metadata。
+
+### 仍需做什么
+- 升级 expert architecture/bundle version 并更新 fixtures。
+- 增加 residual stage 初始 Global baseline 评估、best-state capture 与结束回滚。
+- 运行完整定向测试和独立 Codex 审核。
+
+### 运行过哪些测试
+- EndoMoe preset 定向回归：1 passed。
+- cutting/pulling presets 与 preset test `py_compile`：passed。
+
+### 下一步最小任务
+- 升级 expert bundle protocol，然后实现 stage-level no-regret rollback。
+
+## Update 2026-06-14 expert bundle protocol v5
+
+### 已完成
+- Expert bundle 升级为 version 5 / architecture `endomoeg_heterogeneous_residual_expert_v5`。
+- Local/Contact tracking architecture 升级为 v4；Global 保持 v1。
+- 新运行时会明确拒绝旧 v4 bundle 和旧 Local/Contact v3 state。
+
+### 当前设计决策
+- Local新增持久化 node gate，且 residual训练语义变化，因此属于checkpoint协议变化，不能做静默兼容。
+- 服务器必须从 canonical/Global 开始重建 residual bundles；旧 Local/Contact/Router 均不可复用。
+
+### 仍需做什么
+- 更新 Router fixture 中的 Local/Contact architecture literal。
+- 实现 residual stage baseline validation 与 best-state rollback。
+- 全量定向回归和独立审核。
+
+### 运行过哪些测试
+- Complete expert + expert bundle：32 passed。
+- bundle/deformation/expert test `py_compile`：passed。
+
+### 下一步最小任务
+- 在 residual expert stage 训练前评估 Global等价基线并保存初始状态，训练结束恢复最高PSNR状态。
+
+## Update 2026-06-14 residual stage no-regret checkpointing
+
+### 已完成
+- Local/Contact 在 optimizer step 前执行固定视角 stage-0 评估。
+- stage-0 PSNR 必须与 Global bundle validation PSNR 在 0.05 dB 容差内，否则 fail-fast。
+- stage-0 identity state 作为初始 best；每次 validation 只在 test PSNR 提升时更新 best state。
+- 阶段结束恢复 best expert state，再由外层构建 expert bundle。
+- TensorBoard 新增 Global baseline PSNR 与 rolling best PSNR。
+
+### 当前设计决策
+- no-regret 不只存在于像素loss，还必须存在于模型选择层；最终 residual bundle 的质量下界是 Global anchor。
+- stage-0 门同时验证 canonical、deformation、SH、renderer 与角色前向的端到端等价性。
+
+### 仍需做什么
+- pulling preset 同步 baseline tolerance。
+- Router tests 同步 v5/v4 协议。
+- 增加 stage rollback helper 定向测试并运行完整相关测试。
+
+### 运行过哪些测试
+- Complete expert + pipeline role 定向：25 passed，2 warnings。
+- `py_compile train.py arguments/__init__.py cutting_endomoeg.py`：passed。
+
+### 下一步最小任务
+- 同步 pulling preset 与 Router fixtures，随后执行完整 EndoMoe 回归。
+
+## Update 2026-06-14 core residual pipeline verification
+
+### 已完成
+- pulling preset 已同步 baseline tolerance。
+- Router fixtures 已同步 expert bundle v5 / Local-Contact tracking v4。
+- CompleteExpert、bundle、Router、EndoNeRF preset 四条核心链路全部通过。
+
+### 当前设计决策
+- 当前 residual 安全机制分三层：pixel boosting/no-regret、optimizer trust region、stage-level best rollback。
+- Router只能消费通过v5协议且最终质量不低于Global baseline的residual bundle。
+
+### 仍需做什么
+- 独立 Codex 审核新训练逻辑的理论与工程正确性。
+- 根据审核修正问题后运行 Joint/render 等扩展回归。
+- 更新 README 新协议、TensorBoard tags 和重训要求。
+
+### 运行过哪些测试
+- 核心相关测试：68 passed，2 warnings。
+- `python -m compileall -q arguments models/endomoeg scene train.py`：passed。
+- `git diff --check`：passed，仅CRLF提示。
+
+### 下一步最小任务
+- 调用 Codex 对本次 residual-stage 修正做独立代码与理论审查。
+
+## Update 2026-06-14 review fixes and Codex status
+
+### 已完成
+- MCP Codex 三次调用均在120秒超时；Codex CLI review运行10分钟仍未返回最终审查文本，已终止本次启动的残留进程。
+- 本地逐行审计发现并修复高严重度问题：Global role 分支曾无条件读取未定义 `global_payload`。
+- teacher现在使用Global bundle保存的 `sh_degree` 与 hidden config重建。
+- residual best回滚后重新覆盖stage iteration输出，确保直接render与expert bundle状态一致。
+- 新增gradient clipping只作用refinement组的回归测试。
+
+### 当前设计决策
+- 不把超时的Codex调用表述为“审核通过”；当前结论来自日志证据、定向测试和本地逐行审计。
+- stage输出、expert bundle与validation metrics必须对应同一best state。
+
+### 仍需做什么
+- 更新README中的v5协议、新训练机制、TensorBoard tags和必须从Stage 1重训的提示。
+- 运行Router/Joint/render等扩展回归。
+- 清理测试临时目录并做最终diff/status审计。
+
+### 运行过哪些测试
+- review fixes相关测试：33 passed，2 warnings。
+- `py_compile train.py tests/test_endonerf_presets.py`：passed。
+- `git diff --check`：passed，仅CRLF提示。
+
+### 下一步最小任务
+- 更新README并执行完整EndoMoe扩展回归。
+
+## Update 2026-06-14 documentation and extended regression
+
+### 已完成
+- README 已更新 expert bundle v5、Local spatial gates、Global-teacher boosting、warm-up/clipping、stage baseline与best rollback。
+- README 新增全部 residual TensorBoard tags，并明确必须使用新bundle目录从Stage 1重训。
+- 完成 expert/bundle/router/joint/render/preset 与通用tracking扩展回归。
+
+### 当前设计决策
+- 服务器首轮验证先看stage-0 Global baseline是否与Stage 2一致，再看Local gate是否从小值选择性增长；不能只看单步训练PSNR。
+- 如果Local/Contact没有超过baseline，最终bundle会自动回滚到Global等价状态，Router headroom检查会阻止无效MoE继续训练。
+
+### 仍需做什么
+- 跑全量测试。
+- 清理本轮pytest临时目录，检查git status/diff。
+- 如全量通过，准备commit/push与服务器重训命令。
+
+### 运行过哪些测试
+- EndoMoe完整链路：76 passed，2 warnings。
+- `tests/test_disentangled_moe_tracking.py`：94 passed。
+- 全项目compileall与`git diff --check`：passed，仅CRLF提示。
+
+### 下一步最小任务
+- 执行全量pytest并完成最终工程审计。
+
+## Update 2026-06-14 residual pipeline v5 final verification
+
+### 已完成
+- 全量测试通过：177 passed，2个protobuf弃用warning。
+- compileall、diff check、目标文件敏感信息扫描通过。
+- 清理本轮创建的pytest与Codex临时目录；未处理历史受权限保护的 `.pytest_tmp/`。
+- 最终实现包含：Global teacher boosting/no-regret、residual LR warm-up与clipping、Local spatial gates、stage-0 parity、best rollback、bundle v5和README。
+
+### 当前设计决策
+- 这次修正解决的是旧日志证明的根因：residual首步过冲、无Global保护、Local全场覆盖、正则不约束Global漂移。
+- 无法保证未运行真实CUDA训练就达到SOTA；代码现在保证失败可见、坏专家不传播，并为残差专家提供可优化的增量目标。
+- Codex MCP/CLI审核均超时，没有伪称外部审核通过；本地审计额外发现并修复Global分支未定义变量等问题。
+
+### 仍需做什么
+- 提交并推送除 `.ai-recovery/HANDOFF.md` 外的代码、测试和README。
+- 服务器使用全新bundle目录从Stage 1重训。
+- 首先验证Stage 3 step-0 baseline与Global一致，再观察Local/Contact是否产生正oracle headroom。
+
+### 运行过哪些测试
+- 全量：`python -m pytest tests -q --tb=short --basetemp .pytest_tmp_full_residual_v5`：177 passed，2 warnings。
+- EndoMoe扩展链路：76 passed。
+- tracking回归：94 passed。
+- compileall、`git diff --check`、敏感信息扫描：passed。
+
+### 下一步最小任务
+- Conventional Commit提交并push到`origin/main`，随后服务器从新bundle目录执行README Stage 1–5。
+
+## Update 2026-06-14 GitHub delivery
+
+### 已完成
+- 提交：`4bf6599 fix(model): stabilize residual expert training`。
+- 已推送至 `origin/main`。
+- 本地与远端 `refs/heads/main` 均为 `4bf6599fa6a7f48d1cca926b95d31c2d2b280c89`。
+
+### 当前设计决策
+- `.ai-recovery/HANDOFF.md` 继续只作为本地恢复记录，未纳入功能提交。
+- 旧expert bundle v4与新代码不兼容，服务器必须使用全新bundle目录。
+
+### 仍需做什么
+- 服务器拉取 `4bf6599` 并从Stage 1执行到Stage 4。
+- 回传Stage 2–4 TensorBoard，重点核对baseline、best PSNR、gate/support和oracle headroom。
+
+### 运行过哪些测试
+- push前全量：177 passed，2 warnings。
+
+### 下一步最小任务
+- 服务器创建新 `RUN_ROOT/BUNDLES`，启动canonical与Global阶段，确认Global质量后再启动Local。
+
+## Update 2026-06-14 residual objective second-pass audit
+
+### 已完成
+- 发现 residual 目标仅优化 top-30% hard pixels；easy preserve 与 ReLU no-regret 在 identity 起点的一阶梯度均为零，导致首次有效更新只追逐困难区域并可牺牲全图。
+- residual 目标新增全有效区域 reconstruction 主项，hard-region 降为加权 boost；no-regret 改为带温度的 smooth barrier，并记录退化像素比例与平均 regret。
+- 新增非 hard 可改善像素梯度回归测试，证明全图像素在 identity 起点具有正确优化方向。
+
+### 当前设计决策
+- Global teacher 是质量下界而不是唯一监督；candidate 必须保留全图重建梯度，同时对 hard region 进行有限增益。
+- no-regret 使用 smooth softplus barrier，避免 ReLU 在零边界无梯度而无法阻止首次退化。
+- 当前修复尚不能宣称解决服务器崩塌；仍需封堵 depth/TV 等绕过 teacher 的几何梯度并验证端到端渲染等价性。
+
+### 仍需做什么
+- 审计并修复 residual 阶段未受保护的 depth、TV、DSSIM/LPIPS 路径。
+- 加入 candidate/teacher 同视角 RGB/depth parity fail-fast 与 minibatch PSNR delta 日志。
+- 校验 Global bundle 与 residual 当前配置的所有基础 deformation 语义字段，排除静默错配。
+
+### 运行过哪些测试
+- `python -m pytest tests/test_complete_endomoeg_experts.py -k "residual_boosting or residual_reconstruction" -q --tb=short --basetemp .pytest_tmp_residual_objective`：3 passed。
+- `python -m py_compile models/endomoeg/residual_training.py tests/test_complete_endomoeg_experts.py`：passed。
+
+### 下一步最小任务
+- 修改 residual 训练循环，使 legacy depth/TV/感知损失不能绕过 frozen Global teacher 直接改变几何。
+
+## Update 2026-06-14 residual geometry guard and parity diagnostics
+
+### 已完成
+- residual 阶段不再叠加 legacy `depth + 0.03 * image/depth TV`；binocular depth 改为 frozen Global teacher 约束下的 inverse-depth residual objective，monocular 非局部 Pearson depth 在 residual 阶段禁用。
+- residual 阶段禁用未受 teacher 保护的 DSSIM/LPIPS 旁路；Global 与原始 EndoGaussian 路径保持不变。
+- 启动 residual optimizer 前，在固定 train/test views 上逐像素比较 candidate 与 frozen Global teacher 的 RGB/depth，超过容差立即失败。
+- 新增同 minibatch teacher PSNR、candidate-teacher PSNR delta、teacher L1、depth regret 等 TensorBoard 指标与进度条字段。
+- 新增 Global bundle 与 residual 当前 base deformation 语义配置一致性检查，防止 shape 相同但网络行为不同的静默加载。
+
+### 当前设计决策
+- residual expert 只能在 Global anchor 的信赖域内优化；任何会改变几何/外观的辅助目标都必须 teacher-relative，或在 residual 阶段明确禁用。
+- stage-0 PSNR 相近不足以证明加载正确，必须增加同相机 RGB/depth 精确等价检查。
+- 当前修改保持 Global 专家训练目标不变，只收紧 Local/Contact 的增量优化契约。
+
+### 仍需做什么
+- 增加 candidate/teacher renderer parity 与 optimizer trainable groups 的定向测试。
+- 审计 Local raw rotation 输出、stage component 保存顺序和 best rollback 后的最终 bundle 一致性。
+- 同步 cutting/pulling preset 新参数并升级 bundle protocol，禁止旧 residual bundle 静默复用。
+
+### 运行过哪些测试
+- residual/config 定向回归：11 passed，2 个 protobuf deprecation warnings。
+- `python -m py_compile train.py arguments/__init__.py models/endomoeg/residual_training.py tests/test_complete_endomoeg_experts.py tests/test_endonerf_presets.py`：passed。
+- `git diff --check`：passed，仅 CRLF 提示。
+
+### 下一步最小任务
+- 修正并测试 Global-to-Local 零残差的原始状态完全等价性，然后核对 stage 保存是否发生在 best rollback 之前。
+
+## Update 2026-06-14 residual state identity and save lifecycle
+
+### 已完成
+- Local scaffold 取消对最终 raw quaternion 的隐式归一化；零 residual 现在保留 Global raw rotation，而 renderer 仍在统一边界执行 rotation activation。
+- Global-to-Local 迁移测试加入非零 position/rotation base deformation，验证 means/scales/rotations/opacity 四项前向输出逐项等价。
+- residual best rollback 移到最终 phase component 保存之前，消除 final expert bundle 与 component checkpoint 指向不同状态的问题。
+- 审计确认 `initialize_tracking_state()` 只初始化尚未初始化的 scaffold/contact 几何上下文，不会重置已加载 Global backbone。
+
+### 当前设计决策
+- residual identity 必须同时满足渲染等价与 raw state 等价；不能依赖 renderer 归一化掩盖 checkpoint 语义变化。
+- 任何标记为 final 的 scene、component、expert bundle 都必须来自同一个 rollback 后 best state。
+
+### 仍需做什么
+- 升级 expert bundle/tracking architecture 协议，拒绝旧 residual objective 与旧 Local raw-rotation 契约。
+- 同步 cutting/pulling presets 的 reconstruction、boost、temperature、depth、parity 参数。
+- 增加 preset/protocol 回归并执行完整 EndoMoe 测试。
+
+### 运行过哪些测试
+- 状态迁移与 residual 配置回归：11 passed，2 个 protobuf deprecation warnings。
+- `py_compile train.py models/endomoeg/motion_scaffold.py tests/test_complete_endomoeg_experts.py`：passed。
+- `git diff --check`：passed，仅 CRLF 提示。
+
+### 下一步最小任务
+- 将 expert bundle 升级到新版本，并同步两个 EndoNeRF preset 及测试 fixture。
+
+## Update 2026-06-14 expert protocol v6
+
+### 已完成
+- Expert bundle 升级为 version 6 / architecture `endomoeg_heterogeneous_residual_expert_v6`。
+- Local tracking architecture 升级为 `endomoeg_complete_local_v5`，对应 raw quaternion identity 契约变化。
+- Router bundle 升级为 version 6，避免旧 Router manifest 与新 residual experts 混用。
+
+### 当前设计决策
+- objective、前向 identity 或最终状态选择语义发生变化时必须升级持久化协议；不提供静默兼容。
+- Global tracking architecture 仍为 v1、Contact 为 v4，因为其模块结构未变；但 expert bundle v6 会统一拒绝旧训练语义产物。
+
+### 仍需做什么
+- 更新 bundle/router 测试 fixtures 与 README 版本说明。
+- 同步 cutting/pulling presets 新 residual 参数。
+- 运行 protocol 与 preset 回归。
+
+### 运行过哪些测试
+- 本步为协议常量变更，尚未单独运行测试；下一步同步 fixtures 后统一验证。
+
+### 下一步最小任务
+- 更新两个 EndoNeRF preset 和相关测试断言，使新训练参数完整写入 cfg_args/bundle config。
+
+## Update 2026-06-14 residual v6 preset plumbing
+
+### 已完成
+- cutting/pulling EndoMoe presets 显式加入全图 reconstruction weight、hard boost weight、smooth no-regret temperature、teacher-protected depth weight 与 render parity tolerance。
+- preset 回归断言覆盖全部新增参数，确保 CLI merge 后不会意外使用过期或隐式默认值。
+
+### 当前设计决策
+- 影响 residual 安全边界的参数必须显式进入场景 preset、cfg_args 和 expert bundle config，便于服务器复现与审计。
+- 首轮 cutting/pulling 使用相同安全参数；效果调优必须在确认不再崩塌后单独进行。
+
+### 仍需做什么
+- 更新 Local v5 / bundle v6 的测试 fixture 与 README。
+- 运行 expert bundle、router bundle、完整 expert pipeline 回归。
+
+### 运行过哪些测试
+- EndoMoe preset 定向回归：1 passed，2 个 protobuf deprecation warnings。
+- preset/protocol 相关 `py_compile`：passed。
+
+### 下一步最小任务
+- 同步测试 fixture 中的 Local architecture literal，并验证旧 v5 bundle 被明确拒绝。
+
+## Update 2026-06-14 v6 protocol and core regression
+
+### 已完成
+- 测试 fixtures 已同步 Local v5 architecture，README 已更新 Expert/Router bundle v6 与 residual teacher-protected objective。
+- README 新增 reconstruction/depth/regret/parity TensorBoard 指标，并明确禁止复用 v5 expert/router bundles。
+- Expert bundle、Router、CompleteExpert、EndoNeRF preset 四条核心链路通过。
+
+### 当前设计决策
+- 服务器必须使用全新 bundle 目录从 canonical stage 重训；任何 v5 residual/Router 产物均视为不兼容。
+- 下一轮验证先看 stage-0 parity max abs 是否低于 1e-5，再看同 minibatch `residual_psnr_delta`；不再用单独 candidate PSNR 猜测加载问题。
+
+### 仍需做什么
+- 二次审计 residual depth mask、NaN/Inf、防零除和日志键分类。
+- 增加旧 v5 bundle 显式拒绝测试与 render parity helper 单元测试。
+- 运行全量 tests、独立 Codex review、commit/push。
+
+### 运行过哪些测试
+- `test_endomoeg_bundles.py + test_endomoeg_router.py + test_complete_endomoeg_experts.py + test_endonerf_presets.py`：71 passed，2 warnings。
+- `python -m compileall -q arguments models/endomoeg scene train.py`：passed。
+- `git diff --check`：passed，仅 CRLF 提示。
+
+### 下一步最小任务
+- 审计 residual depth/mask 数值稳定性并补充 parity/protocol 定向测试。
+
+## Update 2026-06-14 residual finite-value contract
+
+### 已完成
+- masked reduction 改为先 `torch.where(mask, value, 0)`，避免无效区 `NaN * 0` 污染整体 loss。
+- candidate/teacher/target 在有效 residual 区域出现 NaN/Inf 时立即抛出 FloatingPointError。
+- stage-0 RGB/depth parity 增加 candidate/teacher 有限性检查，并校验 tolerance 为有限正数。
+- 新增“无效区 NaN 可忽略、有效区 NaN 必须失败”的回归测试。
+
+### 当前设计决策
+- 无效深度/遮罩外像素可以被排除，但任何参与优化或 parity 的非有限值都不得静默传播。
+- 诊断门必须 fail-closed；不能让 Python max/NaN 行为造成错误通过。
+
+### 仍需做什么
+- 增加 Expert v5 与 Router v5 显式拒绝测试。
+- 调用独立 Codex 审核当前 diff，重点审查理论目标和工程状态迁移。
+- 运行全量测试并提交推送。
+
+### 运行过哪些测试
+- residual finite-value 定向回归：8 passed。
+- `py_compile` 与 `git diff --check`：passed，仅 CRLF 提示。
+
+### 下一步最小任务
+- 补充旧协议拒绝测试，然后执行独立审查。
+
+## Update 2026-06-14 residual mask curriculum isolation
+
+### 已完成
+- residual Local/Contact 阶段禁用 legacy 前 1000 步 top-2% candidate-error mask 扩张。
+- 原始 EndoGaussian 与 Global expert 路径仍保留既有 color refinement 行为。
+- 新增策略回归，验证 residual teacher 存在时从 step 1 起使用固定有效 mask。
+
+### 当前设计决策
+- residual teacher 信赖域要求监督区域固定；不能由 candidate 当前误差动态扩张 mask，否则会重新引入 outlier chasing 和目标分布漂移。
+- residual hard-region mining 只能在合法 mask 内根据 frozen teacher error 决定。
+
+### 仍需做什么
+- 运行全量测试和最终 diff 审查。
+- 记录 Codex MCP 超时事实，不伪称外部审核通过。
+- 完成 Conventional Commit 并 push 到 origin/main。
+
+### 运行过哪些测试
+- residual mask/topology/config 定向回归：5 passed，2 warnings。
+- `py_compile` 与 `git diff --check`：passed，仅 CRLF 提示。
+
+### 下一步最小任务
+- 执行全量 pytest、compileall、安全扫描和 Git 状态审计。
+
+## Update 2026-06-14 residual depth shape contract
+
+### 已完成
+- residual binocular depth 在计算 loss 前强制 candidate/teacher/target 均为同形状 `[B, 1, H, W]`。
+- 任何缺失 channel 维或 batch/空间尺寸不一致都会 fail-fast，避免 PyTorch silent broadcasting 生成错误监督。
+- 新增合法 shape、batch mismatch、channel mismatch 三类回归。
+
+### 当前设计决策
+- renderer public depth 与 EndoNeRF GT depth 的边界契约统一为单通道 BCHW；训练内部不允许隐式广播。
+
+### 仍需做什么
+- 全量 pytest、compileall、diff/security/status 审计。
+- 完成提交并 push。
+
+### 运行过哪些测试
+- residual depth shape/mask 回归：2 passed，2 warnings。
+- 相关 `py_compile`：passed。
+
+### 下一步最小任务
+- 执行最终质量门并检查是否还有未预期改动。
+
+## Update 2026-06-14 residual v6 final quality gate
+
+### 已完成
+- 全量 tests 通过：182 passed，2 个 protobuf deprecation warnings。
+- compileall、diff check、目标文件敏感信息扫描通过。
+- 清理本轮创建的 pytest 临时目录；历史受权限保护的 `.pytest_tmp/pytest-of-93895` 未触碰。
+- Codex MCP 独立审查再次在 120 秒超时；未将其表述为审查通过，后续结论来自双轮本地执行流审计与回归测试。
+
+### 当前设计决策
+- 本次根因不是单一权重加载错误，而是多条叠加破坏 residual trust region 的路径：hard-only 首步目标、unprotected depth/TV/perceptual losses、legacy candidate-driven mask expansion、缺少 exact render parity、raw rotation identity 不严格、final component 保存早于 rollback。
+- 新 v6 同时在 objective、optimizer boundary、render parity、numeric contract、state lifecycle 和 protocol version 六层封堵。
+
+### 仍需做什么
+- 提交除 `.ai-recovery/HANDOFF.md` 外的代码/测试/README。
+- push 到 `origin/main`。
+- 服务器使用全新 bundle 目录从 canonical stage 重训，首先检查 parity 与 teacher-delta 指标。
+
+### 运行过哪些测试
+- `python -m pytest tests -q --tb=short --basetemp .pytest_tmp_residual_v6_full`：182 passed，2 warnings。
+- `python -m compileall -q arguments models scene utils train.py render.py metrics.py`：passed。
+- `git diff --check` 与敏感信息扫描：passed。
+
+### 下一步最小任务
+- Conventional Commit 并 push，然后给出服务器重训与首要观察指标。
+
+## Update 2026-06-14 GitHub delivery residual v6
+
+### 已完成
+- 提交：`a31eb30 fix(model): enforce residual expert trust region`。
+- 已推送至 `origin/main`，远端从 `4bf6599` 更新到 `a31eb30`。
+- 功能提交包含 14 个代码/测试/README 文件；`.ai-recovery/HANDOFF.md` 继续仅保留为本地恢复记录。
+
+### 当前设计决策
+- 服务器必须创建全新 bundle 目录并从 canonical stage 开始；v5 expert/router bundle 会被明确拒绝。
+
+### 仍需做什么
+- 服务器 `git pull origin main` 后重训 Stage 1-3。
+- Local 启动时先确认 `parity_rgb_max_abs` 与 `parity_depth_max_abs <= 1e-5`，再观察 `residual_psnr_delta` 是否接近 0 后逐步改善。
+
+### 运行过哪些测试
+- push 前全量：182 passed，2 warnings；compileall/diff/security passed。
+
+### 下一步最小任务
+- 在服务器使用新 RUN_ROOT/BUNDLES 启动 canonical 与 Global，确认 Global 指标后再启动 Local。
+
+## Update 2026-06-17 support-conditioned residual diagnosis
+
+### �����
+- ��ȡ GitHub ���� main��ȷ���Ѱ��� `fix/global-backbone-gradient-flow`��Global backbone ���ٱ� `reset_backbone_to_identity()` zero-init��
+- ���� Stage 3 ������·��Local/Contact ��ͨ�� `restore_global_anchor_state()` ��ֲ `global.pth` �� canonical �� backbone����ǰ PSNR ���������ܷ����� residual optimizer ���º󣬶����� Stage 0 identity ���ء�
+- �޸� `models/endomoeg/residual_training.py`��`compute_residual_boosting_losses()` ���� `support` ���룬support ��ʹ�� reconstruction/boost��support ��ʹ�� teacher preserve/no-regret��
+- �޸� Local/Contact ר�������Local ��� `residual_support=spatial_support`��Contact ��� parent/auxiliary residual support��
+
+### ��ǰ��ƾ���
+- Global zero-init �Ǿ� Stage 2 ���򣬵����� Global �ѻָ� 37�C40 dB��Local �׶μ������� 24 dB ������תΪ residual trust-region ����ר��֧���򻮷֡�
+- residual support ֻ��Ϊ��ʧȨ�أ����� detach������ר��ͨ������ support �ӱ� teacher preserve��
+- support-conditioned loss ���� Global anchor��ר����֧�ֵ�λ������ѧϰ��ʵ�в��֧�ֵ�λ���ϸ����� Global��
+
+### ������ʲô
+- �� `train.py` �а� per-Gaussian `residual_support` �� rasterizer ͶӰ�� 2D support map�������� RGB/depth residual loss��
+- ���ӵ�Ԫ���Ը��� support �����ݶȷ���
+- ������С pytest ��֤��
+
+### ���й���Щ����
+- ��δ���У���ǰ�����м�Ķ�״̬��
+
+### ��һ����С����
+- ����ѵ��ѭ���е� 2D support map ͶӰ��
+
+## Update 2026-06-17 support-conditioned residual integration
+
+### �����
+- `train.py` residual expert ��Ⱦʱ���� `return_routing_state=True`����ͨ�� `rasterize_endomoeg_routing_features()` �� per-Gaussian residual support ͶӰΪ 2D support map��
+- RGB �� depth residual boosting loss ���ڶ�����ͬһ�� support map��support ���Ż� candidate��GT��support ������ candidate��Global teacher ��ʩ�� no-regret��
+- �������� residual loss ��Ԫ���ԣ���֤֧���������ؽ��ݶȡ���֧�����򲻻ᱻ GT �ؽ������� teacher���� unsupported regression �ᱻ preserve/no-regret ���ء�
+
+### ��ǰ��ƾ���
+- 2D support map ʹ�� `torch.no_grad()` ͶӰ��ֻ��Ϊ trust-region Ȩ�أ����� support ��֧���ض����ݶȡ�
+- ��ĳ��ר��û�������Ч support�����Զ����˵��� residual loss������� residual ���쳣·��������
+- Contact �� Gaussian ʹ�� `auxiliary_residual_support` ����ͬһͶӰ·�������� parent-only support ©�� contact bank ����
+
+### ������ʲô
+- ���� residual ���� pytest �� py_compile��
+- ������ͨ������� git diff ��׼�����͡�
+- ������������ʱ�ص�۲� Local �� 0 �� baseline PSNR��`residual_support_fraction`��`residual_psnr_delta`��
+
+### ���й���Щ����
+- ��δ���У���һ��ִ����С���ԡ�
+
+### ��һ����С����
+- �� `tests/test_complete_endomoeg_experts.py -k residual` ����ر����顣
+
+## Update 2026-06-17 support-conditioned residual verification
+
+### �����
+- �� Local residual support �Ӵ� `spatial_support` �ս�Ϊʵ�� `point_gate`�����⼸�θ��ǹ������´�����ر� Global preserve��
+- ���� support ģʽ�� no-regret��support ��ʹ�� hard ReLU no-regret��ֻ�ͷ��������� teacher �����أ�identity �㲻�ٱ� smooth softplus ���� GT��
+- �����С������ preset ���ԣ�ȷ�� residual �ݶȷ���Local/Contact expert contract��ѵ�����������������
+
+### ��ǰ��ƾ���
+- Local support = ��ǰ��ʵ����� residual authority (`point_gate`)��������Ǳ�����򸲸� (`spatial_support`)��
+- support �ڣ����� candidate ͨ�� reconstruction/boost ѧ GT��support �⣺������ reconstruction ���� Global��ֻ���� preserve/no-regret ���� teacher��
+- `residual_support_fraction` �Ǻ��� TensorBoard �ؿ������������ڽӽ� 0��˵�� Local û�򿪣�������ӽ� 1��˵�� trust region ������
+
+### ������ʲô
+- ����ǰ��� git diff ��״̬��
+- ����������ѵ��ʱ����ɾ���� bundle���� canonical/global ���ܣ��ص㿴 Stage 2 Global �Ƿ� 37�C40 dB���Լ� Local �� 0 �� baseline �Ƿ���� Global��
+
+### ���й���Щ����
+- `python -m pytest tests/test_complete_endomoeg_experts.py -q --tb=short --basetemp .pytest_tmp_endomoeg_complete_support3`��28 passed��
+- `python -m pytest tests/test_endonerf_presets.py -q --tb=short --basetemp .pytest_tmp_endonerf_presets_support`��23 passed��2 warnings��protobuf deprecation����
+- `python -m py_compile train.py models/endomoeg/residual_training.py models/endomoeg/motion_scaffold.py models/endomoeg/contact_spacetime.py tests/test_complete_endomoeg_experts.py`��passed��
+
+### ��һ����С����
+- ��� diff ���ύ������ GitHub���������˴��� bundle Ŀ¼�������� canonical �� global �� local��

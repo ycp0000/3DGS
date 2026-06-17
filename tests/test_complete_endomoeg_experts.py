@@ -161,6 +161,58 @@ def test_residual_reconstruction_protects_non_hard_improvable_pixels():
     assert candidate.grad[0, 0, 0, 3].item() == pytest.approx(0.0)
 
 
+def test_support_conditioned_residual_only_reconstructs_supported_pixels():
+    teacher = torch.zeros(1, 1, 1, 4)
+    target = torch.tensor([[[[1.0, 1.0, 1.0, 1.0]]]])
+    support = torch.tensor([[[[1.0, 0.0, 1.0, 0.0]]]])
+    candidate = teacher.clone().requires_grad_(True)
+
+    losses = compute_residual_boosting_losses(
+        candidate,
+        teacher,
+        target,
+        support=support,
+        hard_quantile=0.0,
+        reconstruction_weight=1.0,
+        boost_weight=0.0,
+        preserve_weight=1.0,
+        no_regret_weight=1.0,
+    )
+    losses["L_residual_total"].backward()
+
+    assert losses["residual_support_fraction"].item() == pytest.approx(0.5)
+    assert candidate.grad[0, 0, 0, 0].item() < 0.0
+    assert candidate.grad[0, 0, 0, 1].item() == pytest.approx(0.0)
+    assert candidate.grad[0, 0, 0, 2].item() < 0.0
+    assert candidate.grad[0, 0, 0, 3].item() == pytest.approx(0.0)
+
+
+def test_support_conditioned_residual_preserves_unsupported_regression():
+    teacher = torch.zeros(1, 1, 1, 2)
+    target = torch.zeros_like(teacher)
+    support = torch.tensor([[[[1.0, 0.0]]]])
+    candidate = torch.tensor([[[[0.0, 0.5]]]], requires_grad=True)
+
+    losses = compute_residual_boosting_losses(
+        candidate,
+        teacher,
+        target,
+        support=support,
+        hard_quantile=0.0,
+        reconstruction_weight=1.0,
+        boost_weight=0.0,
+        preserve_weight=1.0,
+        no_regret_weight=1.0,
+        no_regret_temperature=0.01,
+    )
+    losses["L_residual_total"].backward()
+
+    assert losses["L_residual_preserve"].item() > 0.0
+    assert losses["L_residual_no_regret"].item() > 0.0
+    assert candidate.grad[0, 0, 0, 0].item() == pytest.approx(0.0)
+    assert candidate.grad[0, 0, 0, 1].item() > 0.0
+
+
 def test_residual_objective_ignores_invalid_pixels_but_rejects_valid_nan():
     teacher = torch.zeros(1, 1, 1, 2)
     target = torch.zeros_like(teacher)

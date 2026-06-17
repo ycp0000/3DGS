@@ -50,6 +50,7 @@ def compute_residual_boosting_losses(
     teacher: torch.Tensor,
     target: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
+    support: Optional[torch.Tensor] = None,
     hard_quantile: float = 0.7,
     reconstruction_weight: float = 1.0,
     boost_weight: float = 0.25,
@@ -72,6 +73,22 @@ def compute_residual_boosting_losses(
     candidate_error = (candidate - target).abs().mean(dim=1, keepdim=True)
     teacher_error = (teacher - target).abs().mean(dim=1, keepdim=True)
     valid_mask = _canonical_mask(mask, candidate_error)
+    if support is None:
+        support_weight = valid_mask.to(dtype=candidate.dtype)
+        preserve_region_weight = None
+        no_regret_weight_map = valid_mask.to(dtype=candidate.dtype)
+    else:
+        support_value = support.to(device=candidate.device, dtype=candidate.dtype)
+        if support_value.ndim == candidate_error.ndim - 1:
+            support_value = support_value.unsqueeze(1)
+        if support_value.shape != candidate_error.shape:
+            support_value = support_value.expand_as(candidate_error)
+        support_weight = support_value.detach().clamp(0.0, 1.0)
+        support_weight = support_weight * valid_mask.to(dtype=candidate.dtype)
+        preserve_region_weight = (
+            (1.0 - support_weight) * valid_mask.to(dtype=candidate.dtype)
+        )
+        no_regret_weight_map = preserve_region_weight
     _assert_finite_on_mask("candidate", candidate, valid_mask)
     _assert_finite_on_mask("teacher", teacher, valid_mask)
     _assert_finite_on_mask("target", target, valid_mask)
@@ -89,14 +106,19 @@ def compute_residual_boosting_losses(
             detached_teacher_error[batch_index] >= threshold
         ) & valid_mask[batch_index]
 
-    preserve_mask = valid_mask & ~hard_mask
-    hard_weight = hard_mask.to(dtype=candidate.dtype)
-    preserve_region_weight = preserve_mask.to(dtype=candidate.dtype)
+    if support is None:
+        preserve_mask = valid_mask & ~hard_mask
+        preserve_region_weight = preserve_mask.to(dtype=candidate.dtype)
+        reconstruction_weight_map = valid_mask.to(dtype=candidate.dtype)
+        hard_weight = hard_mask.to(dtype=candidate.dtype)
+    else:
+        reconstruction_weight_map = support_weight
+        hard_weight = hard_mask.to(dtype=candidate.dtype) * support_weight
     valid_weight = valid_mask.to(dtype=candidate.dtype)
 
     reconstruction_loss = _masked_weighted_mean(
         candidate_error,
-        valid_weight,
+        reconstruction_weight_map,
         valid_mask,
     )
     boost_loss = _masked_weighted_mean(
@@ -119,15 +141,18 @@ def compute_residual_boosting_losses(
         - float(no_regret_margin)
     )
     temperature = float(no_regret_temperature)
-    no_regret = F.softplus(
-        no_regret_delta / temperature
-    ) * temperature
     no_regret_excess = torch.relu(
         no_regret_delta
     )
+    if support is None:
+        no_regret = F.softplus(
+            no_regret_delta / temperature
+        ) * temperature
+    else:
+        no_regret = no_regret_excess
     no_regret_loss = _masked_weighted_mean(
         no_regret,
-        valid_weight,
+        no_regret_weight_map,
         valid_mask,
     )
     total = (
@@ -146,6 +171,9 @@ def compute_residual_boosting_losses(
         "L_residual_no_regret": no_regret_loss * float(no_regret_weight),
         "L_residual_total": total,
         "residual_hard_fraction": hard_weight.sum().detach() / valid_count,
+        "residual_support_fraction": (
+            support_weight.sum().detach() / valid_count
+        ),
         "residual_teacher_error": _masked_weighted_mean(
             teacher_error.detach(),
             valid_weight,

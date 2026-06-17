@@ -525,6 +525,7 @@ class MotionScaffoldLocalExpert(nn.Module):
             "scales": scales,
             "rotations": transformed_rotations,
             "opacity_logits": opacity_logits,
+            "residual_support": point_gate.detach(),
             "d_mu": d_mu,
             "d_scale": torch.zeros_like(scales),
             "d_rot": axis_angle[indices[:, 0]] * point_gate,

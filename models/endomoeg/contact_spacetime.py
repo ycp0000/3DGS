@@ -375,6 +375,9 @@ class ContactSpacetimeExpert(nn.Module):
             camera,
         )
         active_child_weight = amplitude * temporal_rbf
+        auxiliary_support = (
+            active_child_weight * anchor_boundary_support.detach()
+        ).clamp(0.0, 1.0)
         transient_probability = contact_support
         pi_vis = torch.cat(
             (1.0 - transient_probability, transient_probability),
@@ -390,6 +393,7 @@ class ContactSpacetimeExpert(nn.Module):
             "scales": scales,
             "rotations": rotations,
             "opacity_logits": opacity_logits + d_opacity,
+            "residual_support": contact_support.detach(),
             "d_mu": torch.zeros_like(means3d),
             "d_scale": torch.zeros_like(scales),
             "d_rot": means3d.new_zeros((means3d.shape[0], 3)),
@@ -415,6 +419,7 @@ class ContactSpacetimeExpert(nn.Module):
             "auxiliary_opacity": child_alpha,
             "auxiliary_parent_indices": child_parent,
             "auxiliary_rgb_delta": child_rgb_delta,
+            "auxiliary_residual_support": auxiliary_support.detach(),
             "auxiliary_temporal_rbf": temporal_rbf,
             "auxiliary_amplitude": amplitude,
             "auxiliary_contact_target": anchor_boundary_support,
