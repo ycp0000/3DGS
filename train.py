@@ -204,24 +204,48 @@ def endomoeg_bundle_config(dataset, hyper, opt):
 
 
 def build_frozen_global_teacher(dataset, global_payload, device):
-    config = global_payload.get("config") or {}
+    return build_frozen_expert_from_payload(dataset, global_payload, device)
+
+
+def build_frozen_expert_from_payload(dataset, payload, device):
+    config = payload.get("config") or {}
     model_params = config.get("model_params") or {}
     hidden_params = config.get("hidden_params") or {}
     if not model_params or not hidden_params:
         raise ValueError(
-            "Global expert bundle is missing reconstruction config required for "
-            "residual teacher reconstruction"
+            "Expert bundle is missing reconstruction config required for "
+            "state round-trip reconstruction"
         )
-    teacher = GaussianModel(
+    expert = GaussianModel(
         int(model_params.get("sh_degree", getattr(dataset, "sh_degree", 3))),
         Namespace(**hidden_params),
     )
-    teacher._deformation = teacher._deformation.to(device)
-    teacher.restore_expert_state(
-        global_payload["expert_state"],
+    expert._deformation = expert._deformation.to(device)
+    expert.restore_expert_state(
+        payload["expert_state"],
         training_args=None,
     )
-    return freeze_gaussian_model(teacher)
+    return freeze_gaussian_model(expert)
+
+
+def assert_metric_psnr_coherence(label, measured_metrics, reference_metrics, tolerance):
+    measured_psnr = float((measured_metrics or {}).get("psnr", float("nan")))
+    reference_psnr = float((reference_metrics or {}).get("psnr", float("nan")))
+    if not np.isfinite(measured_psnr):
+        raise RuntimeError("{} PSNR could not be measured".format(label))
+    if np.isfinite(reference_psnr) and measured_psnr < reference_psnr - float(tolerance):
+        raise RuntimeError(
+            "{} restored state PSNR {:.4f} does not reproduce saved bundle "
+            "PSNR {:.4f} within tolerance {:.4f}. The bundle is stale or "
+            "state-incoherent; delete it and rerun the Global expert stage "
+            "from canonical before training Local/Contact.".format(
+                label,
+                measured_psnr,
+                reference_psnr,
+                float(tolerance),
+            )
+        )
+    return measured_psnr
 
 
 def validate_global_anchor_config(hyper, global_payload):
@@ -575,6 +599,19 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
     residual_best_metrics = {}
     residual_best_psnr = -float("inf")
     if residual_teacher is not None:
+        teacher_actual_metrics = measure_bundle_metrics(
+            scene,
+            residual_teacher,
+            pipe,
+            background,
+            lpips_model=lpips_model,
+        )
+        teacher_actual_psnr = assert_metric_psnr_coherence(
+            "Global anchor",
+            teacher_actual_metrics,
+            residual_teacher_metrics,
+            hyper.endomoeg_residual_max_baseline_psnr_drop,
+        )
         parity_metrics = validate_residual_teacher_render_parity(
             scene,
             gaussians,
@@ -606,12 +643,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 -float("inf"),
             )
         )
-        expected_psnr = float(
-            (residual_teacher_metrics or {}).get(
-                "psnr",
-                residual_best_psnr,
-            )
-        )
+        expected_psnr = teacher_actual_psnr
         max_drop = float(
             hyper.endomoeg_residual_max_baseline_psnr_drop
         )
@@ -632,6 +664,11 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             )
         )
         if tb_writer is not None:
+            tb_writer.add_scalar(
+                "{}/residual/global_teacher_actual_psnr".format(stage),
+                teacher_actual_psnr,
+                0,
+            )
             tb_writer.add_scalar(
                 "{}/residual/global_baseline_psnr".format(stage),
                 residual_best_psnr,
@@ -1535,6 +1572,29 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
             iteration=opt.iterations,
             config=endomoeg_bundle_config(dataset, hyper, opt),
             validation_metrics=test_metrics,
+        )
+        roundtrip_model = build_frozen_expert_from_payload(
+            dataset,
+            expert_payload,
+            device,
+        )
+        roundtrip_metrics = measure_bundle_metrics(
+            scene,
+            roundtrip_model,
+            pipe,
+            background,
+            lpips_model=bundle_metrics_lpips,
+        )
+        roundtrip_psnr = assert_metric_psnr_coherence(
+            "EndoMoe {} expert bundle round-trip".format(role),
+            roundtrip_metrics,
+            test_metrics,
+            hyper.endomoeg_residual_max_baseline_psnr_drop,
+        )
+        print(
+            "[EndoMoe] Bundle round-trip PSNR {:.4f}".format(
+                roundtrip_psnr
+            )
         )
         expert_path = save_bundle(
             os.path.join(bundle_dir, "{}.pth".format(role)),

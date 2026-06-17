@@ -22,6 +22,7 @@ from models.tracking.cams_gs_tracking import CAMSGSScheduler
 from train import (
     allows_gaussian_topology_updates,
     clip_residual_refinement_gradients,
+    assert_metric_psnr_coherence,
     normalize_endomoeg_pipeline_stage,
     should_apply_color_refinement,
     validate_global_anchor_config,
@@ -527,6 +528,27 @@ def test_global_anchor_config_rejects_base_deformation_mismatch():
 
     with pytest.raises(ValueError, match="net_width"):
         validate_global_anchor_config(hyper, payload)
+
+
+def test_metric_psnr_coherence_rejects_stale_bundle_metrics():
+    with pytest.raises(RuntimeError, match="state-incoherent"):
+        assert_metric_psnr_coherence(
+            "Global anchor",
+            {"psnr": 24.1066},
+            {"psnr": 38.5744},
+            0.05,
+        )
+
+
+def test_metric_psnr_coherence_accepts_close_roundtrip():
+    psnr_value = assert_metric_psnr_coherence(
+        "Global anchor",
+        {"psnr": 38.53},
+        {"psnr": 38.5744},
+        0.05,
+    )
+
+    assert psnr_value == pytest.approx(38.53)
 
 
 def test_endomoeg_pipeline_requires_absolute_bundle_paths(tmp_path):

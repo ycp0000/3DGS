@@ -4390,3 +4390,47 @@ Claude must verify with:
 
 ### ��һ����С����
 - ��� diff ���ύ������ GitHub���������˴��� bundle Ŀ¼�������� canonical �� global �� local��
+
+## Update 2026-06-17 bundle round-trip diagnosis
+
+### 已完成
+- 定位最新 Local `ITER 0` 崩塌不是 residual loss 更新导致，而是 restored Local/Global candidate 实测 PSNR 约 24，与 `global.pth` 保存指标 38.5744 不一致。
+- 修正 `build_frozen_expert_from_payload()` 半截补丁中的未定义变量，统一从传入 payload 重建 frozen expert。
+- 在 residual 启动阶段新增 restored Global teacher 实测 PSNR 与 bundle metadata 的一致性校验，避免旧 bundle 被误当成高质量 Global anchor。
+- 在 expert bundle 保存前新增 round-trip 重建与固定视角指标复测，防止再次写出“指标高、状态低”的不一致 bundle。
+
+### 当前设计决策
+- Local 第 0 步必须和实际 restored Global anchor 等价；若实际 anchor 只有 24 dB，而 metadata 是 38 dB，训练应立即报“bundle stale/state-incoherent”，而不是继续误诊 Local 架构。
+- residual baseline 对比改用 restored teacher 的实际 PSNR，metadata 只作为一致性验证目标。
+- 旧 bundle 一旦不一致必须作废，不能通过放宽阈值继续训练。
+
+### 仍需做什么
+- 运行最小 preset/compile 测试。
+- 若测试通过，提交并推送 GitHub。
+- 服务器端需删除旧 `BUNDLES`，从 canonical → global 重新生成 bundle 后再跑 local。
+
+### 运行过哪些测试
+- 尚未运行；下一步执行 `tests/test_endonerf_presets.py` 与 `py_compile`。
+
+### 下一步最小任务
+- 运行最小测试并推送修复。
+## Update 2026-06-17 bundle round-trip verification
+
+### 已完成
+- 完成 bundle restored-state coherence 修复的最小验证。
+- 确认新增测试能拒绝 `24 dB restored state / 38 dB metadata` 的 stale bundle 场景。
+
+### 当前设计决策
+- 当前服务器报错应被新版代码改写为更早、更明确的 Global anchor bundle 不一致错误；真正解决需要重跑 Global bundle，而不是复用旧 bundle。
+
+### 仍需做什么
+- 提交并推送 GitHub。
+- 服务器端拉取后删除旧 bundle 目录，重新跑 canonical → global → local。
+
+### 运行过哪些测试
+- `python -m py_compile train.py tests/test_endonerf_presets.py`：passed。
+- `python -m pytest tests/test_endonerf_presets.py -q --tb=short --basetemp .pytest_tmp_endonerf_presets_roundtrip`：25 passed，2 warnings（protobuf deprecation）。
+- `python -m pytest tests/test_complete_endomoeg_experts.py -q --tb=short --basetemp .pytest_tmp_endomoeg_complete_roundtrip`：28 passed。
+
+### 下一步最小任务
+- 提交并推送当前修复。
